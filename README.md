@@ -1,5 +1,18 @@
 # AthenaK for tidal disruption events and other astrophysical flows
 
+<p align="center">
+  <a href="https://github.com/HongxuanJiang/athenak-transients/releases/download/v1.0.0/tde_fid_7pmb_1080p.mp4">
+    <img src="docs/media/tde_fid_7pmb.gif" width="480" alt="Gas density in the orbital plane of the fiducial tidal disruption run">
+  </a>
+  <br>
+  <em>Tidal disruption of a 1&nbsp;M<sub>&#9737;</sub> star by a 10<sup>3</sup>&nbsp;M<sub>&#9737;</sub> black hole (black dot):
+  gas density in the orbital plane of the fiducial (FID) run over seven fallback times of the most
+  bound debris (7&nbsp;P<sub>mb</sub>).  The inset follows the pericenter region; white areas lie outside the
+  computational box, which grows with each remap.
+  <a href="https://github.com/HongxuanJiang/athenak-transients/releases/download/v1.0.0/tde_fid_7pmb_1080p.mp4">Full movie (1080p)</a> &middot;
+  <a href="https://github.com/HongxuanJiang/athenak-transients/releases/download/v1.0.0/tde_fid_7pmb_full.mp4">original resolution</a></em>
+</p>
+
 An extended version of [AthenaK](https://github.com/IAS-Astrophysics/athenak) for GPU
 simulations of self-gravitating, radiation-pressure-dominated astrophysical flows, together
 with tools that turn the simulation output into synthetic observables.  Tidal disruption
