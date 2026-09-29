@@ -1,0 +1,185 @@
+<comment>
+problem   = TDE of a 1 Msun star by a 1000 Msun black hole, step 3 of 5 (second remap)
+reference = Jiang et al., End-to-End Numerical Framework for TDEs with AthenaK, ApJS, Table 1
+
+# Step 3: remap to the 512 x 512 x 256 Rsun box used for the rest of the calculation.
+#   * Reads the step-2 restart at t = 24 t0 and resamples it onto 9 AMR levels.
+#   * Still in the translating stellar frame.
+#   * From here on a user refinement criterion adds BH-centered refinement shells that
+#     follow the returning stream (stream_shell_* keys) on top of the density criterion.
+#   * Runs to t = 40 t0 (0.45 P_mb).  rst/TDEExternalLTEPrad.00010.rst (t = 40) is the
+#     source of step 4.
+#
+# Run from a directory named 03_remap_box512 next to 02_remap_box256.
+
+<job>
+basename = TDEExternalLTEPrad
+
+<mesh>
+nghost = 2
+nx1    = 64
+x1min  = -128
+x1max  = 128
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 64
+x2min  = -128
+x2max  = 128
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 32
+x3min  = -64
+x3max  = 64
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<units>
+mass_cgs   = 1.98841586e33          # 1 Msun
+length_cgs = 1.3914e11              # 2 Rsun, so star_radius = 0.5 is 1 Rsun
+time_cgs   = 1.2709152632111343e3   # t0 = sqrt(L0^3 / (4 pi G M0))
+mu         = 1.0
+
+<mesh_refinement>
+refinement          = adaptive
+num_levels          = 9
+ncycle_check        = 20
+refinement_interval = 20
+max_nmb_per_rank    = 750
+
+<amr_criterion0>
+method             = min_max
+variable           = hydro_w_d
+value_max          = 1.0e-3
+derefine_value_max = 1.0e-3
+
+<amr_criterion1>                    # BH-centered shells, see stream_shell_* below
+method = user
+
+<refined_region0>                   # minimum level in the central 200 Rsun
+level = 3
+x1min = -50
+x1max = 50
+x2min = -50
+x2max = 50
+x3min = -50
+x3max = 50
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.5
+nlim       = -1
+tlim       = 40.1
+ndiag      = 1
+lat        = false
+
+<hydro>
+eos              = lte_table_chabrier2021_t13_helm_union_prad
+table            = ../chabrier2021_t13_helm_union_prad_640.table
+reconstruct      = plm
+rsolver          = hlle
+dfloor           = 1.0e-10
+pfloor           = 1.0e-12
+tfloor_kelvin    = 1
+sfloor           = 0.0
+cs_ceil          = 15.0
+vceil            = 15.0
+fofc             = false
+dual_energy      = true             # Sec. 5
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
+lte_bounds       = clamp
+lte_debug_checks = false
+allow_reinterpretive_restart = true
+
+<gravity>
+self_gravity = true                 # multigrid self-gravity (Sec. 3.2)
+four_pi_G    = 1.0
+threshold    = 0.0
+fmg_ncycle   = 1
+show_defect  = true
+npresmooth   = 1
+npostsmooth  = 2
+rho_grav_min = 1.0e-9
+solve_dt     = 0.03                 # self-gravity cadence Delta t_sg (Sec. 8.1)
+
+<remap>
+enable        = true
+source        = ../02_remap_box256/rst/TDEExternalLTEPrad.00008.rst
+settle_steps  = 10
+settle_passes = 1
+
+<problem>
+pgen_name = tde_external
+user_srcs = true
+
+# star (read again by the problem generator, the state itself comes from the remap)
+star_radius            = 0.5
+poly_n                 = 1.5
+stellar_structure_mode = eos_balanced
+rho_floor              = 1.0e-10
+relax_damp             = true
+relax_tau              = 0.02
+relax_t_end            = 0.2
+relax_radius           = 0.5
+amp                    = 0.0
+x_center               = 0.0
+y_center               = 0.0
+z_center               = 0.0
+vx_star                = 0.0
+vy_star                = 0.0
+vz_star                = 0.0
+
+# frame and black hole
+external_bh_gravity_source = true   # BH gravity enters as a source term with the same stencil as the BH force
+bh_live               = true   # the BH orbit responds to the gas (leapfrog with the gas pull on the BH)
+use_translating_frame = true
+frame_rho_min         = 1.0e-9
+bh_grav_rho_min       = 1.0e-9
+bh_max_amr            = false
+mass_ratio            = 1000.0      # M_BH / M_star
+beta                  = 1.0         # r_t / r_p
+ecc_bh                = 1.0
+theta_bh              = 0.0
+sep_initial           = 10.0        # initial separation in units of r_t
+bh_softening          = 5.0e-3
+bh_excise_radius      = 0.2
+
+# refinement shells around the BH used by <amr_criterion1>
+unbound_amr                       = false
+unbound_amr_level_offset          = 3
+unbound_amr_rho_min               = 1.0e-9
+stream_shell_dr                   = 0.5
+stream_shell_level_offset         = 0
+stream_shell_xsplit_radius        = 60.0
+stream_shell_rho_frac             = 0.5
+stream_shell_level_radius_1       = 20.0
+stream_shell_level_offset_1       = 1
+stream_shell_dr_1                 = 0.5
+stream_shell_rho_frac_1           = 0.6
+stream_shell_level_radius_2       = 180.0
+stream_shell_level_offset_2       = 2
+stream_shell_dr_2                 = 1.0
+stream_shell_rho_frac_2           = 0.8
+stream_shell_r_max                = 300.0
+stream_shell_derefine_dfloor_mult = 100.0
+
+<output1>
+file_type = hst
+dt        = 0.1
+
+<output2>
+file_type = bin
+variable  = hydro_w
+dt        = 1.0
+
+<output3>
+file_type = rst
+dt        = 8.0

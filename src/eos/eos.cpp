@@ -13,6 +13,7 @@
 #include "mesh/mesh.hpp"
 #include "parameter_input.hpp"
 #include "eos/eos.hpp"
+#include "units/units.hpp"
 
 //----------------------------------------------------------------------------------------
 // EquationOfState constructor
@@ -23,6 +24,15 @@ EquationOfState::EquationOfState(std::string bk, MeshBlockPack* pp, ParameterInp
   eos_data.pfloor = pin->GetOrAddReal(bk,"pfloor",(FLT_MIN));
   eos_data.tfloor = pin->GetOrAddReal(bk,"tfloor",(FLT_MIN));
   eos_data.sfloor = pin->GetOrAddReal(bk,"sfloor",(FLT_MIN));
+  eos_data.cs_ceil = pin->GetOrAddReal(bk,"cs_ceil",0.0);
+  eos_data.vceil = pin->GetOrAddReal(bk,"vceil",(FLT_MAX));
+  if (pp != nullptr && pp->punit != nullptr) {
+    eos_data.density_unit_cgs = pp->punit->density_cgs();
+    eos_data.pressure_unit_cgs = pp->punit->pressure_cgs();
+    eos_data.specific_eint_unit_cgs =
+        eos_data.pressure_unit_cgs/eos_data.density_unit_cgs;
+    eos_data.temp_unit_cgs = pp->punit->temperature_cgs();
+  }
 }
 
 //----------------------------------------------------------------------------------------

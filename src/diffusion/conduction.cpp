@@ -86,6 +86,14 @@ Conduction::~Conduction() {
 
 void Conduction::AddHeatFluxes(const DvceArray5D<Real> &w0, const EOS_Data &eos,
     DvceFaceFld5D<Real> &flx) {
+  // A ghost-extended register is the zero-origin band.
+  AddHeatFluxes(w0, eos, BandFaceFld5D<Real>{BandView5D<Real>{flx.x1f, 0, 0, 0},
+                                                BandView5D<Real>{flx.x2f, 0, 0, 0},
+                                                BandView5D<Real>{flx.x3f, 0, 0, 0}});
+}
+
+void Conduction::AddHeatFluxes(const DvceArray5D<Real> &w0, const EOS_Data &eos,
+    const BandFaceFld5D<Real> &flx) {
   if (alpha_iso != 0) {
     AddHeatFluxIso(w0, eos, flx);
   }
@@ -104,7 +112,7 @@ void Conduction::AddHeatFluxes(const DvceArray5D<Real> &w0, const EOS_Data &eos,
 //! fluxes of conserved variables
 
 void Conduction::AddHeatFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-    DvceFaceFld5D<Real> &flx) {
+    const BandFaceFld5D<Real> &flx) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
@@ -156,7 +164,7 @@ void Conduction::AddHeatFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &eos
 //! \brief Current a no-op function, to be added later
 
 void Conduction::AddHeatFluxAniso(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-    DvceFaceFld5D<Real> &flx) {
+    const BandFaceFld5D<Real> &flx) {
   return;
 }
 
@@ -166,7 +174,7 @@ void Conduction::AddHeatFluxAniso(const DvceArray5D<Real> &w0, const EOS_Data &e
 //! temperature-dependent conductivity
 
 void Conduction::AddHeatFluxSpitzer(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-   DvceFaceFld5D<Real> &flx) {
+   const BandFaceFld5D<Real> &flx) {
 /*
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
@@ -179,9 +187,9 @@ void Conduction::AddHeatFluxSpitzer(const DvceArray5D<Real> &w0, const EOS_Data 
   bool &three_d = pmy_pack->pmesh->three_d;
   Real gm1 = eos.gamma-1.0;
   Real kappaceil = kappa_ceiling;
-  Real temp_unit = pmy_pack->punit->temperature_cgs();
+  Real temp_unit = pmy_pack->TemperatureUnitCGS();
   Real kappa_unit = pmy_pack->punit->pressure_cgs()*pmy_pack->punit->velocity_cgs()*
-                    pmy_pack->punit->length_cgs()/pmy_pack->punit->temperature_cgs();
+                    pmy_pack->punit->length_cgs()/pmy_pack->TemperatureUnitCGS();
 
   // fluxes in x1-direction
   auto &flx1 = flx.x1f;
@@ -328,9 +336,9 @@ void Conduction::NewTimeStep(const DvceArray5D<Real> &w0, const EOS_Data &eos_da
 
   // set flag for Spitzer conductivity
   bool spitzer_ = alpha_spitzer;
-  Real temp_unit = pmy_pack->punit->temperature_cgs();
+  Real temp_unit = pmy_pack->TemperatureUnitCGS();
   Real kappa_unit = pmy_pack->punit->pressure_cgs()*pmy_pack->punit->velocity_cgs()*
-                      pmy_pack->punit->length_cgs()/pmy_pack->punit->temperature_cgs();
+                      pmy_pack->punit->length_cgs()/pmy_pack->TemperatureUnitCGS();
 
   // capture variables for kernel
   auto &indcs = pmy_pack->pmesh->mb_indcs;

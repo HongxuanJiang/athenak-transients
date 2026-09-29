@@ -28,8 +28,8 @@ TaskStatus MHD::CT(Driver *pdriver, int stage) {
   int nmb1 = pmy_pack->nmb_thispack - 1;
 
   // capture class variables for the kernels
-  Real &gam0 = pdriver->gam0[stage-1];
-  Real &gam1 = pdriver->gam1[stage-1];
+  Real gam0, gam1;
+  TransportStageWeights(pdriver, stage, gam0, gam1);
   Real beta_dt = (pdriver->beta[stage-1])*(pmy_pack->pmesh->dt);
   bool &multi_d = pmy_pack->pmesh->multi_d;
   bool &three_d = pmy_pack->pmesh->three_d;

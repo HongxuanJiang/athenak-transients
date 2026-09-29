@@ -50,6 +50,7 @@ SphericalSurface::SphericalSurface(MeshBlockPack *pmy_pack, int ntheta,
   InitializeRadius();
   SetInterpolationIndices();
   SetInterpolationWeights();
+  interp_topology_version_ = pmy_pack->pmesh->topology_version;
   return;
 }
 
@@ -225,11 +226,15 @@ void SphericalSurface::SetInterpolationWeights() {
 
 void SphericalSurface::InterpolateToSphere(int var_ind,
                                            DvceArray5D<Real> &val) {
-  // reinitialize interpolation indices and weights if AMR
-  // if (pmy_pack->pmesh->adaptive) {
-  //  SetInterpolationIndices();
-  //  SetInterpolationWeights();
-  //}
+  // Rebuild the interpolation indices and weights whenever the block layout has changed
+  // since they were built: Mesh::topology_version is bumped, on every rank, by every AMR
+  // regrid and LAT load-balance transaction (MeshRefinement::RedistAndRefineMeshBlocks).
+  const std::uint64_t topology_version = pmy_pack->pmesh->topology_version;
+  if (topology_version != interp_topology_version_) {
+    SetInterpolationIndices();
+    SetInterpolationWeights();
+    interp_topology_version_ = topology_version;
+  }
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int &is = indcs.is;
   int &js = indcs.js;

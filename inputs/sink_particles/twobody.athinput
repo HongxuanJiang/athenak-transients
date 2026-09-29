@@ -1,0 +1,118 @@
+# AthenaK input: sink-particle two-body circular orbit (battery case "twobody")
+#
+# Two equal sinks on a circular orbit in a near-vacuum box.  Gates the ported
+# Bulirsch-Stoer/Stoermer N-body integrator (sink_particles_nbody.cpp) alone: period,
+# energy drift and centre-of-mass drift over 5 orbits.
+#
+# Setup (G = 1):
+#   m1 = m2 = 0.5, separation d = 1, softening s = soften*dx_finest = 0.01*0.5 = 0.005
+#   The pair force is  a = -G m rhat/(r^2 + s^2)  (NOT Plummer), so the exact circular
+#   relative speed and period of THAT law are
+#       v_rel = sqrt(G M_tot d/(d^2 + s^2)) = 0.9999875002343701
+#       P     = 2 pi d / v_rel              = 6.283263846505059
+#   while the unsoftened Kepler period is P_kep = 6.283185307179586; the softening bias
+#   is +1.2499921876e-05, i.e. 8x inside the 1e-4 period gate, so the gate may be taken
+#   against either reference (the harness reports both).
+#   Each sink carries momentum m*v_rel/2 = 0.24999687505859253, sink 0 at +x moving +y.
+#   Exact softened-law energy  E0 = KE + U,  U = -(G m1 m2/s) atan(s/d) = -0.12500104161979309
+#
+# The grid is deliberately coarse (8^3, dx = 0.5): the gas is inert here, and the
+# timestep is set by the deepest point of the softened well the gas falls into,
+# dt ~ cfl dx/(c_s + sqrt(pi G M/s)), so a coarse grid is what keeps the 5-orbit run at
+# a few thousand cycles.  8 MeshBlocks of 4^3 keep the case runnable on up to 8 ranks.
+#
+# The gas exists only because <hydro> is mandatory.  rho = 1e-30 makes the gas->sink
+# kick (~1e-31) a floating-point NO-OP against momenta of order 0.25, so the orbit is
+# pure N-body and the run is deterministic; p is set so c_s = 2, which keeps the
+# in-falling near-vacuum gas subsonic-ish and the timestep near dx/(c_s + v_esc).
+# Both floors stay at their FLT_MIN defaults, which are far below 1e-30.
+#
+# merge_link_cells and mmergemax are both set so the pair can never merge:
+# link = 0.5*dx = 0.25 << d = 1, and every member is above mmergemax = 0.1.
+
+<comment>
+problem   = two sink particles on a circular orbit
+
+<job>
+basename  = sink_twobody
+
+<mesh>
+nghost    = 2
+nx1       = 8
+x1min     = -2.0
+x1max     = 2.0
+ix1_bc    = periodic
+ox1_bc    = periodic
+
+nx2       = 8
+x2min     = -2.0
+x2max     = 2.0
+ix2_bc    = periodic
+ox2_bc    = periodic
+
+nx3       = 8
+x3min     = -2.0
+x3max     = 2.0
+ix3_bc    = periodic
+ox3_bc    = periodic
+
+<meshblock>
+nx1       = 4
+nx2       = 4
+nx3       = 4
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim       = -1
+tlim       = 31.416319232525293   # 5 softened-law orbits
+ndiag      = 500
+lat        = false
+hydro_lat_levels = 1
+
+<hydro>
+eos         = ideal
+reconstruct = plm
+rsolver     = hllc
+gamma       = 1.6666666666666667
+
+<sink_particles>
+create               = false
+accrete              = false      # pure N-body: no gas is removed
+accrete_radius_cells = 4
+soften               = 0.01       # s = 0.005 = 0.005 d  ->  period bias 1.25e-05
+merge_link_cells     = 0.5        # link = 0.25 << d = 1; the pair never merges
+mmergemax            = 0.1        # both sinks are "flagged" (m = 0.5 > 0.1): belt+braces
+jeans_no             = 0.25
+r_angmom             = 1.0e100
+use_sink_timestep    = true
+subcell_gravity      = false
+bs_tol               = 1.0e-10    # integrator error made irrelevant to the 1e-4 gate
+newton_g             = 1.0
+log                  = sinks.log
+n_init               = 2
+# m, x, y, z, px, py, pz
+init0                = 0.5,  0.5, 0.0, 0.0, 0.0,  0.24999687505859253, 0.0
+init1                = 0.5, -0.5, 0.0, 0.0, 0.0, -0.24999687505859253, 0.0
+
+<problem>
+pgen_name  = shock_tube
+shock_dir  = 1
+xshock     = 0.0
+dl = 1.0e-30
+pl = 2.4e-30              # c_s = sqrt(gamma p/rho) = 2
+ul = 0.0
+vl = 0.0
+wl = 0.0
+
+dr = 1.0e-30
+pr = 2.4e-30
+ur = 0.0
+vr = 0.0
+wr = 0.0
+
+<output1>
+file_type   = hst
+data_format = %24.17e
+dcycle      = 50

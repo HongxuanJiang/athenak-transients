@@ -1,0 +1,101 @@
+<job>
+basename = hydro_lte_thermo_tube
+
+<mesh>
+nghost = 2
+nx1    = 64
+x1min  = -0.5
+x1max  = 0.5
+ix1_bc = outflow
+ox1_bc = outflow
+nx2    = 1
+x2min  = -0.5
+x2max  = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3    = 1
+x3min  = -0.5
+x3max  = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 64
+nx2 = 1
+nx3 = 1
+
+<units>
+mass_cgs   = 1.98841586e33
+length_cgs = 1.3914e11
+time_cgs   = 1.2709152632111343e3
+mu         = 1.0
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim       = 10
+tlim       = 1.0e30
+ndiag      = 1
+
+<hydro>
+eos           = lte_table_chabrier2021_t13_helm_union_prad
+table         = eos_tables/chabrier2021_t13_helm_union_prad_640.table
+reconstruct   = plm
+rsolver       = hlle
+dfloor        = 1.0e-14
+pfloor        = 1.0e-20
+tfloor_kelvin = 1.0
+sfloor        = 0.0
+lte_bounds    = clamp
+
+<problem>
+pgen_name = shock_tube
+shock_dir = 1
+xshock    = 0.0
+dl = 1.355e-8
+pl = 1.0e-11
+ul = 0.0
+vl = 0.0
+wl = 0.0
+dr = 1.355e-10
+pr = 1.0e-14
+ur = 0.0
+vr = 0.0
+wr = 0.0
+
+<output1>
+file_type = bin
+variable  = hydro_w
+variable_precision = float64
+dt        = 1.0e30
+
+<output2>
+file_type = bin
+variable  = hydro_temperature
+variable_precision = float64
+dt        = 1.0e30
+
+<output3>
+file_type = bin
+variable  = hydro_mu
+variable_precision = float64
+dt        = 1.0e30
+
+<output4>
+file_type = bin
+variable  = hydro_beta_rad
+variable_precision = float64
+dt        = 1.0e30
+
+<output5>
+file_type = bin
+variable  = hydro_xion
+variable_precision = float64
+dt        = 1.0e30
+
+<output6>
+file_type = bin
+variable  = hydro_gamma1
+variable_precision = float64
+dt        = 1.0e30

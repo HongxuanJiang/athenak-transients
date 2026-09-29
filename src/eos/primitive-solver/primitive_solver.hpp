@@ -162,6 +162,87 @@ class PrimitiveSolver {
     }
   };
   // }}}
+
+  // AdiabatRootFunctor {{{
+  //! \brief The same Kastaun root function with the pressure taken from the advected
+  //  adiabat instead of from the conserved energy.
+  //
+  //  It differs from RootFunctor in exactly one place: where that one forms
+  //  `eoverD = qbar - mu*rbarsq + 1` -- a difference of two terms that are both O(b^2/D)
+  //  in a magnetically dominated cell, so that the gas energy survives only in the
+  //  digits left after the cancellation -- this one evaluates the temperature from
+  //  kappa and the density directly, which is a power, not a difference.  The
+  //  conditioning of the recovered pressure therefore does not depend on b^2/u at all,
+  //  and neither does the Lorentz factor, which comes out of the same root.
+  //
+  //  q does not appear, so the energy equation is discarded for the cells that use this
+  //  branch: total energy is not conserved there.  That is the price of the channel and
+  //  the reason the eta1 test is a ratio and not a failure flag -- it is only taken
+  //  where the discarded energy is a set fraction of the cell's own budget.
+  //
+  //  It is a separate functor rather than a branch in RootFunctor because the GR
+  //  inversion kernels are instruction-bound: a runtime flag there would carry both
+  //  code paths through every iteration of every cell.
+  class AdiabatRootFunctor {
+   public:
+    KOKKOS_INLINE_FUNCTION
+    Real operator()(Real mu, Real D, Real kappa, Real q, Real bsq, Real rsq, Real rbsq,
+        Real *Y, const EOS<EOSPolicy, ErrorPolicy> * peos,
+        Real* n, Real* T, Real* P) const {
+      const Real x = 1.0/(1.0 + mu*bsq);
+      const Real rbarsq = x*(rsq*x + mu*(x + 1.0)*rbsq);
+      const Real mb = peos->GetBaryonMass();
+
+      // Velocity and Lorentz factor: identical to the energy branch, and bounded the
+      // same way.
+      const Real h_min = peos->GetMinimumEnthalpy();
+      const Real vsq_max = Kokkos::fmin(rsq/(h_min*h_min + rsq),
+                                    peos->GetMaxVelocity()*peos->GetMaxVelocity());
+      const Real vhatsq = Kokkos::fmin(mu*mu*rbarsq, vsq_max);
+      const Real iWhat = Kokkos::sqrt(1.0 - vhatsq);
+
+      Real rhohat = D*iWhat;
+      Real nhat = rhohat/mb;
+      peos->ApplyDensityLimits(nhat);
+
+      // The one line that differs from RootFunctor.
+      Real That = peos->GetTemperatureFromAdiabat(nhat, kappa, Y);
+      peos->ApplyTemperatureLimits(That);
+
+      Real ehat = peos->GetEnergy(nhat, That, Y);
+      // Nothing in the transport bounds the advected adiabat from above, and a cell
+      // whose density reaches its floor turns kappa into a finite numerator over a
+      // floor.  The state that implies owns more internal energy than the cell has, so
+      // it is capped at q = tau/D, the budget the conserved variables carry.  Without
+      // this the pressure feeds the next flux, which feeds the next kappa.
+      // rhohat*q, not D*q: q = tau/D is per unit rest mass in the FLUID frame, and
+      // D = rho*W, so D*q overstates the budget by exactly the Lorentz factor.
+      const Real eint_max = rhohat*q;
+      const Real eint_hat = ehat - rhohat;
+      if ((eint_max > 0.0) && isfinite(eint_max) && (eint_hat > eint_max)) {
+        That = peos->GetTemperatureFromE(nhat, rhohat + eint_max, Y);
+        peos->ApplyTemperatureLimits(That);
+        ehat = peos->GetEnergy(nhat, That, Y);
+      }
+      Real Phat = peos->GetPressure(nhat, That, Y);
+      Real hhat = (ehat + Phat)/(mb*nhat);
+
+      // Both estimates of nu = h/W agree here unless the density limit moved nhat, so
+      // the fmax only guards that case; it is kept for parity with the energy branch.
+      Real nu_a = hhat*iWhat;
+      Real nu_b = (ehat + Phat)/D;
+      Real nuhat = Kokkos::fmax(nu_a, nu_b);
+
+      Real muhat = 1.0/(nuhat + mu*rbarsq);
+
+      *n = nhat;
+      *T = That;
+      *P = Phat;
+
+      return mu - muhat;
+    }
+  };
+  // }}}
  private:
   /// A constant pointer to the EOS.
   /// We make this constant because the
@@ -176,6 +257,7 @@ class PrimitiveSolver {
   UpperRootFunctor UpperRoot;
   MuFromWFunctor MuFromW;
   RootFunctor RootFunction;
+  AdiabatRootFunctor AdiabatRootFunction;
 
   //! \brief Check and handle the corner case for rho being too small or large.
   //
@@ -220,9 +302,15 @@ class PrimitiveSolver {
   //  \param[in]     g3u   The 3x3 inverse spatial metric
   //
   //  \return information about the solve
+  //  \param[in]     kappa The advected adiabat p/rho^Gamma.  A value that is not
+  //                       strictly positive (the default) selects the conserved-energy
+  //                       channel and reproduces the original solve exactly; a positive
+  //                       value selects the auxiliary channel, which discards the energy
+  //                       equation and takes the pressure from kappa instead.
   KOKKOS_INLINE_FUNCTION
   SolverResult ConToPrim(Real prim[NPRIM], Real cons[NCONS], Real b[NMAG],
-                         Real g3d[NSPMETRIC], Real g3u[NSPMETRIC]) const;
+                         Real g3d[NSPMETRIC], Real g3u[NSPMETRIC],
+                         Real kappa = -1.0) const;
 
   //! \brief Get the conserved variables from the primitive variables.
   //
@@ -332,7 +420,8 @@ Error PrimitiveSolver<EOSPolicy, ErrorPolicy>::CheckDensityValid(Real& mul, Real
 template<typename EOSPolicy, typename ErrorPolicy>
 KOKKOS_INLINE_FUNCTION
 SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM],
-      Real cons[NCONS], Real b[NMAG], Real g3d[NSPMETRIC], Real g3u[NSPMETRIC]) const {
+      Real cons[NCONS], Real b[NMAG], Real g3d[NSPMETRIC], Real g3u[NSPMETRIC],
+      Real kappa) const {
   SolverResult solver_result{Error::SUCCESS, 0, false, false, false};
 
   // Extract the undensitized conserved variables.
@@ -341,12 +430,24 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   Real tau = cons[CTA];
   Real B_u[3] = {b[IBX], b[IBY], b[IBZ]};
   // Extract the particle fractions.
+  //
+  // Every species loop below runs to the compile-time MAX_SPECIES and predicates its
+  // body on the runtime count rather than using the count as the trip bound.  A loop
+  // bounded by a runtime value leaves Y[], prim[] and cons[] with runtime-variable
+  // subscripts, which forces all three point arrays into thread-local memory for the
+  // whole kernel; with a constant bound nvcc unrolls, every subscript becomes a
+  // constant, and the arrays stay in registers.  Measured on the dyn-GR ConsToPrim
+  // kernels this removes ~45% of the local-memory instructions across all EOS
+  // policies (most of all for the tabulated ones) at ~5% less code.  The predicate
+  // keeps the semantics identical -- the same elements are written, in the same
+  // order, and MAX_SPECIES is unchanged, so no configuration loses capability.
   const int n_species = eos.GetNSpecies();
   Real Y[MAX_SPECIES] = {0.0};
   // Avoid division by zero.
   if (cons[CDN] > 0 ) {
-    for (int s = 0; s < n_species; s++) {
-      Y[s] = cons[CYD + s]/cons[CDN];
+    #pragma unroll
+    for (int s = 0; s < MAX_SPECIES; s++) {
+      if (s < n_species) Y[s] = cons[CYD + s]/cons[CDN];
     }
   }
   // Apply limits to Y to ensure a physical state
@@ -355,7 +456,13 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   // Check the conserved variables for consistency and do whatever
   // the EOSPolicy wants us to.
   bool floored = eos.ApplyConservedFloor(D, S_d, tau, Y, SquareVector(B_u, g3d));
+  // Raised ahead of either root functor, so it describes the conserved state the cell
+  // was handed and not the channel about to invert it.  A caller that inverts the same
+  // cell twice -- the dual-energy formalism does, once per channel -- gets the same
+  // answer from both and must keep it when it discards one of the two solves.
   solver_result.cons_floor = floored;
+  // The floor added rest mass to the cell and kept tau (and S_i): see cons_mass_floor.
+  solver_result.cons_mass_floor = floored && (D > cons[CDN]);
   if (floored && eos.IsConservedFlooringFailure()) {
     HandleFailure(prim, cons, b, g3d);
     solver_result.error = Error::CONS_FLOOR;
@@ -363,8 +470,9 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   }
   // If a floor is applied or Y is adjusted, we need to propagate the changes back to DYe.
   if (floored || Y_adjusted) {
-    for (int s = 0; s < n_species; s++) {
-      cons[CYD + s] = D*Y[s];
+    #pragma unroll
+    for (int s = 0; s < MAX_SPECIES; s++) {
+      if (s < n_species) cons[CYD + s] = D*Y[s];
     }
   }
 
@@ -388,12 +496,15 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
     return solver_result;
   }
   // We have to check the particle fractions separately.
-  for (int s = 0; s < n_species; s++) {
-    if (!isfinite(Y[s])) {
-      HandleFailure(prim, cons, b, g3d);
-      solver_result.error = Error::NANS_IN_CONS;
-      return solver_result;
-    }
+  bool Y_nan = false;
+  #pragma unroll
+  for (int s = 0; s < MAX_SPECIES; s++) {
+    if (s < n_species && !isfinite(Y[s])) Y_nan = true;
+  }
+  if (Y_nan) {
+    HandleFailure(prim, cons, b, g3d);
+    solver_result.error = Error::NANS_IN_CONS;
+    return solver_result;
   }
 
   // Make sure that the magnetic field is physical.
@@ -409,7 +520,7 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
     Real Bsq = SquareVector(B_u, g3d);
     D = Bsq/bsqr;
     r_d[0] = S_d[0]/D; r_d[1] = S_d[1]/D; r_d[2] = S_d[2]/D;
-    RaiseForm(r_u, r_d, g3d);
+    RaiseForm(r_u, r_d, g3u);
     rb = Contract(b_u, r_d);
     rbsqr = rb*rb;
     q = tau/D;
@@ -489,10 +600,16 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   }
 
 
-  // Do the root solve.
+  // Do the root solve.  The bracket, the upper bound and the velocity recovery below
+  // are the same for both channels -- only the function whose root is sought differs,
+  // because only the pressure is taken from somewhere else.
   Real n, P, T, mu;
-  bool result = root.FalsePosition(RootFunction, mul, muh, mu, tol,
-                                   D, q, bsqr, rsqr, rbsqr, Y, &eos, &n, &T, &P);
+  const bool use_adiabat = (kappa > 0.0) && isfinite(kappa) && eos.HasAdiabat();
+  bool result = use_adiabat
+      ? root.FalsePosition(AdiabatRootFunction, mul, muh, mu, tol,
+                           D, kappa, q, bsqr, rsqr, rbsqr, Y, &eos, &n, &T, &P)
+      : root.FalsePosition(RootFunction, mul, muh, mu, tol,
+                           D, q, bsqr, rsqr, rbsqr, Y, &eos, &n, &T, &P);
   // WARNING: the reported number of iterations is not thread-safe and should only be
   // trusted on single-thread benchmarks.
   solver_result.iterations = root.iterations;
@@ -516,8 +633,34 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   Wv_u[1] = Wmux*(r_u[1] + rbmu*b_u[1]);
   Wv_u[2] = Wmux*(r_u[2] + rbmu*b_u[2]);
 
-  // Apply the flooring policy to the primitive variables.
+  // The enthalpy density the inversion actually recovered.  Everything the floors add
+  // from here on is measured against it, because the drift-frame re-injection that
+  // decides the velocity of the added material needs the state it was added to.  It is
+  // recorded rather than acted on here: the caller applies every bound at once and
+  // re-solves the velocity a single time, so that a cell caught by the atmosphere floor
+  // and the magnetization ceiling in the same step is not rotated twice.
+  solver_result.w_prefloor = n*eos.GetBaryonMass()*eos.GetEnthalpy(n, T, Y);
+
+  // Apply the flooring policy to the primitive variables.  The policy adds its mass at
+  // the cell's temperature, which is the right temperature for a gas.  In a cell whose
+  // D the conserved floor has just raised (cons_mass_floor) it need not be: for
+  // D << D_floor, T is the leftover tau divided by the floor's mass and has no bound, and
+  // mass added at it carries (added mass) x (that specific energy) of heat nothing paid
+  // for.  In every such cell the added mass therefore comes cold, as the conserved
+  // floor's own did: the internal energy density is kept and T re-solved from it, at
+  // least T_atm.
+  const Real rho_prefloor = n*eos.GetBaryonMass();
+  const Real u_prefloor = solver_result.cons_mass_floor ?
+      eos.GetEnergy(n, T, Y) - rho_prefloor : 0.0;
   floored = eos.ApplyPrimitiveFloor(n, Wv_u, P, T, Y);
+  if (floored && solver_result.cons_mass_floor && n*eos.GetBaryonMass() > rho_prefloor) {
+    T = fmax(eos.GetTemperatureFromE(n, n*eos.GetBaryonMass() + u_prefloor, Y),
+             eos.GetTemperatureFloor());
+    P = eos.GetPressure(n, T, Y);
+  }
+  // The counterpart of cons_floor above: this one is measured on the state the root solve
+  // just recovered, so it belongs to that root alone and is meaningless for a channel
+  // whose answer was thrown away.
   solver_result.prim_floor = floored;
   if (floored && eos.IsPrimitiveFlooringFailure()) {
     HandleFailure(prim, cons, b, g3d);
@@ -533,8 +676,9 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   prim[PVX] = Wv_u[0];
   prim[PVY] = Wv_u[1];
   prim[PVZ] = Wv_u[2];
-  for (int s = 0; s < n_species; s++) {
-    prim[PYF + s] = Y[s];
+  #pragma unroll
+  for (int s = 0; s < MAX_SPECIES; s++) {
+    if (s < n_species) prim[PYF + s] = Y[s];
   }
 
   // If we floored the primitive variables, we should check
@@ -563,8 +707,9 @@ Error PrimitiveSolver<EOSPolicy, ErrorPolicy>::PrimToCon(Real prim[NPRIM],
   const Real B_u[3] = {bu[IBX], bu[IBY], bu[IBZ]};
   const int n_species = eos.GetNSpecies();
   Real Y[MAX_SPECIES] = {0.0};
-  for (int s = 0; s < n_species; s++) {
-    Y[s] = prim[PYF + s];
+  #pragma unroll
+  for (int s = 0; s < MAX_SPECIES; s++) {
+    if (s < n_species) Y[s] = prim[PYF + s];
   }
 
   // Note that Athena passes in Wv, not v.
@@ -600,8 +745,9 @@ Error PrimitiveSolver<EOSPolicy, ErrorPolicy>::PrimToCon(Real prim[NPRIM],
   Real H = n*eos.GetEnthalpy(n, t, Y)*mb;
   Real HWsq = H*Wsq;
   D = n*mb*W;
-  for (int s = 0; s < n_species; s++) {
-    cons[CYD + s]= D*Y[s];
+  #pragma unroll
+  for (int s = 0; s < MAX_SPECIES; s++) {
+    if (s < n_species) cons[CYD + s] = D*Y[s];
   }
   Real HWsqpb = HWsq + Bsq;
   Sx = (HWsqpb*v_d[0] - Bv*B_d[0]);

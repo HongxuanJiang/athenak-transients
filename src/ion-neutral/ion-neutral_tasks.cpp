@@ -72,12 +72,12 @@ void IonNeutral::AssembleIonNeutralTasks(
   id.sendb    = tl["stagen"]->AddTask(&MHD::SendB, pmhd, id.restb);
   id.recvb    = tl["stagen"]->AddTask(&MHD::RecvB, pmhd, id.sendb);
 
-  id.i_bcs    = tl["stagen"]->AddTask(&MHD::ApplyPhysicalBCs, pmhd, id.recvb);
-  id.n_bcs    = tl["stagen"]->AddTask(&Hydro::ApplyPhysicalBCs, phyd, id.n_recvu);
-  id.i_prol   = tl["stagen"]->AddTask(&MHD::Prolongate, pmhd, id.i_bcs);
-  id.n_prol   = tl["stagen"]->AddTask(&Hydro::Prolongate, phyd, id.n_bcs);
-  id.i_c2p    = tl["stagen"]->AddTask(&MHD::ConToPrim, pmhd, id.i_prol);
-  id.n_c2p    = tl["stagen"]->AddTask(&Hydro::ConToPrim, phyd, id.n_prol);
+  id.i_prol   = tl["stagen"]->AddTask(&MHD::Prolongate, pmhd, id.recvb);
+  id.n_prol   = tl["stagen"]->AddTask(&Hydro::Prolongate, phyd, id.n_recvu);
+  id.i_bcs    = tl["stagen"]->AddTask(&MHD::ApplyPhysicalBCs, pmhd, id.i_prol);
+  id.n_bcs    = tl["stagen"]->AddTask(&Hydro::ApplyPhysicalBCs, phyd, id.n_prol);
+  id.i_c2p    = tl["stagen"]->AddTask(&MHD::ConToPrim, pmhd, id.i_bcs);
+  id.n_c2p    = tl["stagen"]->AddTask(&Hydro::ConToPrim, phyd, id.n_bcs);
   id.i_newdt  = tl["stagen"]->AddTask(&MHD::NewTimeStep, pmhd, id.i_c2p);
   id.n_newdt  = tl["stagen"]->AddTask(&Hydro::NewTimeStep, phyd, id.n_c2p);
 

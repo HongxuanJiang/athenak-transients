@@ -40,6 +40,7 @@
 #include "outputs/outputs.hpp"
 #include "driver/driver.hpp"
 #include "utils/utils.hpp"
+#include "utils/env_switch.hpp"
 
 // MPI/OpenMP headers
 #if MPI_PARALLEL_ENABLED
@@ -117,6 +118,10 @@ int main(int argc, char *argv[]) {
   global_variable::my_rank = 0;
   global_variable::nranks  = 1;
 #endif  // MPI_PARALLEL_ENABLED
+
+  // Broadcast rank 0's ATHENAK_* environment switches before anything can read one, so a
+  // per-rank difference in the launch environment cannot desynchronise the ranks.
+  env_switch::Sync();
 
   Kokkos::initialize(argc, argv);
 
@@ -232,6 +237,22 @@ int main(int argc, char *argv[]) {
 
   ParameterInput* pinput = new ParameterInput;
   IOWrapper infile, restartfile;
+  std::string hydro_eos_from_restart = "none";
+  std::string mhd_eos_from_restart = "none";
+  std::string hydro_table_from_restart = "unknown";
+  std::string mhd_table_from_restart = "unknown";
+  std::string hydro_table_type_from_restart = "unknown";
+  std::string mhd_table_type_from_restart = "unknown";
+  Real hydro_lte_x_from_restart = -1.0;
+  Real mhd_lte_x_from_restart = -1.0;
+  Real hydro_lte_y_from_restart = -1.0;
+  Real mhd_lte_y_from_restart = -1.0;
+  Real hydro_lte_prad_from_restart = -1.0;
+  Real mhd_lte_prad_from_restart = -1.0;
+  Real hydro_lte_h2_from_restart = -1.0;
+  Real mhd_lte_h2_from_restart = -1.0;
+  Real hydro_lte_zpe_from_restart = -1.0;
+  Real mhd_lte_zpe_from_restart = -1.0;
   // read parameters from restart file
   bool single_file_per_rank = false; // DBF: flag for single_file_per_rank for rst files
   if (res_flag) {
@@ -262,6 +283,62 @@ int main(int argc, char *argv[]) {
     // read parameters from restart file
     restartfile.Open(restart_file.c_str(),IOWrapper::FileMode::read,single_file_per_rank);
     pinput->LoadFromFile(restartfile, single_file_per_rank);
+    if (pinput->DoesParameterExist("hydro", "eos")) {
+      hydro_eos_from_restart = pinput->GetString("hydro", "eos");
+    }
+    if (pinput->DoesParameterExist("hydro", "table")) {
+      hydro_table_from_restart = pinput->GetString("hydro", "table");
+    }
+    if (pinput->DoesParameterExist("mhd", "eos")) {
+      mhd_eos_from_restart = pinput->GetString("mhd", "eos");
+    }
+    if (pinput->DoesParameterExist("mhd", "table")) {
+      mhd_table_from_restart = pinput->GetString("mhd", "table");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "hydro_table_type_runtime")) {
+      hydro_table_type_from_restart =
+          pinput->GetString("saha_runtime", "hydro_table_type_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "mhd_table_type_runtime")) {
+      mhd_table_type_from_restart =
+          pinput->GetString("saha_runtime", "mhd_table_type_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "hydro_lte_x_runtime")) {
+      hydro_lte_x_from_restart = pinput->GetReal("saha_runtime", "hydro_lte_x_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "mhd_lte_x_runtime")) {
+      mhd_lte_x_from_restart = pinput->GetReal("saha_runtime", "mhd_lte_x_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "hydro_lte_y_runtime")) {
+      hydro_lte_y_from_restart = pinput->GetReal("saha_runtime", "hydro_lte_y_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "mhd_lte_y_runtime")) {
+      mhd_lte_y_from_restart = pinput->GetReal("saha_runtime", "mhd_lte_y_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "hydro_lte_prad_runtime")) {
+      hydro_lte_prad_from_restart =
+          pinput->GetReal("saha_runtime", "hydro_lte_prad_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "mhd_lte_prad_runtime")) {
+      mhd_lte_prad_from_restart =
+          pinput->GetReal("saha_runtime", "mhd_lte_prad_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "hydro_lte_h2_runtime")) {
+      hydro_lte_h2_from_restart =
+          pinput->GetReal("saha_runtime", "hydro_lte_h2_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "mhd_lte_h2_runtime")) {
+      mhd_lte_h2_from_restart =
+          pinput->GetReal("saha_runtime", "mhd_lte_h2_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "hydro_lte_zpe_runtime")) {
+      hydro_lte_zpe_from_restart =
+          pinput->GetReal("saha_runtime", "hydro_lte_zpe_runtime");
+    }
+    if (pinput->DoesParameterExist("saha_runtime", "mhd_lte_zpe_runtime")) {
+      mhd_lte_zpe_from_restart =
+          pinput->GetReal("saha_runtime", "mhd_lte_zpe_runtime");
+    }
   }
 
   // read parameters from input file.  If both -r and -i are specified, this will
@@ -273,6 +350,123 @@ int main(int argc, char *argv[]) {
     pinput->CheckBlockNames();
   }
   pinput->ModifyFromCmdline(argc, argv);
+  pinput->SetBoolean("saha_runtime", "restart_active", res_flag);
+  pinput->SetString("saha_runtime", "hydro_eos_from_restart", hydro_eos_from_restart);
+  pinput->SetString("saha_runtime", "mhd_eos_from_restart", mhd_eos_from_restart);
+  pinput->SetString("saha_runtime", "hydro_table_from_restart", hydro_table_from_restart);
+  pinput->SetString("saha_runtime", "mhd_table_from_restart", mhd_table_from_restart);
+  pinput->SetString("saha_runtime", "hydro_table_type_from_restart",
+                    hydro_table_type_from_restart);
+  pinput->SetString("saha_runtime", "mhd_table_type_from_restart",
+                    mhd_table_type_from_restart);
+  pinput->SetReal("saha_runtime", "hydro_lte_x_from_restart", hydro_lte_x_from_restart);
+  pinput->SetReal("saha_runtime", "mhd_lte_x_from_restart", mhd_lte_x_from_restart);
+  pinput->SetReal("saha_runtime", "hydro_lte_y_from_restart", hydro_lte_y_from_restart);
+  pinput->SetReal("saha_runtime", "mhd_lte_y_from_restart", mhd_lte_y_from_restart);
+  pinput->SetReal("saha_runtime", "hydro_lte_prad_from_restart",
+                  hydro_lte_prad_from_restart);
+  pinput->SetReal("saha_runtime", "mhd_lte_prad_from_restart", mhd_lte_prad_from_restart);
+  pinput->SetReal("saha_runtime", "hydro_lte_h2_from_restart", hydro_lte_h2_from_restart);
+  pinput->SetReal("saha_runtime", "mhd_lte_h2_from_restart", mhd_lte_h2_from_restart);
+  pinput->SetReal("saha_runtime", "hydro_lte_zpe_from_restart",
+                  hydro_lte_zpe_from_restart);
+  pinput->SetReal("saha_runtime", "mhd_lte_zpe_from_restart", mhd_lte_zpe_from_restart);
+
+  // Refuse inputs that enable a module or a combination that this public release omits.
+  {
+    struct RemovedModule {const char *module; const char *block; const char *key;
+                          bool key_is_flag;};
+    // an empty key means that the block itself enables the module; a key that is not a
+    // flag enables it whenever it is present
+    const RemovedModule removed[] = {
+      {"GR M1 radiation", "radiation_m1", "", true},
+      {"GR M1 radiation", "bns_nurates", "", true},
+      {"GR M1 radiation", "photons", "", true},
+      {"Newtonian M1 radiation", "radiation_newt", "", true},
+      {"Newtonian M1 radiation", "problem", "rad_lte_seed", true},
+      {"Newtonian M1 radiation", "problem", "rad_pgen_opacity", true},
+      {"Newtonian M1 radiation", "mesh_refinement", "drad_max", false},
+      {"hybrid force-free", "forcefree", "", true},
+      {"hybrid force-free", "forcefree_restart", "", true},
+      {"hybrid force-free", "mhd", "hybrid_forcefree", true},
+      {"two-temperature thermodynamics", "two_temperature", "", true},
+      {"nonthermal electrons", "two_temperature", "nonthermal_enable", true},
+    };
+    for (const auto &r : removed) {
+      const bool has_key = (r.key[0] != '\0');
+      if (!pinput->DoesBlockExist(r.block)) continue;
+      if (has_key && !pinput->DoesParameterExist(r.block, r.key)) continue;
+      if (has_key && r.key_is_flag && !pinput->GetBoolean(r.block, r.key)) continue;
+      if (global_variable::my_rank == 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "The " << r.module << " module is not included in "
+                  << "this public release of the code (input "
+                  << (has_key ? "key " : "block ") << r.block
+                  << (has_key ? "/" : "") << r.key << ")." << std::endl;
+      }
+      std::exit(EXIT_FAILURE);
+    }
+    if (pinput->IsLATEnabled() && pinput->DoesBlockExist("mhd")) {
+      if (global_variable::my_rank == 0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl
+                  << "LAT for MHD and GRMHD is not included in this public release. "
+                  << "It is available on request from Hong-Xuan Jiang "
+                  << "(masterjoe2000@outlook.com)." << std::endl;
+      }
+      std::exit(EXIT_FAILURE);
+    }
+  }
+
+  // TDE remapping is applied after mesh construction, so reject combinations that would
+  // make BuildTree/LoadBalance consume LAT metadata for the pre-remap state.
+  const bool initial_tde_remap =
+      !res_flag && pinput->DoesParameterExist("problem", "remap") &&
+      pinput->GetBoolean("problem", "remap");
+  const bool hydro_lat_requested = pinput->IsLATEnabled();
+  const bool self_gravity_requested =
+      pinput->DoesBlockExist("gravity") &&
+      pinput->GetOrAddBoolean("gravity", "self_gravity", true);
+  const std::string pgen_name =
+      pinput->DoesBlockExist("problem") ?
+      pinput->GetOrAddString("problem", "pgen_name", "none") : "none";
+  const bool analytic_bh_source_problem =
+      (pgen_name == "tde_external");
+  const bool external_bh_gravity_requested =
+      pinput->DoesBlockExist("problem") &&
+      pinput->GetOrAddBoolean("problem", "external_bh_gravity_source",
+                              analytic_bh_source_problem);
+  if (initial_tde_remap && hydro_lat_requested) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl
+              << "time/lat cannot be used with problem/remap=true."
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const bool self_gravity_lat_has_solve_dt =
+      pinput->DoesParameterExist("gravity", "solve_dt") &&
+      pinput->GetReal("gravity", "solve_dt") > 0.0;
+  if (hydro_lat_requested && self_gravity_requested &&
+      !self_gravity_lat_has_solve_dt) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl
+              << "time/lat with gravity/self_gravity=true requires "
+              << "gravity/solve_dt > 0 so the frozen-potential LAT window is bounded."
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+  const std::string hydro_lat_neighbor_limiter =
+      pinput->GetOrAddString("time", "lat_neighbor_limiter", "all");
+  if (hydro_lat_requested && external_bh_gravity_requested &&
+      pinput->GetOrAddBoolean("time", "lat_same_level", false) &&
+      hydro_lat_neighbor_limiter == "face") {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl
+              << "time/lat_neighbor_limiter must be 'all' or 'hybrid' when "
+              << "time/lat_same_level=true is used with analytic BH gravity."
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 
   // Dump input parameters and quit if code was run with -n option.
   if (narg_flag) {
@@ -317,6 +511,14 @@ int main(int argc, char *argv[]) {
   // is fully constructed.
 
   pmesh->AddCoordinatesAndPhysics(pinput);
+
+  // MeshRefinement depends on the enrolled physics modules for refinement data and
+  // load-balance metadata.  Construct it before the problem generator, since custom
+  // problems in this fork configure AMR cadence and initial refinement through pmr.
+  if (pmesh->multilevel) {
+    pmesh->pmr = new MeshRefinement(pmesh, pinput);
+  }
+
   if (!res_flag) {
     // set ICs using ProblemGenerator constructor for new runs
     pmesh->pgen = std::make_unique<ProblemGenerator>(pinput, pmesh);
@@ -327,12 +529,6 @@ int main(int argc, char *argv[]) {
                                                      restartfile,
                                                      single_file_per_rank);
     restartfile.Close(single_file_per_rank);
-  }
-
-  // Construct MeshRefinement object only after physics modules have been added because
-  // size of buffers for load balancing, refinement criteria, etc. depend on physics
-  if (pmesh->multilevel) {
-    pmesh->pmr = new MeshRefinement(pmesh, pinput);
   }
 
   //--- Step 6. --------------------------------------------------------------------------

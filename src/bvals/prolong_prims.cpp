@@ -8,7 +8,9 @@
 //! boundary buffers where prolongation is used at fine/coarse level boundaries.  This
 //! enables prolongation in either the conserved or primitive variables.
 #include <cstdlib>
+#include <cmath>
 #include <iostream>
+#include <limits>
 #include <string>
 
 #include "athena.hpp"
@@ -16,7 +18,10 @@
 #include "mesh/mesh.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
+#include "mhd/hybrid_forcefree_algebra.hpp"
 #include "eos/eos.hpp"
+#include "eos/general_c2p_hyd.hpp"
+#include "eos/general_c2p_mhd.hpp"
 #include "eos/ideal_c2p_hyd.hpp"
 #include "eos/ideal_c2p_mhd.hpp"
 #include "bvals.hpp"
@@ -24,6 +29,32 @@
 #include "coordinates/coordinates.hpp"
 #include "coordinates/cartesian_ks.hpp"
 #include "coordinates/cell_locations.hpp"
+
+namespace {
+template <typename NeighborView, typename LevelView, typename RecvBufferView>
+KOKKOS_INLINE_FUNCTION
+bool OwnsCoarsePrimitiveStencilCell(
+    const NeighborView &nghbr, const LevelView &mblev,
+    const RecvBufferView &rbuf, const bool multi_d, const bool three_d,
+    const int m, const int n, const int k, const int j, const int i) {
+  const int block_level = mblev(m);
+  for (int owner = 0; owner < n; ++owner) {
+    if (nghbr(m,owner).gid < 0 || nghbr(m,owner).lev >= block_level) continue;
+
+    const auto &idx = rbuf(owner).iprol[0];
+    const int il = idx.bis - 1;
+    const int iu = idx.bie + 1;
+    const int jl = idx.bjs - (multi_d ? 1 : 0);
+    const int ju = idx.bje + (multi_d ? 1 : 0);
+    const int kl = idx.bks - (three_d ? 1 : 0);
+    const int ku = idx.bke + (three_d ? 1 : 0);
+    if (i >= il && i <= iu && j >= jl && j <= ju && k >= kl && k <= ku) {
+      return false;
+    }
+  }
+  return true;
+}
+}  // namespace
 
 //----------------------------------------------------------------------------------------
 //! \fn void ConsToPrimCoarseBndry()
@@ -40,7 +71,13 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
 
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &mblev = pmy_pack->pmb->mb_lev;
-  auto &rbuf = recvbuf;
+  const bool lat_enabled = pmy_pack->lat_active_mask_enabled;
+  auto lat_active_indices = pmy_pack->lat_active_indices.d_view;
+  const int nwork = lat_enabled ? pmy_pack->lat_nactive_thispack : nmb;
+  if (nwork <= 0) return;
+  auto nghbr_device = nghbr.d_view;
+  auto mblev_device = mblev.d_view;
+  auto rbuf_device = recvbuf_device;
   auto &indcs  = pmy_pack->pmesh->mb_indcs;
   const bool multi_d = pmy_pack->pmesh->multi_d;
   const bool three_d = pmy_pack->pmesh->three_d;
@@ -52,27 +89,32 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
   auto &eos = pmy_pack->phydro->peos->eos_data;
   int &nhyd  = pmy_pack->phydro->nhydro;
   int &nscal = pmy_pack->phydro->nscalars;
+  const bool use_dual = pmy_pack->phydro->dual_energy_pdv;
+  const int dual_idx = pmy_pack->phydro->dual_energy_idx;
+  const Real dual_eta1 = pmy_pack->phydro->dual_energy_eta1;
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr), Kokkos::AUTO);
-  Kokkos::parallel_for("Prol_C2P_CC", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = tmember.league_rank()/nnghbr;
-    const int n = tmember.league_rank() - m*nnghbr;
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nwork*nnghbr), Kokkos::AUTO);
+  Kokkos::parallel_for("Prol_C2P_CC", athenak_lw(policy),
+      KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int a = tmember.league_rank()/nnghbr;
+    const int m = lat_enabled ? lat_active_indices(a) : a;
+    const int n = tmember.league_rank() - a*nnghbr;
 
     // only convert coarse vars when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
       // use indices for prolongation on this buffer as loop limits.
       // Note that one extra cell is added to match stencil of 2nd-order prolongation
-      int il = rbuf[n].iprol[0].bis - 1;
-      int iu = rbuf[n].iprol[0].bie + 1;
-      int jl = rbuf[n].iprol[0].bjs;
-      int ju = rbuf[n].iprol[0].bje;
+      int il = rbuf_device(n).iprol[0].bis - 1;
+      int iu = rbuf_device(n).iprol[0].bie + 1;
+      int jl = rbuf_device(n).iprol[0].bjs;
+      int ju = rbuf_device(n).iprol[0].bje;
       if (multi_d) {
         jl -= 1;
         ju += 1;
       }
-      int kl = rbuf[n].iprol[0].bks;
-      int ku = rbuf[n].iprol[0].bke;
+      int kl = rbuf_device(n).iprol[0].bks;
+      int ku = rbuf_device(n).iprol[0].bke;
       if (three_d) {
         kl -= 1;
         ku += 1;
@@ -91,6 +133,12 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
         j += jl;
         k += kl;
 
+        // Expanded face/edge/corner stencil boxes overlap.  Give every coarse cell to
+        // exactly one neighbor team so C2P and scalar repair cannot race on prim/cons.
+        if (!OwnsCoarsePrimitiveStencilCell(
+                nghbr_device, mblev_device, rbuf_device, multi_d, three_d,
+                m, n, k, j, i)) return;
+
         // load single state conserved variables
         HydCons1D u;
         u.d  = cons(m,IDN,k,j,i);
@@ -99,8 +147,10 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
         u.mz = cons(m,IM3,k,j,i);
         u.e  = cons(m,IEN,k,j,i);
         HydPrim1D w;
+        Real dual_prim_e = 0.0;
 
         bool dfloor_used=false, efloor_used=false, tfloor_used=false;
+        bool vceiling_used=false;
         if (is_gr) {
           Real &x1min = size.d_view(m).x1min;
           Real &x1max = size.d_view(m).x1max;
@@ -155,7 +205,19 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
             w.vz *= factor;
           }
         } else {
-          SingleC2P_IdealHyd(u, eos, w, dfloor_used, efloor_used, tfloor_used);
+          if (!use_dual) {
+            if (eos.UsesTabulatedLTE()) {
+              eos_general::SingleC2P_GeneralHyd(u, eos, w, dfloor_used, efloor_used,
+                                                tfloor_used, vceiling_used);
+            } else {
+              SingleC2P_IdealHyd(u, eos, w, dfloor_used, efloor_used, tfloor_used,
+                                 vceiling_used);
+            }
+          } else {
+            eos_general::SingleC2P_GeneralHydDual(
+                u, eos, cons(m, dual_idx, k, j, i), dual_eta1, w, dual_prim_e,
+                dfloor_used, efloor_used, tfloor_used, vceiling_used);
+          }
         }
 
         // No need to correct conserved state in coarse boundary arrays if floors used
@@ -173,6 +235,9 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
             cons(m,n,k,j,i) = 0.0;
           }
           prim(m,n,k,j,i) = cons(m,n,k,j,i)/u.d;
+        }
+        if (use_dual) {
+          prim(m,dual_idx,k,j,i) = dual_prim_e;
         }
       });
     }
@@ -195,7 +260,11 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
 
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &mblev = pmy_pack->pmb->mb_lev;
-  auto &rbuf = recvbuf;
+  const bool lat_enabled = pmy_pack->lat_active_mask_enabled;
+  auto lat_active_indices = pmy_pack->lat_active_indices.d_view;
+  const int nwork = lat_enabled ? pmy_pack->lat_nactive_thispack : nmb;
+  if (nwork <= 0) return;
+  auto rbuf_device = recvbuf_device;
   auto &indcs  = pmy_pack->pmesh->mb_indcs;
   const bool multi_d = pmy_pack->pmesh->multi_d;
   const bool three_d = pmy_pack->pmesh->three_d;
@@ -204,29 +273,33 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
   bool &is_sr = pmy_pack->pcoord->is_special_relativistic;
   bool &is_gr = pmy_pack->pcoord->is_general_relativistic;
+  auto &eos = pmy_pack->phydro->peos->eos_data;
   Real &gamma = pmy_pack->phydro->peos->eos_data.gamma;
   int &nhyd  = pmy_pack->phydro->nhydro;
   int &nscal = pmy_pack->phydro->nscalars;
+  bool use_dual = pmy_pack->phydro->dual_energy_pdv;
+  int dual_idx = pmy_pack->phydro->dual_energy_idx;
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr), Kokkos::AUTO);
-  Kokkos::parallel_for("ProlCC", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = tmember.league_rank()/nnghbr;
-    const int n = tmember.league_rank() - m*nnghbr;
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nwork*nnghbr), Kokkos::AUTO);
+  Kokkos::parallel_for("ProlCC", athenak_lw(policy), KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int a = tmember.league_rank()/nnghbr;
+    const int m = lat_enabled ? lat_active_indices(a) : a;
+    const int n = tmember.league_rank() - a*nnghbr;
 
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
       // loop over indices for prolongation on this buffer
       // Convert indices from coarse to fine arrays
-      int il = (rbuf[n].iprol[0].bis - indcs.cis)*2 + indcs.is;
-      int iu = (rbuf[n].iprol[0].bie - indcs.cis)*2 + indcs.is + 1;
-      int jl = (rbuf[n].iprol[0].bjs - indcs.cjs)*2 + indcs.js;
-      int ju = (rbuf[n].iprol[0].bje - indcs.cjs)*2 + indcs.js;
+      int il = (rbuf_device(n).iprol[0].bis - indcs.cis)*2 + indcs.is;
+      int iu = (rbuf_device(n).iprol[0].bie - indcs.cis)*2 + indcs.is + 1;
+      int jl = (rbuf_device(n).iprol[0].bjs - indcs.cjs)*2 + indcs.js;
+      int ju = (rbuf_device(n).iprol[0].bje - indcs.cjs)*2 + indcs.js;
       if (multi_d) {
         ju += 1;
       }
-      int kl = (rbuf[n].iprol[0].bks - indcs.cks)*2 + indcs.ks;
-      int ku = (rbuf[n].iprol[0].bke - indcs.cks)*2 + indcs.ks;
+      int kl = (rbuf_device(n).iprol[0].bks - indcs.cks)*2 + indcs.ks;
+      int ku = (rbuf_device(n).iprol[0].bke - indcs.cks)*2 + indcs.ks;
       if (three_d) {
         ku += 1;
       }
@@ -251,6 +324,11 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
         w.vy = prim(m,IVY,k,j,i);
         w.vz = prim(m,IVZ,k,j,i);
         w.e  = prim(m,IEN,k,j,i);
+        if (!is_sr && !is_gr && eos.use_e) {
+          bool efloor_used = false, tfloor_used = false;
+          w.e = eos_general::ApplyHydroThermalFloors(eos, w.d, w.e, efloor_used,
+                                                     tfloor_used);
+        }
         HydCons1D u;
 
         if (is_gr) {
@@ -272,7 +350,11 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
         } else if (is_sr) {
           SingleP2C_IdealSRHyd(w, gamma, u);
         } else {
-          SingleP2C_IdealHyd(w, u);
+          if (eos.UsesTabulatedLTE()) {
+            eos_general::SingleP2C_GeneralHyd(w, u);
+          } else {
+            SingleP2C_IdealHyd(w, u);
+          }
         }
 
         // Set conserved quantities
@@ -285,6 +367,15 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
         // convert scalars (if any)
         for (int n=nhyd; n<(nhyd+nscal); ++n) {
           cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
+        }
+        if (use_dual) {
+          Real eint_aux = prim(m,dual_idx,k,j,i);
+          if (!is_sr && !is_gr && eos.use_e) {
+            bool efloor_used = false, tfloor_used = false;
+            eint_aux = eos_general::ApplyHydroThermalFloors(eos, w.d, eint_aux,
+                                                            efloor_used, tfloor_used);
+          }
+          cons(m,dual_idx,k,j,i) = eint_aux;
         }
       });
     }
@@ -308,7 +399,11 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
 
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &mblev = pmy_pack->pmb->mb_lev;
-  auto &rbuf = recvbuf;
+  const int nwork = nmb;
+  if (nwork <= 0) return;
+  auto nghbr_device = nghbr.d_view;
+  auto mblev_device = mblev.d_view;
+  auto rbuf_device = recvbuf_device;
   auto &indcs  = pmy_pack->pmesh->mb_indcs;
   const bool multi_d = pmy_pack->pmesh->multi_d;
   const bool three_d = pmy_pack->pmesh->three_d;
@@ -320,27 +415,34 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
   auto &eos = pmy_pack->pmhd->peos->eos_data;
   int &nmhd  = pmy_pack->pmhd->nmhd;
   int &nscal = pmy_pack->pmhd->nscalars;
+  // dual_energy_pdv: the GR adiabat must cross a coarse/fine boundary through the
+  // ordinary passive-scalar path, which recovers kappa as cons/D.  Skipping it here
+  // published kappa = 0 in exactly the worst-conditioned cells.
+  const bool use_dual = pmy_pack->pmhd->dual_energy_pdv;
+  const int dual_idx = pmy_pack->pmhd->dual_energy_idx;
+  const Real dual_eta1 = pmy_pack->pmhd->dual_energy_eta1;
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr), Kokkos::AUTO);
-  Kokkos::parallel_for("ProlCC", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = tmember.league_rank()/nnghbr;
-    const int n = tmember.league_rank() - m*nnghbr;
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nwork*nnghbr), Kokkos::AUTO);
+  Kokkos::parallel_for("ProlCC", athenak_lw(policy), KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int a = tmember.league_rank()/nnghbr;
+    const int m = a;
+    const int n = tmember.league_rank() - a*nnghbr;
 
     // only convert coarse vars when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
       // use indices for prolongation on this buffer as loop limits
       // Note that one extra cell is added to match stencil of 2nd-order prolongation
-      int il = rbuf[n].iprol[0].bis - 1;
-      int iu = rbuf[n].iprol[0].bie + 1;
-      int jl = rbuf[n].iprol[0].bjs;
-      int ju = rbuf[n].iprol[0].bje;
+      int il = rbuf_device(n).iprol[0].bis - 1;
+      int iu = rbuf_device(n).iprol[0].bie + 1;
+      int jl = rbuf_device(n).iprol[0].bjs;
+      int ju = rbuf_device(n).iprol[0].bje;
       if (multi_d) {
         jl -= 1;
         ju += 1;
       }
-      int kl = rbuf[n].iprol[0].bks;
-      int ku = rbuf[n].iprol[0].bke;
+      int kl = rbuf_device(n).iprol[0].bks;
+      int ku = rbuf_device(n).iprol[0].bke;
       if (three_d) {
         kl -= 1;
         ku += 1;
@@ -359,6 +461,12 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
         j += jl;
         k += kl;
 
+        // Expanded face/edge/corner stencil boxes overlap.  Give every coarse cell to
+        // exactly one neighbor team so C2P and scalar repair cannot race on prim/cons.
+        if (!OwnsCoarsePrimitiveStencilCell(
+                nghbr_device, mblev_device, rbuf_device, multi_d, three_d,
+                m, n, k, j, i)) return;
+
         // load single state conserved variables
         MHDCons1D u;
         u.d  = cons(m,IDN,k,j,i);
@@ -366,13 +474,18 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
         u.my = cons(m,IM2,k,j,i);
         u.mz = cons(m,IM3,k,j,i);
         u.e  = cons(m,IEN,k,j,i);
+        Real scalar_cons_density = u.d;
         // use simple linear average of face-centered fields
         u.bx = 0.5*(b.x1f(m,k,j,i) + b.x1f(m,k,j,i+1));
         u.by = 0.5*(b.x2f(m,k,j,i) + b.x2f(m,k,j+1,i));
         u.bz = 0.5*(b.x3f(m,k,j,i) + b.x3f(m,k+1,j,i));
         HydPrim1D w;
+        Real dual_prim_e = 0.0;
 
         bool dfloor_used=false, efloor_used=false, tfloor_used=false;
+        bool vceiling_used=false;
+        bool sigceiling_used=false;
+        bool c2p_failure=false;
         if (is_gr) {
           Real &x1min = size.d_view(m).x1min;
           Real &x1max = size.d_view(m).x1max;
@@ -390,46 +503,72 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
           Real glower[4][4], gupper[4][4];
           ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
 
+          EOS_Data cell_eos = eos;
           MHDCons1D u_sr;
           Real s2,b2,rpar;
           TransformToSRMHD(u,glower,gupper,s2,b2,rpar,u_sr);
-          bool c2p_failure=false;
           int iter_used=0;
-          SingleC2P_IdealSRMHD(u_sr, eos, s2, b2, rpar, w,
+          SingleC2P_IdealSRMHD(u_sr, cell_eos, s2, b2, rpar, w,
                                dfloor_used, efloor_used, c2p_failure, iter_used);
 
-          // apply velocity ceiling if necessary
-          Real tmp = glower[1][1]*SQR(w.vx)
-                   + glower[2][2]*SQR(w.vy)
-                   + glower[3][3]*SQR(w.vz)
-                   + 2.0*glower[1][2]*w.vx*w.vy + 2.0*glower[1][3]*w.vx*w.vz
-                   + 2.0*glower[2][3]*w.vy*w.vz;
-          Real lor = sqrt(1.0+tmp);
-          if (lor > eos.gamma_max) {
-            Real factor = sqrt((SQR(eos.gamma_max)-1.0)/(SQR(lor)-1.0));
-            w.vx *= factor;
-            w.vy *= factor;
-            w.vz *= factor;
+          // Coarse primitives feed every fine-boundary interpolation stencil.  Use the
+          // overflow-safe KORAL ceiling here so no AMR receiver can inherit an
+          // uncapped or nonfinite wall direction from its coarse GRMHD state.
+          const auto lorentz_limit =
+              mhd::forcefree::ApplyIsotropicLorentzLimit(
+                  glower, cell_eos.gamma_max, w.vx, w.vy, w.vz);
+          if (!lorentz_limit.valid) {
+            w.vx = 0.0;
+            w.vy = 0.0;
+            w.vz = 0.0;
+            vceiling_used = true;
+          } else if (lorentz_limit.limited) {
+            vceiling_used = true;
+          }
+          sigceiling_used = ApplySigmaCeiling_IdealGRMHD(cell_eos, glower, gupper, u, w);
+          Real qv = glower[1][1]*SQR(w.vx)
+                  + glower[2][2]*SQR(w.vy)
+                  + glower[3][3]*SQR(w.vz)
+                  + 2.0*glower[1][2]*w.vx*w.vy
+                  + 2.0*glower[1][3]*w.vx*w.vz
+                  + 2.0*glower[2][3]*w.vy*w.vz;
+          Real lor = (isfinite(qv) && qv >= 0.0) ? sqrt(1.0 + qv) : 0.0;
+          Real alpha = sqrt(-1.0/gupper[0][0]);
+          if (scalar_cons_density > 0.0 && alpha > 0.0 && lor > 0.0) {
+            u.d = w.d*lor/alpha;
           }
         } else if (is_sr) {
           // Compute (S^i S_i) (eqn C2)
           Real s2 = SQR(u.mx) + SQR(u.my) + SQR(u.mz);
           Real b2 = SQR(u.bx) + SQR(u.by) + SQR(u.bz);
           Real rpar = (u.bx*u.mx +  u.by*u.my +  u.bz*u.mz)/u.d;
-          bool c2p_failure=false;
           int iter_used=0;
           SingleC2P_IdealSRMHD(u, eos, s2, b2, rpar, w,
                                dfloor_used, efloor_used, c2p_failure, iter_used);
           // apply velocity ceiling if necessary
           Real lor = sqrt(1.0+SQR(w.vx)+SQR(w.vy)+SQR(w.vz));
           if (lor > eos.gamma_max) {
+            vceiling_used = true;
             Real factor = sqrt((SQR(eos.gamma_max)-1.0)/(SQR(lor)-1.0));
             w.vx *= factor;
             w.vy *= factor;
             w.vz *= factor;
           }
         } else {
-          SingleC2P_IdealMHD(u, eos, w, dfloor_used, efloor_used, tfloor_used);
+          if (!use_dual) {
+            if (eos.UsesTabulatedLTE()) {
+              eos_general::SingleC2P_GeneralMHD(u, eos, w, dfloor_used, efloor_used,
+                                                tfloor_used, vceiling_used);
+            } else {
+              SingleC2P_IdealMHD(u, eos, w, dfloor_used, efloor_used, tfloor_used,
+                                 vceiling_used);
+            }
+          } else {
+            bool eint_from_aux = false;  // primitives only; the coarse E is not kept
+            eos_general::SingleC2P_GeneralMHDDual(
+                u, eos, cons(m, dual_idx, k, j, i), dual_eta1, w, dual_prim_e,
+                eint_from_aux, dfloor_used, efloor_used, tfloor_used, vceiling_used);
+          }
         }
 
         // No need to correct conserved state in coarse boundary arrays if floors used
@@ -441,13 +580,23 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
         prim(m,IVZ,k,j,i) = w.vz;
         prim(m,IEN,k,j,i) = w.e;
         // No need to store cell-centered fields since they will not be prolongated
+        const bool preserve_scalars_across_kinematic_repair = is_gr &&
+            vceiling_used && !dfloor_used && !efloor_used &&
+            !sigceiling_used && !c2p_failure;
         // convert scalars (if any)
         for (int n=nmhd; n<(nmhd+nscal); ++n) {
           // apply scalar floor
-          if (cons(m,n,k,j,i) < 0.0) {
+          if (!isfinite(cons(m,n,k,j,i)) || cons(m,n,k,j,i) < 0.0) {
             cons(m,n,k,j,i) = 0.0;
           }
-          prim(m,n,k,j,i) = cons(m,n,k,j,i)/u.d;
+          const Real scalar_den =
+              preserve_scalars_across_kinematic_repair ? scalar_cons_density :
+              ((u.d > 0.0) ? u.d : w.d);
+          Real scalar = (scalar_den > 0.0) ? cons(m,n,k,j,i)/scalar_den : 0.0;
+          prim(m,n,k,j,i) = isfinite(scalar) ? scalar : 0.0;
+        }
+        if (use_dual) {
+          prim(m,dual_idx,k,j,i) = dual_prim_e;
         }
       });
     }
@@ -462,7 +611,7 @@ void MeshBoundaryValuesCC::ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons,
 //! into MHD conservative variables.
 //! Note same function for Hydrodynamics has different argument list.
 
-void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
+void MeshBoundaryValuesCC::PrimToConsFineBndry(DvceArray5D<Real> &prim,
                                const DvceFaceFld4D<Real> &b, DvceArray5D<Real> &cons) {
   // create local references for variables in kernel
   int nmb = pmy_pack->nmb_thispack;
@@ -470,7 +619,9 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
 
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &mblev = pmy_pack->pmb->mb_lev;
-  auto &rbuf = recvbuf;
+  const int nwork = nmb;
+  if (nwork <= 0) return;
+  auto rbuf_device = recvbuf_device;
   auto &indcs  = pmy_pack->pmesh->mb_indcs;
   const bool multi_d = pmy_pack->pmesh->multi_d;
   const bool three_d = pmy_pack->pmesh->three_d;
@@ -479,29 +630,33 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
   auto &spin = pmy_pack->pcoord->coord_data.bh_spin;
   bool &is_sr = pmy_pack->pcoord->is_special_relativistic;
   bool &is_gr = pmy_pack->pcoord->is_general_relativistic;
+  auto &eos = pmy_pack->pmhd->peos->eos_data;
   Real &gamma = pmy_pack->pmhd->peos->eos_data.gamma;
   int &nmhd  = pmy_pack->pmhd->nmhd;
   int &nscal = pmy_pack->pmhd->nscalars;
+  bool use_dual = pmy_pack->pmhd->dual_energy_pdv;
+  int dual_idx = pmy_pack->pmhd->dual_energy_idx;
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)
-  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nmb*nnghbr), Kokkos::AUTO);
-  Kokkos::parallel_for("ProlCC", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = tmember.league_rank()/nnghbr;
-    const int n = tmember.league_rank() - m*nnghbr;
+  Kokkos::TeamPolicy<> policy(DevExeSpace(), (nwork*nnghbr), Kokkos::AUTO);
+  Kokkos::parallel_for("ProlCC", athenak_lw(policy), KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int a = tmember.league_rank()/nnghbr;
+    const int m = a;
+    const int n = tmember.league_rank() - a*nnghbr;
 
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
       // loop over indices for prolongation on this buffer
       // Convert indices from coarse to fine arrays
-      int il = (rbuf[n].iprol[0].bis - indcs.cis)*2 + indcs.is;
-      int iu = (rbuf[n].iprol[0].bie - indcs.cis)*2 + indcs.is + 1;
-      int jl = (rbuf[n].iprol[0].bjs - indcs.cjs)*2 + indcs.js;
-      int ju = (rbuf[n].iprol[0].bje - indcs.cjs)*2 + indcs.js;
+      int il = (rbuf_device(n).iprol[0].bis - indcs.cis)*2 + indcs.is;
+      int iu = (rbuf_device(n).iprol[0].bie - indcs.cis)*2 + indcs.is + 1;
+      int jl = (rbuf_device(n).iprol[0].bjs - indcs.cjs)*2 + indcs.js;
+      int ju = (rbuf_device(n).iprol[0].bje - indcs.cjs)*2 + indcs.js;
       if (multi_d) {
         ju += 1;
       }
-      int kl = (rbuf[n].iprol[0].bks - indcs.cks)*2 + indcs.ks;
-      int ku = (rbuf[n].iprol[0].bke - indcs.cks)*2 + indcs.ks;
+      int kl = (rbuf_device(n).iprol[0].bks - indcs.cks)*2 + indcs.ks;
+      int ku = (rbuf_device(n).iprol[0].bke - indcs.cks)*2 + indcs.ks;
       if (three_d) {
         ku += 1;
       }
@@ -530,6 +685,11 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
         w.bx = 0.5*(b.x1f(m,k,j,i) + b.x1f(m,k,j,i+1));
         w.by = 0.5*(b.x2f(m,k,j,i) + b.x2f(m,k,j+1,i));
         w.bz = 0.5*(b.x3f(m,k,j,i) + b.x3f(m,k+1,j,i));
+        if (!is_sr && !is_gr && eos.use_e) {
+          bool efloor_used = false, tfloor_used = false;
+          w.e = eos_general::ApplyMHDThermalFloors(eos, w.d, w.e, efloor_used,
+                                                   tfloor_used);
+        }
         HydCons1D u;
 
         if (is_gr) {
@@ -547,11 +707,64 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
 
           Real glower[4][4], gupper[4][4];
           ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
-          SingleP2C_IdealGRMHD(glower, gupper, w, gamma, u);
+
+          EOS_Data cell_eos = eos;
+          if (!isfinite(w.d) || w.d < cell_eos.dfloor) {
+            w.d = cell_eos.dfloor;
+          }
+          Real eint_floor = IdealMHDEintFloor(cell_eos, w.d);
+          if (!isfinite(w.e) || w.e < eint_floor) {
+            w.e = eint_floor;
+          }
+          Real eint_ceiling = cell_eos.HydroInternalEnergyDensityCeiling(w.d);
+          if (isfinite(eint_ceiling) && w.e > eint_ceiling) {
+            w.e = eint_ceiling;
+          }
+
+          const auto lorentz_limit =
+              mhd::forcefree::ApplyIsotropicLorentzLimit(
+                  glower, cell_eos.gamma_max, w.vx, w.vy, w.vz);
+          if (!lorentz_limit.valid) {
+            w.vx = 0.0;
+            w.vy = 0.0;
+            w.vz = 0.0;
+          }
+
+          MHDCons1D u_for_limit;
+          u_for_limit.bx = w.bx;
+          u_for_limit.by = w.by;
+          u_for_limit.bz = w.bz;
+          HydPrim1D wh;
+          wh.d = w.d;
+          wh.vx = w.vx;
+          wh.vy = w.vy;
+          wh.vz = w.vz;
+          wh.e = w.e;
+          ApplySigmaCeiling_IdealGRMHD(cell_eos, glower, gupper, u_for_limit, wh);
+          w.d = wh.d;
+          w.vx = wh.vx;
+          w.vy = wh.vy;
+          w.vz = wh.vz;
+          w.e = wh.e;
+
+          Real local_gamma = gamma;
+
+          prim(m,IDN,k,j,i) = w.d;
+          prim(m,IVX,k,j,i) = w.vx;
+          prim(m,IVY,k,j,i) = w.vy;
+          prim(m,IVZ,k,j,i) = w.vz;
+          prim(m,IEN,k,j,i) = w.e;
+          SingleP2C_IdealGRMHD(glower, gupper, w, local_gamma, u);
         } else if (is_sr) {
           SingleP2C_IdealSRMHD(w, gamma, u);
         } else {
-          SingleP2C_IdealMHD(w, u);
+          // Non-gamma EOS AMR boundaries must rebuild conserved fields through the active
+          // EOS rather than the gamma-law primitive-to-conserved helper.
+          if (eos.UsesTabulatedLTE()) {
+            eos_general::SingleP2C_GeneralMHD(w, u);
+          } else {
+            SingleP2C_IdealMHD(w, u);
+          }
         }
 
         // Set conserved quantities
@@ -563,7 +776,18 @@ void MeshBoundaryValuesCC::PrimToConsFineBndry(const DvceArray5D<Real> &prim,
 
         // convert scalars (if any)
         for (int n=nmhd; n<(nmhd+nscal); ++n) {
-          cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
+          Real scalar = prim(m,n,k,j,i);
+          scalar = (isfinite(scalar) && scalar > 0.0) ? scalar : 0.0;
+          cons(m,n,k,j,i) = u.d*scalar;
+        }
+        if (use_dual) {
+          Real eint_aux = prim(m,dual_idx,k,j,i);
+          if (!is_sr && !is_gr && eos.use_e) {
+            bool efloor_used = false, tfloor_used = false;
+            eint_aux = eos_general::ApplyMHDThermalFloors(eos, w.d, eint_aux,
+                                                          efloor_used, tfloor_used);
+          }
+          cons(m,dual_idx,k,j,i) = eint_aux;
         }
       });
     }

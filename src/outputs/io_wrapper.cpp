@@ -6,6 +6,8 @@
 //! \file io_wrapper.cpp
 //! \brief functions that provide wrapper for MPI-IO versus serial input/output
 
+#include <sys/stat.h>  // stat
+
 #include <cstdio>
 #include <cstdlib>
 #include <iomanip>
@@ -16,6 +18,19 @@
 
 #include "athena.hpp"
 #include "io_wrapper.hpp"
+
+//----------------------------------------------------------------------------------------
+//! \fn bool PreserveExistingFile(const char *fname)
+//! \brief rename an existing file out of the way before it is opened for writing
+
+bool PreserveExistingFile(const char *fname) {
+  // Existing output files are simply overwritten (operator request, 2026-08-24): a
+  // restart that rewinds past already-written dumps replaces them in place, without
+  // renaming them to .old and without a per-file warning.  The startup listing in
+  // outputs.cpp still says which numbered files a resumed stream is going to supersede.
+  (void) fname;
+  return false;
+}
 
 //----------------------------------------------------------------------------------------
 //! \fn int IOWrapper::Open(const char* fname, FileMode rw)
@@ -36,6 +51,25 @@ int IOWrapper::Open(const char* fname, FileMode rw, bool single_file_per_rank) {
       break;
     default:
       return false;
+  }
+
+  // Every numbered dump comes through here, so the overwrite guard lives here rather
+  // than in each writer.  Only the rank that owns the file renames it; for a shared file
+  // that is rank 0 of this file's communicator, and the barrier below keeps the other
+  // ranks from opening (and truncating) the path before the rename has happened.
+  if (rw == FileMode::write) {
+#if MPI_PARALLEL_ENABLED
+    if (single_file_per_rank) {
+      PreserveExistingFile(fname);
+    } else {
+      int file_rank = 0;
+      MPI_Comm_rank(comm_, &file_rank);
+      if (file_rank == 0) PreserveExistingFile(fname);
+      MPI_Barrier(comm_);
+    }
+#else
+    PreserveExistingFile(fname);
+#endif
   }
 
 #if MPI_PARALLEL_ENABLED

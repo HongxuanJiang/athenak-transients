@@ -8,9 +8,21 @@
 //! \file reset_floor.hpp
 //  \brief Describes an error floor that simply resets nonphysical values.
 //
-//  If the density or pressure fall below the atmosphere, they get floored.
-//  We impose similar limits for D and tau. If the density is floored,
-//  the velocity is zeroed out and the pressure is also reset to the floor.
+//  If the density or pressure fall below the atmosphere, they get floored.  We impose
+//  similar limits for D and tau.  Both floors only add.  The conserved floor raises D to
+//  max(D, n_atm m_b) and keeps S_i and tau (the added rest mass is at rest in the normal
+//  frame), then raises tau to the atmosphere value if below.  The primitive floor raises
+//  n to max(n, n_atm) at the cell's own temperature (itself raised to T_atm if below); in
+//  a cell whose D the conserved floor raised, PrimitiveSolver::ConToPrim then re-solves T
+//  at the internal energy density the cell had, because there T is the kept tau over the
+//  floor's mass.  In both the added mass has the atmosphere composition.  The primitive
+//  floor leaves the velocity alone: what momentum the floored mass carries is not this
+//  policy's decision.  The caller owns it, because only the caller knows the metric and
+//  the magnetic field the answer depends on -- see PrimitiveSolverHydro
+//  (eos/primitive_solver_hyd.hpp), which re-injects it in the drift frame of Ressler+2017
+//  (eos/drift_frame_floor.hpp), a map that is defined for added enthalpy only.  Zeroing
+//  the velocity or the momentum here is a momentum sink that pins any flow resting near
+//  the atmosphere at rest for good.
 //  If the pressure is floored, all other quantities are ignored.
 //  If the primitive solve fails, all points are set to floor.
 
@@ -23,6 +35,9 @@
 namespace Primitive {
 
 class ResetFloor : public ErrorPolicyInterface {
+  // NOTE: the species loops below run to the compile-time MAX_SPECIES and predicate on
+  // the runtime count, so the caller's Y[] keeps constant subscripts and can stay in
+  // registers.  See the note in PrimitiveSolver::ConToPrim for the measurement.
  protected:
   /// Constructor
   ResetFloor() {
@@ -34,15 +49,20 @@ class ResetFloor : public ErrorPolicyInterface {
   /// Floor for primitive variables
   KOKKOS_INLINE_FUNCTION bool PrimitiveFloor(Real& n, Real v[3], Real& T, Real *Y,
                                              int n_species) const {
+    // v is untouched by design; see the note at the top of this file.
+    (void) v;
     if (n < n_atm*n_threshold) {
-      n = n_atm;
-      v[0] = 0.0;
-      v[1] = 0.0;
-      v[2] = 0.0;
-      T = T_atm;
-      for (int i = 0; i < n_species; i++) {
-        Y[i] = Y_atm[i];
+      // Added mass n_new - n at the cell's temperature; the n the cell had keeps its
+      // composition, the added mass has the atmosphere's (n <= 0 keeps none, so a
+      // non-finite Y there cannot survive the mix).
+      const Real n_new = fmax(n, n_atm);
+      const Real kept = (n > 0.0) ? n/n_new : 0.0;
+      #pragma unroll
+      for (int i = 0; i < MAX_SPECIES; i++) {
+        if (i < n_species) Y[i] = (kept > 0.0) ? Y_atm[i] + (Y[i] - Y_atm[i])*kept : Y_atm[i];
       }
+      n = n_new;
+      T = fmax(T, T_atm);
       return true;
     } else if (T < T_atm) {
       T = T_atm;
@@ -56,14 +76,21 @@ class ResetFloor : public ErrorPolicyInterface {
                                 Real D_floor, Real tau_floor, Real tau_abs_floor,
                                 int n_species) const {
     if (D < D_floor*n_threshold) {
-      D = D_floor;
-      Sd[0] = 0.0;
-      Sd[1] = 0.0;
-      Sd[2] = 0.0;
-      tau = tau_abs_floor;
-      for (int i = 0; i < n_species; i++) {
-        Y[i] = Y_atm[i];
+      // Added rest mass D_new - D at rest in the normal frame: S_i and tau are kept.  The
+      // D the cell had keeps its composition, the added mass has the atmosphere's.
+      // tau_floor was evaluated at the incoming D; a cell raised to D_floor takes the
+      // atmosphere's tau floor, tau_abs_floor.
+      const bool raised = (D < D_floor);
+      const Real D_new = raised ? D_floor : D;
+      const Real kept = (D > 0.0) ? D/D_new : 0.0;
+      #pragma unroll
+      for (int i = 0; i < MAX_SPECIES; i++) {
+        if (i < n_species) {
+          Y[i] = (kept > 0.0) ? Y_atm[i] + (Y[i] - Y_atm[i])*kept : Y_atm[i];
+        }
       }
+      D = D_new;
+      tau = fmax(tau, raised ? tau_abs_floor : tau_floor);
       return true;
     } else if (tau < tau_floor) {
       tau = tau_floor;
@@ -78,9 +105,9 @@ class ResetFloor : public ErrorPolicyInterface {
       Real factor = sqrt(max_bsq/bsq);
       bsq = max_bsq;
 
-      b_u[0] /= factor;
-      b_u[1] /= factor;
-      b_u[2] /= factor;
+      b_u[0] *= factor;
+      b_u[1] *= factor;
+      b_u[2] *= factor;
 
       return Error::CONS_ADJUSTED;
     }
@@ -101,13 +128,16 @@ class ResetFloor : public ErrorPolicyInterface {
   KOKKOS_INLINE_FUNCTION bool SpeciesLimits(Real* Y, const Real* Y_min, const Real* Y_max,
                                             int n_species) const {
     bool adjusted = false;
-    for (int i = 0; i < n_species; i++) {
-      if (Y[i] < Y_min[i]) {
-        adjusted = true;
-        Y[i] = Y_min[i];
-      } else if (Y[i] > Y_max[i]) {
-        adjusted = true;
-        Y[i] = Y_max[i];
+    #pragma unroll
+    for (int i = 0; i < MAX_SPECIES; i++) {
+      if (i < n_species) {
+        if (Y[i] < Y_min[i]) {
+          adjusted = true;
+          Y[i] = Y_min[i];
+        } else if (Y[i] > Y_max[i]) {
+          adjusted = true;
+          Y[i] = Y_max[i];
+        }
       }
     }
     return adjusted;

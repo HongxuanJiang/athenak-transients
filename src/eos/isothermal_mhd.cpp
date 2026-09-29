@@ -77,19 +77,22 @@ void IsothermalMHD::ConsToPrim(DvceArray5D<Real> &cons, const DvceFaceFld4D<Real
   auto &fofc_ = pmy_pack->pmhd->fofc;
   Real dfloor = eos_data.dfloor;
   Real sigma_max = eos_data.sigma_max;
+  const int nwork = nmb;
+  if (nwork <= 0) return;
 
   const int ni   = (iu - il + 1);
   const int nji  = (ju - jl + 1)*ni;
   const int nkji = (ku - kl + 1)*nji;
-  const int nmkji = nmb*nkji;
+  const int nmkji = nwork*nkji;
 
   int nfloord_=0;
   Kokkos::parallel_reduce("isomhd_c2p",Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
   KOKKOS_LAMBDA(const int &idx, int &sumd) {
-    int m = (idx)/nkji;
-    int k = (idx - m*nkji)/nji;
-    int j = (idx - m*nkji - k*nji)/ni;
-    int i = (idx - m*nkji - k*nji - j*ni) + il;
+    int a = (idx)/nkji;
+    int m = a;
+    int k = (idx - a*nkji)/nji;
+    int j = (idx - a*nkji - k*nji)/ni;
+    int i = (idx - a*nkji - k*nji - j*ni) + il;
     j += jl;
     k += kl;
 
@@ -159,9 +162,12 @@ void IsothermalMHD::PrimToCons(const DvceArray5D<Real> &prim,const DvceArray5D<R
   int &nmhd  = pmy_pack->pmhd->nmhd;
   int &nscal = pmy_pack->pmhd->nscalars;
   int &nmb = pmy_pack->nmb_thispack;
+  const int nwork = nmb;
+  if (nwork <= 0) return;
 
-  par_for("isomhd_prim2cons", DevExeSpace(), 0, (nmb-1), kl, ku, jl, ju, il, iu,
-  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+  par_for("isomhd_prim2cons", DevExeSpace(), 0, (nwork-1), kl, ku, jl, ju, il, iu,
+  KOKKOS_LAMBDA(int a, int k, int j, int i) {
+    const int m = a;
     // load single state primitive variables
     HydPrim1D w;
     w.d  = prim(m,IDN,k,j,i);

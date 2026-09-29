@@ -49,6 +49,8 @@ class MeshBlockTree {
   void CreateZOrderedLLList(LogicalLocation *list, int *pglist, int& count);
   MeshBlockTree* FindNeighbor(LogicalLocation myloc, int ox1, int ox2, int ox3,
                               bool amrflag=false);
+  void ActivateRoot();
+  void SetLeafGID(LogicalLocation tloc, int gid);
 
  private:
   // data: note private variable names have trailing underscore for this class

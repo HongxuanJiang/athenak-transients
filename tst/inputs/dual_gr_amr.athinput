@@ -1,0 +1,118 @@
+<comment>
+problem   = 3D GR MHD shocktube on a refined mesh, dual-energy auxiliary on
+reference = Mignone, Ugliano, & Bodo 2009, MNRAS 393 1141
+
+<job>
+basename  = dual_gr_amr
+
+<mesh>
+nghost    = 2
+nx1       = 16
+x1min     = -0.5
+x1max     = 0.5
+ix1_bc    = outflow
+ox1_bc    = outflow
+
+nx2       = 16
+x2min     = -0.5
+x2max     = 0.5
+ix2_bc    = periodic
+ox2_bc    = periodic
+
+nx3       = 16
+x3min     = -0.5
+x3max     = 0.5
+ix3_bc    = periodic
+ox3_bc    = periodic
+
+<meshblock>
+nx1       = 8
+nx2       = 8
+nx3       = 8
+
+<mesh_refinement>
+refinement          = adaptive
+num_levels          = 2
+ncycle_check        = 1
+refinement_interval = 1
+max_nmb_per_rank    = 512
+
+<amr_criterion1>
+method    = slope
+variable  = mhd_w_d
+value_max = 0.1
+
+<refined_region1>
+x1min = -0.125
+x1max = 0.125
+x2min = -0.5
+x2max = 0.0
+x3min = -0.5
+x3max = 0.0
+level = 1
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim       = -1
+tlim       = 0.2
+ndiag      = 1000
+lat        = false
+lat_union_stage1 = auto
+lat_levels = 2
+hydro_lat_min_bin_count = 4
+hydro_lat_defer_final_exchange = true
+
+<coord>
+general_rel = true
+minkowski   = true
+
+<mhd>
+eos              = ideal
+reconstruct      = plm
+rsolver          = hlle
+gamma            = 2.0
+dfloor           = 1.0e-10
+pfloor           = 1.0e-10
+dual_energy      = false
+dual_energy_eta1 = 1.0e-4
+dual_energy_eta2 = 1.0e-1
+
+<problem>
+pgen_name  = shock_tube
+shock_dir  = 1
+xshock     = 0.0
+
+dl  = 1.0
+pl  = 1.0
+ul  = 0.0
+vl  = 0.0
+wl  = 0.0
+bxl = 0.5
+byl = 1.0
+bzl = 0.0
+
+dr  = 0.125
+pr  = 0.1
+ur  = 0.0
+vr  = 0.0
+wr  = 0.0
+bxr = 0.5
+byr = -1.0
+bzr = 0.0
+
+<output1>
+file_type   = hst
+data_format = %24.16e
+dt          = 0.02
+
+<output2>
+file_type   = bin
+variable    = mhd_w
+dt          = 0.1
+
+<output3>
+file_type   = bin
+variable    = mhd_u
+dt          = 0.1

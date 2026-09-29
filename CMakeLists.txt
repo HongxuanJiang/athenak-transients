@@ -34,6 +34,7 @@ endif()
 option(Athena_SINGLE_PRECISION "Compile for single precision" OFF)
 option(Athena_ENABLE_MPI "Compile with MPI parallelism enabled" OFF)
 option(Athena_ENABLE_OPENMP "Compile with OpenMP parallelism enabled" OFF)
+option(Athena_ENABLE_RNS "Compile with RNS support enabled" OFF)
 set(PROBLEM built_in_pgens CACHE STRING "Name of problem generator function")
 
 #------ set macros exported to config.hpp ------------------------------------------------
@@ -77,7 +78,32 @@ else()
   set(OPENMP_PARALLEL_ENABLED 0)
 endif()
 
-#set user problem generator flag
+# Resolve legacy problem-generator basenames after the IAS source-tree reorganization.
+# Direct files in src/pgen retain priority; otherwise require one unique recursive match.
+set(ATHENA_PROBLEM_REQUESTED "${PROBLEM}")
+set(ATHENA_PROBLEM_RESOLVED "${PROBLEM}")
+if (NOT "${PROBLEM}" STREQUAL "built_in_pgens")
+  if (NOT EXISTS "${CMAKE_SOURCE_DIR}/src/pgen/${PROBLEM}.cpp")
+    file(GLOB_RECURSE ATHENA_PROBLEM_MATCHES
+         RELATIVE "${CMAKE_SOURCE_DIR}/src/pgen"
+         "${CMAKE_SOURCE_DIR}/src/pgen/*/${PROBLEM}.cpp")
+    list(LENGTH ATHENA_PROBLEM_MATCHES ATHENA_PROBLEM_MATCH_COUNT)
+    if (ATHENA_PROBLEM_MATCH_COUNT EQUAL 0)
+      message(FATAL_ERROR
+              "Unable to locate problem generator '${ATHENA_PROBLEM_REQUESTED}' under src/pgen")
+    elseif (ATHENA_PROBLEM_MATCH_COUNT GREATER 1)
+      message(FATAL_ERROR
+              "Problem generator '${ATHENA_PROBLEM_REQUESTED}' is ambiguous: ${ATHENA_PROBLEM_MATCHES}")
+    endif()
+    list(GET ATHENA_PROBLEM_MATCHES 0 ATHENA_PROBLEM_SOURCE)
+    string(REGEX REPLACE "\\.cpp$" "" ATHENA_PROBLEM_RESOLVED
+           "${ATHENA_PROBLEM_SOURCE}")
+  endif()
+  # src/CMakeLists.txt consumes PROBLEM as a path relative to src/pgen.
+  set(PROBLEM "${ATHENA_PROBLEM_RESOLVED}")
+endif()
+
+# set user problem generator flag
 if (NOT ${PROBLEM} STREQUAL "built_in_pgens")
   message(STATUS "Including user-specified problem generator file: ${PROBLEM}")
   set(USER_PROBLEM_ENABLED 1)
@@ -111,7 +137,13 @@ endif()
 
 # add subdirectories for source code and include files
 add_subdirectory(src)
-add_subdirectory(kokkos)
+if (EXISTS ${CMAKE_SOURCE_DIR}/kokkos/CMakeLists.txt)
+  add_subdirectory(${CMAKE_SOURCE_DIR}/kokkos ${CMAKE_BINARY_DIR}/kokkos-build)
+elseif (EXISTS ${CMAKE_SOURCE_DIR}/../athenak/kokkos/CMakeLists.txt)
+  add_subdirectory(${CMAKE_SOURCE_DIR}/../athenak/kokkos ${CMAKE_BINARY_DIR}/kokkos-build)
+else()
+  message(FATAL_ERROR "Unable to locate Kokkos source directory.")
+endif()
 include_directories(${Kokkos_INCLUDE_DIRS_RET})
 
 target_link_libraries(athena PUBLIC Kokkos::kokkos)
@@ -172,7 +204,7 @@ if (${PROBLEM} MATCHES "dyn_grmhd/elliptica/*")
   endif()
 endif()
 
-if (${PROBLEM} MATCHES "dyn_grmhd/rns/*")
+if (Athena_ENABLE_RNS OR "${PROBLEM}" MATCHES "^dyn_grmhd/rns/")
   # Support for RNS library for rotating neutron stars. See
   # https://github.com/computationalrelativity/RNSC
   target_include_directories(athena PRIVATE
@@ -246,9 +278,9 @@ endif()
 target_include_directories(athena PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_BINARY_DIR}
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/pgen
 )
 
 configure_file(config.hpp.in config.hpp)
 
 install( TARGETS athena DESTINATION bin )
-

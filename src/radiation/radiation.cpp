@@ -22,6 +22,7 @@
 #include "geodesic-grid/geodesic_grid.hpp"
 #include "units/units.hpp"
 #include "radiation/radiation.hpp"
+#include "../mesh/mb_storage.hpp"
 
 namespace radiation {
 //----------------------------------------------------------------------------------------
@@ -110,7 +111,7 @@ Radiation::Radiation(MeshBlockPack *ppack, ParameterInput *pin) :
   prgeo = new GeodesicGrid(nlevel, rotate_geo, angular_fluxes);
 
   // Total number of MeshBlocks on this rank to be used in array dimensioning
-  int nmb = std::max((ppack->nmb_thispack), (ppack->pmesh->nmb_maxperrank));
+  int nmb = ppack->nmb_thispack;
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   {
   int ncells1 = indcs.nx1 + 2*(indcs.ng);
@@ -133,6 +134,7 @@ Radiation::Radiation(MeshBlockPack *ppack, ParameterInput *pin) :
   // (3) read time-evolution option [already error checked in driver constructor]
   // Then initialize memory and algorithms for reconstruction and Riemann solvers
   std::string evolution_t = pin->GetString("time","evolution");
+  time_evolving = (evolution_t.compare("stationary") != 0);
 
   // allocate memory for intensities
   {
@@ -156,7 +158,7 @@ Radiation::Radiation(MeshBlockPack *ppack, ParameterInput *pin) :
   pbval_i->InitializeBuffers(prgeo->nangles);
 
   // for time-evolving problems, continue to construct methods, allocate arrays
-  if (evolution_t.compare("stationary") != 0) {
+  if (time_evolving) {
     // select reconstruction method (default PLM)
     {std::string xorder = pin->GetOrAddString("radiation","reconstruct","plm");
     if (xorder.compare("dc") == 0) {
@@ -209,6 +211,77 @@ Radiation::~Radiation() {
   delete pbval_i;
   delete prgeo;
   if (psrc != nullptr) {delete psrc;}
+}
+
+bool Radiation::ResizeMeshBlockStorage(int nmb, bool exact, bool allow_shrink) {
+  // See the matching comment in Hydro::ResizeMeshBlockStorage.
+  if (pbval_i != nullptr) {
+    pbval_i->ResizeBuffers(nmb);
+  }
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  int ncells1 = indcs.nx1 + 2*(indcs.ng);
+  int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
+  int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
+  int nccells1 = indcs.cnx1 + 2*(indcs.ng);
+  int nccells2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*(indcs.ng)) : 1;
+  int nccells3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*(indcs.ng)) : 1;
+
+  auto resize6 = [exact, allow_shrink](auto &view, int n0, int n1, int n2, int n3,
+                                       int n4, int n5) {
+    const bool need = ((exact ? (view.extent_int(0) != n0)
+                          : MeshBlockStorageShouldResize(view.extent_int(0), n0,
+                                                         allow_shrink)) ||
+                       view.extent_int(1) != n1 || view.extent_int(2) != n2 ||
+                       view.extent_int(3) != n3 || view.extent_int(4) != n4 ||
+                       view.extent_int(5) != n5);
+    if (need) {
+      Kokkos::resize(view, exact ? n0 : MeshBlockStorageCapacity(n0), n1, n2, n3, n4, n5);
+    }
+    return need;
+  };
+  auto resize5 = [exact, allow_shrink](auto &view, int n0, int n1, int n2, int n3,
+      int n4) {
+    const bool need = ((exact ? (view.extent_int(0) != n0)
+                          : MeshBlockStorageShouldResize(view.extent_int(0), n0,
+                                                         allow_shrink)) ||
+                       view.extent_int(1) != n1 || view.extent_int(2) != n2 ||
+                       view.extent_int(3) != n3 || view.extent_int(4) != n4);
+    if (need) {
+      Kokkos::resize(view, exact ? n0 : MeshBlockStorageCapacity(n0), n1, n2, n3, n4);
+    }
+    return need;
+  };
+
+  bool resized = false;
+  resized = resize6(tet_c, nmb, 4, 4, ncells3, ncells2, ncells1) || resized;
+  resized = resize6(tetcov_c, nmb, 4, 4, ncells3, ncells2, ncells1) || resized;
+  resized = resize5(tet_d1_x1f, nmb, 4, ncells3, ncells2, ncells1 + 1) || resized;
+  resized = resize5(tet_d2_x2f, nmb, 4, ncells3, ncells2 + 1, ncells1) || resized;
+  resized = resize5(tet_d3_x3f, nmb, 4, ncells3 + 1, ncells2, ncells1) || resized;
+  if (angular_fluxes) {
+    resized = resize6(na, nmb, prgeo->nangles, ncells3, ncells2, ncells1, 6) || resized;
+  }
+  if (is_hydro_enabled || is_mhd_enabled) {
+    resized = resize6(norm_to_tet, nmb, 4, 4, ncells3, ncells2, ncells1) || resized;
+  }
+  resized = resize5(i0, nmb, prgeo->nangles, ncells3, ncells2, ncells1) || resized;
+  if (pmy_pack->pmesh->multilevel) {
+    resized = resize5(coarse_i0, nmb, prgeo->nangles, nccells3, nccells2, nccells1) ||
+              resized;
+  }
+  if (time_evolving) {
+    resized = resize5(i1, nmb, prgeo->nangles, ncells3, ncells2, ncells1) || resized;
+    resized = resize5(iflx.x1f, nmb, prgeo->nangles, ncells3, ncells2,
+        ncells1) || resized;
+    resized = resize5(iflx.x2f, nmb, prgeo->nangles, ncells3, ncells2,
+        ncells1) || resized;
+    resized = resize5(iflx.x3f, nmb, prgeo->nangles, ncells3, ncells2,
+        ncells1) || resized;
+    if (angular_fluxes) {
+      resized = resize5(divfa, nmb, prgeo->nangles, ncells3, ncells2, ncells1) || resized;
+    }
+  }
+  return resized;
 }
 
 } // namespace radiation

@@ -12,29 +12,55 @@
 #include "athena.hpp"
 #include "mesh/mesh.hpp"
 
+namespace {
+void BCHelperRadiation(MeshBlockPack *ppack, DualArray2D<Real> i_in,
+                       DvceArray5D<Real> i0, int is, int ie, int js, int je,
+                       int ks, int ke, int n1, int n2, int n3);
+}  // namespace
+
 //----------------------------------------------------------------------------------------
-//! \!fn void BoundaryValues::RadiationBCs()
-//! \brief Apply physical boundary conditions for radiation at faces of MB which
-//! are at the edge of the computational domain
+//! \fn void BoundaryValues::RadiationBCs()
+//! \brief Apply physical boundary conditions to the fine array after prolongation.
 
 void MeshBoundaryValues::RadiationBCs(MeshBlockPack *ppack, DualArray2D<Real> i_in,
                                       DvceArray5D<Real> i0) {
-  // loop over all MeshBlocks in this MeshBlockPack
-  auto &pm = ppack->pmesh;
   auto &indcs = ppack->pmesh->mb_indcs;
   int &ng = indcs.ng;
-  auto &mb_bcs = ppack->pmb->mb_bcs;
-
   int n1 = indcs.nx1 + 2*ng;
   int n2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng) : 1;
   int n3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng) : 1;
+  BCHelperRadiation(ppack, i_in, i0, indcs.is, indcs.ie, indcs.js, indcs.je,
+                    indcs.ks, indcs.ke, n1, n2, n3);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void BoundaryValues::RadiationBCsCoarse()
+//! \brief Fill coarse physical-boundary ghosts before prolongation.
+
+void MeshBoundaryValues::RadiationBCsCoarse(MeshBlockPack *ppack,
+                                            DualArray2D<Real> i_in,
+                                            DvceArray5D<Real> coarse_i0) {
+  auto &indcs = ppack->pmesh->mb_indcs;
+  int &ng = indcs.ng;
+  int n1 = indcs.cnx1 + 2*ng;
+  int n2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*ng) : 1;
+  int n3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*ng) : 1;
+  BCHelperRadiation(ppack, i_in, coarse_i0, indcs.cis, indcs.cie, indcs.cjs,
+                    indcs.cje, indcs.cks, indcs.cke, n1, n2, n3);
+}
+
+namespace {
+void BCHelperRadiation(MeshBlockPack *ppack, DualArray2D<Real> i_in,
+                       DvceArray5D<Real> i0, int is, int ie, int js, int je,
+                       int ks, int ke, int n1, int n2, int n3) {
+  auto &pm = ppack->pmesh;
+  int &ng = ppack->pmesh->mb_indcs.ng;
+  auto &mb_bcs = ppack->pmb->mb_bcs;
   int nvar = i0.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
   int nmb = ppack->nmb_thispack;
 
   // only apply BCs if not periodic
   if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::periodic) {
-    int &is = indcs.is;
-    int &ie = indcs.ie;
     par_for("radiationbc_x1", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n3-1),0,(n2-1),
     KOKKOS_LAMBDA(int m, int n, int k, int j) {
       // apply physical boundaries to inner_x1
@@ -74,8 +100,6 @@ void MeshBoundaryValues::RadiationBCs(MeshBlockPack *ppack, DualArray2D<Real> i_
 
   // only apply BCs if not periodic
   if (pm->mesh_bcs[BoundaryFace::inner_x2] != BoundaryFlag::periodic) {
-    int &js = indcs.js;
-    int &je = indcs.je;
     par_for("radiationbc_x2", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n3-1),0,(n1-1),
     KOKKOS_LAMBDA(int m, int n, int k, int i) {
       // apply physical boundaries to inner_x2
@@ -115,8 +139,6 @@ void MeshBoundaryValues::RadiationBCs(MeshBlockPack *ppack, DualArray2D<Real> i_
 
   // only apply BCs if not periodic
   if (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic) return;
-  int &ks = indcs.ks;
-  int &ke = indcs.ke;
   par_for("radiationbc_x3", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n2-1),0,(n1-1),
   KOKKOS_LAMBDA(int m, int n, int j, int i) {
     // apply physical boundaries to inner_x3
@@ -154,3 +176,4 @@ void MeshBoundaryValues::RadiationBCs(MeshBlockPack *ppack, DualArray2D<Real> i_
 
   return;
 }
+}  // namespace

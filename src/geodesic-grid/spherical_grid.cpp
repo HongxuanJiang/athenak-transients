@@ -47,6 +47,7 @@ SphericalGrid::SphericalGrid(MeshBlockPack *ppack, int nlev, Real rad, int nintp
   SetInterpolationCoordinates();
   SetInterpolationIndices();
   SetInterpolationWeights();
+  interp_topology_version_ = pmy_pack->pmesh->topology_version;
 
   return;
 }
@@ -90,6 +91,24 @@ void SphericalGrid::SetInterpolationCoordinates() {
   interp_coord.template modify<HostMemSpace>();
   interp_coord.template sync<DevExeSpace>();
 
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void SphericalGrid::ResetCenterAndRadius
+//! \brief move the sphere to Euclidean radius rad about center and invalidate the cached
+//         (MeshBlock, zone) stencil so that the next interpolation rebuilds it
+
+void SphericalGrid::ResetCenterAndRadius(const Real center[3], Real rad) {
+  radius = rad;
+  for (int n=0; n<nangles; ++n) {
+    interp_coord.h_view(n,0) = center[0] + rad*cart_pos.h_view(n,0);
+    interp_coord.h_view(n,1) = center[1] + rad*cart_pos.h_view(n,1);
+    interp_coord.h_view(n,2) = center[2] + rad*cart_pos.h_view(n,2);
+  }
+  interp_coord.template modify<HostMemSpace>();
+  interp_coord.template sync<DevExeSpace>();
+  interp_topology_version_ = ~std::uint64_t{0};
   return;
 }
 
@@ -229,10 +248,14 @@ void SphericalGrid::InterpolateToSphere(int nvars, DvceArray5D<Real>& val) {
 //! \brief interpolate an (inclusive) index range of Cartesian data to surface of sphere
 
 void SphericalGrid::InterpolateToSphere(int vs, int ve, DvceArray5D<Real>& val) {
-  // reinitialize interpolation indices and weights if AMR
-  if (pmy_pack->pmesh->adaptive) {
+  // Rebuild the interpolation indices and weights whenever the block layout has changed
+  // since they were built (Mesh::topology_version is bumped, on every rank, by every AMR
+  // regrid and LAT load-balance transaction) or the sphere itself has been moved.
+  const std::uint64_t topology_version = pmy_pack->pmesh->topology_version;
+  if (topology_version != interp_topology_version_) {
     SetInterpolationIndices();
     SetInterpolationWeights();
+    interp_topology_version_ = topology_version;
   }
 
   // capturing variables for kernel

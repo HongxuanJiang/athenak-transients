@@ -48,6 +48,14 @@ Viscosity::~Viscosity() {
 
 void Viscosity::AddViscousFluxes(const DvceArray5D<Real> &w0, const EOS_Data &eos,
     DvceFaceFld5D<Real> &flx) {
+  // A ghost-extended register is the zero-origin band.
+  AddViscousFluxes(w0, eos, BandFaceFld5D<Real>{BandView5D<Real>{flx.x1f, 0, 0, 0},
+                                                BandView5D<Real>{flx.x2f, 0, 0, 0},
+                                                BandView5D<Real>{flx.x3f, 0, 0, 0}});
+}
+
+void Viscosity::AddViscousFluxes(const DvceArray5D<Real> &w0, const EOS_Data &eos,
+    const BandFaceFld5D<Real> &flx) {
   if (nu_iso != 0.0) {
     AddViscousFluxIso(w0, eos, flx);
   }
@@ -62,7 +70,7 @@ void Viscosity::AddViscousFluxes(const DvceArray5D<Real> &w0, const EOS_Data &eo
 //  \brief Adds viscous fluxes to face-centered fluxes of conserved variables
 
 void Viscosity::AddViscousFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-    DvceFaceFld5D<Real> &flx) {
+    const BandFaceFld5D<Real> &flx) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;
@@ -218,7 +226,7 @@ void Viscosity::AddViscousFluxIso(const DvceArray5D<Real> &w0, const EOS_Data &e
 //  \brief Currently no-op function, to be added later
 
 void Viscosity::AddViscousFluxAniso(const DvceArray5D<Real> &w0, const EOS_Data &eos,
-    DvceFaceFld5D<Real> &flx) {
+    const BandFaceFld5D<Real> &flx) {
   return;
 }
 

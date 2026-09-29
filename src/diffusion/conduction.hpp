@@ -30,15 +30,19 @@ class Conduction {
   bool alpha_spitzer;   // switch to turn on Spitzer conductivity
   Real q_limit;         // saturated heat flux limit
 
-  // functions
+  // functions.  The flux register is taken on its storage band (MHD keeps uflx on the
+  // flux band, mhd.hpp FluxBand); a ghost-extended register (Hydro) is the zero-origin
+  // band, via the second overload.
+  void AddHeatFluxes(const DvceArray5D<Real> &w, const EOS_Data &eos,
+                     const BandFaceFld5D<Real> &f);
   void AddHeatFluxes(const DvceArray5D<Real> &w, const EOS_Data &eos,
                      DvceFaceFld5D<Real> &f);
   void AddHeatFluxIso(const DvceArray5D<Real> &w, const EOS_Data &eos,
-                      DvceFaceFld5D<Real> &f);
+                      const BandFaceFld5D<Real> &f);
   void AddHeatFluxAniso(const DvceArray5D<Real> &w, const EOS_Data &eos,
-                        DvceFaceFld5D<Real> &f);
+                        const BandFaceFld5D<Real> &f);
   void AddHeatFluxSpitzer(const DvceArray5D<Real> &w, const EOS_Data &eos,
-                          DvceFaceFld5D<Real> &f);
+                          const BandFaceFld5D<Real> &f);
   void NewTimeStep(const DvceArray5D<Real> &w, const EOS_Data &eos_data);
 
  private:

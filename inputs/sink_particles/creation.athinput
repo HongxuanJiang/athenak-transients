@@ -1,0 +1,125 @@
+# AthenaK input: Jeans/Truelove sink creation + gas surgery (battery case "creation")
+#
+# A single cold, Jeans-supercritical uniform sphere on a self-gravitating uniform grid.
+# Every finest-level cell with rho > rho_J spawns a sink of mass (rho - rho_J)*V at the
+# CELL CENTRE (sink_particles_create.cpp); the friends-of-friends pass that runs
+# immediately afterwards collapses that swarm into ONE sink, which by the symmetry of
+# the configuration must land on the density peak, the origin.
+#
+# Numbers (isothermal EOS, so c_s is an input and rho_J is exact):
+#   G = four_pi_G/(4 pi) = 1, c_s = 1, dx = 1/32 = 0.03125, jeans_no = 0.25
+#   rho_J = pi c_s^2 / (G (dx/jeans_no)^2) = pi/0.015625 = 201.06192982974676
+#   sphere: radius 3 dx = 0.09375, mass 1  ->  rho = 289.7327319575126 = 1.441 rho_J
+#   so the sphere core (fill fraction > 0.694) is supercritical: ~90 candidate cells.
+#
+# The pgen is the built-in binary_gravity (two uniform spheres); the second sphere is
+# parked at x = 100, far outside the domain, so only sphere 1 exists.  Its ambient is
+# 1e-300, which the density floor lifts to FLT_MIN once, manufacturing ~1e-38 of mass in
+# total -- 26 orders below the 1e-12 ledger gate.
+#
+# accrete = false so the only gas->sink transfer in the step is the surgery itself, and
+# nlim = 1 so the sinks appear on the very first cycle.  With periodic boundaries the
+# hydro conserves mass exactly, so
+#     M_gas(after) + M_sink == M_gas(before)      to round-off
+# is a clean gate, and so is the momentum ledger (both are ~0 by symmetry here).
+
+<comment>
+problem   = Jeans-supercritical sphere -> sink creation
+reference = Truelove et al. 1997, ApJ 489, L179; Krumholz, Klein & McKee 2004
+
+<job>
+basename  = sink_creation
+
+<mesh>
+nghost    = 4
+nx1       = 32
+x1min     = -0.5
+x1max     = 0.5
+ix1_bc    = periodic
+ox1_bc    = periodic
+
+nx2       = 32
+x2min     = -0.5
+x2max     = 0.5
+ix2_bc    = periodic
+ox2_bc    = periodic
+
+nx3       = 32
+x3min     = -0.5
+x3max     = 0.5
+ix3_bc    = periodic
+ox3_bc    = periodic
+
+<meshblock>
+nx1       = 16
+nx2       = 16
+nx3       = 16
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.2
+nlim       = 1
+tlim       = 1.0e30
+ndiag      = 1
+lat        = false
+hydro_lat_levels = 1
+
+<hydro>
+eos             = isothermal
+reconstruct     = plm
+rsolver         = llf
+gamma           = 1.4
+iso_sound_speed = 1.0
+
+<gravity>
+four_pi_G      = 12.566370614359172   # G = 1
+self_gravity   = true
+threshold      = -1
+niteration     = 20
+npresmooth     = 1
+npostsmooth    = 1
+full_multigrid = true
+show_defect    = 0
+mg_nghost      = 1
+root_on_host   = false
+
+<hydro_srcterms>
+self_gravity = true
+
+<sink_particles>
+create               = true       # requires the <gravity> block above
+accrete              = false      # keep the ledger a pure surgery ledger
+accrete_radius_cells = 4
+soften               = 1.0
+merge_link_cells     = 8.0        # link = 0.25 > the 0.09375 sphere: one group
+mmergemax            = 0.0        # merge unconditionally
+jeans_no             = 0.25
+r_angmom             = 1.0e100
+use_sink_timestep    = true
+subcell_gravity      = false
+bs_tol               = 1.0e-6
+newton_g             = 1.0
+log                  = sinks.log
+n_init               = 0
+
+<problem>
+pgen_name  = binary_gravity
+four_pi_G  = 12.566370614359172
+rho0       = 1.0
+# sphere 1: the Jeans-supercritical cloud, centred on the origin
+x1         = 0.0
+y1         = 0.0
+z1         = 0.0
+m1         = 1.0
+# sphere 2 parked far outside the domain so it contributes nothing
+x2         = 100.0
+y2         = 0.0
+z2         = 0.0
+m2         = 1.0
+radius     = 0.09375              # 3 dx
+
+<output1>
+file_type   = hst
+data_format = %24.17e
+dcycle      = 1

@@ -16,12 +16,12 @@
 #include "athena.hpp"
 #include "io_wrapper.hpp"
 
-#define NHISTORY_VARIABLES 20
+#define NHISTORY_VARIABLES 24
 #if NHISTORY_VARIABLES > NREDUCTION_VARIABLES
     #error NHISTORY > NREDUCTION in outputs.hpp
 #endif
 
-#define NOUTPUT_CHOICES 153
+#define NOUTPUT_CHOICES 174
 // choices for output variables used in <ouput> blocks in input file
 // TO ADD MORE CHOICES:
 //   - add more strings to array below, change NOUTPUT_CHOICES above appropriately
@@ -98,7 +98,16 @@ static const char *var_choice[NOUTPUT_CHOICES] = {
   "tmunu",
 
   // Particles (151-152)
-  "prtcl_all", "prtcl_d"
+  "prtcl_all", "prtcl_d",
+  // Gravity (153)
+  "grav_phi",
+  // tabulated LTE EOS diagnostics (154-171)
+  "hydro_temperature", "hydro_xh2", "hydro_xion", "hydro_xhe1", "hydro_xhe2",
+  "hydro_gamma1", "hydro_gamma3m1", "hydro_mu", "hydro_beta_rad",
+  "mhd_temperature", "mhd_xh2", "mhd_xion", "mhd_xhe1", "mhd_xhe2",
+  "mhd_gamma1", "mhd_gamma3m1", "mhd_mu", "mhd_beta_rad",
+  // hydro diagnostics shared with AMR criteria (172-173)
+  "hydro_div_v", "hydro_abs_div_v"
 };
 
 
@@ -144,6 +153,7 @@ struct OutputParameters {
   bool logscale=true, logscale2=true;
   bool mass_weighted=false;
   bool single_file_per_rank=false; // DBF: parameter for single file per rank
+  bool binary_double = false;
 };
 
 //----------------------------------------------------------------------------------------
@@ -154,9 +164,21 @@ struct OutputVariableInfo {
   std::string label;             // "name" of variable
   int data_index;                // index of variable in device array
   DvceArray5D<Real> *data_ptr;   // ptr to device array containing variable
+  bool stream_grav_phi;          // compute gravity potential one MeshBlock at a time
+  bool stream_ideal_dyn_temperature; // compute ideal DynGRMHD temperature on output only
+  bool stream_adm_metric;        // materialize analytical ADM one MeshBlock at a time
   // constructor(s)
   OutputVariableInfo(std::string lab, int indx, DvceArray5D<Real> *ptr) :
-    label(lab), data_index(indx), data_ptr(ptr) {}
+    label(lab), data_index(indx), data_ptr(ptr), stream_grav_phi(false),
+    stream_ideal_dyn_temperature(false), stream_adm_metric(false) {}
+  OutputVariableInfo(std::string lab, int indx, DvceArray5D<Real> *ptr,
+                     bool stream_phi) :
+    label(lab), data_index(indx), data_ptr(ptr), stream_grav_phi(stream_phi),
+    stream_ideal_dyn_temperature(false), stream_adm_metric(false) {}
+  OutputVariableInfo(std::string lab, int indx, DvceArray5D<Real> *ptr,
+                     bool stream_phi, bool stream_temp) :
+    label(lab), data_index(indx), data_ptr(ptr), stream_grav_phi(stream_phi),
+    stream_ideal_dyn_temperature(stream_temp), stream_adm_metric(false) {}
 };
 
 //----------------------------------------------------------------------------------------
@@ -225,6 +247,17 @@ class BaseTypeOutput {
   // virtual functions may be over-ridden in derived classes
   virtual void LoadOutputData(Mesh *pm);
   virtual void WriteOutputFile(Mesh *pm, ParameterInput *pin) = 0;
+
+  //! Path this stream writes for a given file number, or "" for a stream that does not
+  //! write numbered files.  One definition, shared by the writer and by the startup scan
+  //! that reports which existing files a run is about to supersede.
+  virtual std::string FileNameForNumber(int number) const {
+    (void)number;
+    return std::string();
+  }
+
+  // advance this stream's output cadence after a dump, and record it for the next restart
+  void AdvanceOutputTime(Mesh *pm, ParameterInput *pin);
 
   // Functions to detect big endian machine, and to byte-swap 32-bit words.  The vtk
   // legacy format requires data to be stored as big-endian.
@@ -374,6 +407,7 @@ class MeshBinaryOutput : public BaseTypeOutput {
  public:
   MeshBinaryOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
   void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+  std::string FileNameForNumber(int number) const override;
 };
 
 //----------------------------------------------------------------------------------------
@@ -385,6 +419,7 @@ class RestartOutput : public BaseTypeOutput {
   RestartOutput(ParameterInput *pin, Mesh *pm, OutputParameters oparams);
   void LoadOutputData(Mesh *pm) override;
   void WriteOutputFile(Mesh *pm, ParameterInput *pin) override;
+  std::string FileNameForNumber(int number) const override;
 };
 
 // Forward declaration
@@ -478,6 +513,10 @@ class Outputs {
 
   // use vector of pointers to BaseTypeOutputs since it is an abstract base class
   std::vector<BaseTypeOutput*> pout_list;
+
+ private:
+  // warn (rank 0) about existing numbered files this run will write over
+  void ReportSupersededFiles();
 };
 
 #endif // OUTPUTS_OUTPUTS_HPP_

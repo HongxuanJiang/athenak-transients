@@ -1,0 +1,101 @@
+# The LAT variant of linear_wave_amr_restart.athinput.  Under LAT the outputs are made
+# at LAT WINDOW ends, so dcycle = 1 gives a checkpoint at every window end, not at every
+# cycle, and the file number is not the cycle number.
+# Used by tst/test_suite/nr/test_nr_amr_restart_bitwise_lat_mpicpu.py.
+#
+# Under LAT, Driver::Execute calls AMR at a WINDOW END whenever
+# (ncycle - last_amr_call_cycle) >= ncycle_check, and a window is a sum of variable sync
+# factors, so with ncycle_check = 3 the AMR calls do NOT land on the multiples of 3.  A
+# restart therefore cannot reconstruct the writer's cadence from ncycle alone; it reads
+# the anchor the restart writer records (mesh_refinement/last_amr_call_cycle).
+# refinement_interval = ncycle_check keeps the per-MeshBlock refinement cooldown (run
+# history no checkpoint carries) inert, which is what lets the restart be bitwise.
+# The comparison is on the hydro_u dumps rather than the history file, because an AMR
+# restart rebuilds Z-ordered GIDs and the global history sums then reassociate at 1e-14.
+
+<comment>
+problem   = hydro linear wave, adaptive mesh, LAT, restart regression
+
+<job>
+basename  = LinWaveAMRRestartLAT
+
+<mesh>
+nghost    = 2
+nx1       = 64
+x1min     = 0.0
+x1max     = 3.0
+ix1_bc    = periodic
+ox1_bc    = periodic
+
+nx2       = 32
+x2min     = 0.0
+x2max     = 1.5
+ix2_bc    = periodic
+ox2_bc    = periodic
+
+nx3       = 1
+x3min     = 0.0
+x3max     = 1.5
+ix3_bc    = periodic
+ox3_bc    = periodic
+
+<meshblock>
+nx1       = 8
+nx2       = 8
+nx3       = 1
+
+<mesh_refinement>
+refinement          = adaptive
+max_nmb_per_rank    = 256
+num_levels          = 2
+ncycle_check        = 3
+refinement_interval = 3
+
+<amr_criterion0>
+method    = min_max
+variable  = hydro_w_d
+value_max = 1.0008
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim       = 24
+tlim       = 5.0
+ndiag      = 1
+lat                     = true
+hydro_lat_levels        = 2
+hydro_lat_min_bin_count = 0
+hydro_lat_diagnostics   = true
+
+<hydro>
+eos         = ideal
+reconstruct = plm
+rsolver     = llf
+gamma       = 1.66666666667
+
+<problem>
+pgen_name = linear_wave
+wave_flag = 0
+amp       = 1.0e-3
+dens      = 1.0
+pgas      = 0.6
+vx0       = 0.0
+along_x1  = false
+along_x2  = false
+along_x3  = false
+
+<output1>
+file_type   = hst
+data_format = %24.16e
+dt          = 1.0e-8
+
+<output2>
+file_type   = rst
+dcycle      = 1
+
+<output3>
+file_type = bin
+variable  = hydro_u
+dcycle    = 1
+variable_precision = float64

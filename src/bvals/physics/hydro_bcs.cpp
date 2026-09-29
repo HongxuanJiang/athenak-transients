@@ -14,32 +14,62 @@
 #include "hydro/hydro.hpp"
 #include "eos/eos.hpp"
 
+namespace {
+void BCHelperHydro(MeshBlockPack *ppack, DualArray2D<Real> u_in, DvceArray5D<Real> u0,
+                   int is, int ie, int js, int je, int ks, int ke, int n1, int n2,
+                   int n3);
+}  // namespace
+
 //----------------------------------------------------------------------------------------
-//! \!fn void BoundaryValues::HydroBCs()
-//! \brief Apply physical boundary conditions for all Hydro variables at faces of MB which
-//! are at the edge of the computational domain
+//! \fn void BoundaryValues::HydroBCs()
+//! \brief Apply physical boundary conditions to the fine array after prolongation.
 
 void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
                                   DvceArray5D<Real> u0) {
-  // loop over all MeshBlocks in this MeshBlockPack
-  auto &pm = ppack->pmesh;
   auto &indcs = ppack->pmesh->mb_indcs;
   int &ng = indcs.ng;
-  auto &mb_bcs = ppack->pmb->mb_bcs;
-
   int n1 = indcs.nx1 + 2*ng;
   int n2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng) : 1;
   int n3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng) : 1;
+  BCHelperHydro(ppack, u_in, u0, indcs.is, indcs.ie, indcs.js, indcs.je,
+                indcs.ks, indcs.ke, n1, n2, n3);
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void BoundaryValues::HydroBCsCoarse()
+//! \brief Fill coarse physical-boundary ghosts before prolongation uses their stencil.
+
+void MeshBoundaryValues::HydroBCsCoarse(MeshBlockPack *ppack, DualArray2D<Real> u_in,
+                                        DvceArray5D<Real> coarse_u0) {
+  auto &indcs = ppack->pmesh->mb_indcs;
+  int &ng = indcs.ng;
+  int n1 = indcs.cnx1 + 2*ng;
+  int n2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*ng) : 1;
+  int n3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*ng) : 1;
+  BCHelperHydro(ppack, u_in, coarse_u0, indcs.cis, indcs.cie, indcs.cjs,
+                indcs.cje, indcs.cks, indcs.cke, n1, n2, n3);
+}
+
+namespace {
+void BCHelperHydro(MeshBlockPack *ppack, DualArray2D<Real> u_in, DvceArray5D<Real> u0,
+                   int is, int ie, int js, int je, int ks, int ke, int n1, int n2,
+                   int n3) {
+  auto &pm = ppack->pmesh;
+  int &ng = ppack->pmesh->mb_indcs.ng;
+  auto &mb_bcs = ppack->pmb->mb_bcs;
   int nvar = u0.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
   int nmb = ppack->nmb_thispack;
+  const bool lat_enabled = ppack->lat_active_mask_enabled;
+  auto active_indices = ppack->lat_active_indices.d_view;
+  const int nwork = lat_enabled ? ppack->lat_nactive_thispack : nmb;
+  if (nwork <= 0) return;
 
   // only apply BCs if not (periodic) or (shear_periodic)
   if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::periodic &&
       pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::shear_periodic) {
-    int &is = indcs.is;
-    int &ie = indcs.ie;
-    par_for("hydrobc_x1", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n3-1),0,(n2-1),
-    KOKKOS_LAMBDA(int m, int n, int k, int j) {
+    par_for("hydrobc_x1", DevExeSpace(), 0,(nwork-1),0,(nvar-1),0,(n3-1),0,(n2-1),
+    KOKKOS_LAMBDA(int a, int n, int k, int j) {
+      const int m = lat_enabled ? active_indices(a) : a;
       // apply physical boundaries to inner_x1
       switch (mb_bcs.d_view(m,BoundaryFace::inner_x1)) {
         case BoundaryFlag::reflect:
@@ -124,10 +154,9 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
 
   // only apply BCs if not periodic
   if (pm->mesh_bcs[BoundaryFace::inner_x2] != BoundaryFlag::periodic) {
-    int &js = indcs.js;
-    int &je = indcs.je;
-    par_for("hydrobc_x2", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n3-1),0,(n1-1),
-    KOKKOS_LAMBDA(int m, int n, int k, int i) {
+    par_for("hydrobc_x2", DevExeSpace(), 0,(nwork-1),0,(nvar-1),0,(n3-1),0,(n1-1),
+    KOKKOS_LAMBDA(int a, int n, int k, int i) {
+      const int m = lat_enabled ? active_indices(a) : a;
       // apply physical boundaries to inner_x2
       switch (mb_bcs.d_view(m,BoundaryFace::inner_x2)) {
         case BoundaryFlag::reflect:
@@ -211,10 +240,9 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
 
   // only apply BCs if not periodic
   if (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic) return;
-  int &ks = indcs.ks;
-  int &ke = indcs.ke;
-  par_for("hydrobc_x3", DevExeSpace(), 0,(nmb-1),0,(nvar-1),0,(n2-1),0,(n1-1),
-  KOKKOS_LAMBDA(int m, int n, int j, int i) {
+  par_for("hydrobc_x3", DevExeSpace(), 0,(nwork-1),0,(nvar-1),0,(n2-1),0,(n1-1),
+  KOKKOS_LAMBDA(int a, int n, int j, int i) {
+    const int m = lat_enabled ? active_indices(a) : a;
     // apply physical boundaries to inner_x3
     switch (mb_bcs.d_view(m,BoundaryFace::inner_x3)) {
       case BoundaryFlag::reflect:
@@ -296,3 +324,4 @@ void MeshBoundaryValues::HydroBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
 
   return;
 }
+}  // namespace

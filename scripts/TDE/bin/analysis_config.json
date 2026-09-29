@@ -1,0 +1,85 @@
+{
+  "snapshot_selection": {
+    "start": null,
+    "stop": null,
+    "stride": 1,
+    "limit": null
+  },
+  "resume_existing_outputs": true,
+  "batch_blocks": 32,
+  "numba_threads": 32,
+  "checkpoint_stride": 32,
+  "clean_output_dir": true,
+  "sink_radius_code": 0.2,
+  "sink_shell_cells": 1.0,
+  "outer_shell_cells": 1.0,
+  "control_radius_code": 1.0,
+  "control_shell_cells": 1.0,
+  "r_tide_code": null,
+  "fallback_radius_multipliers": [
+    0.5,
+    1.0,
+    1.2,
+    1.5
+  ],
+  "fallback_shell_cells": 1.0,
+  "inner_shell_radius_code": 1.0,
+  "inner_shell_cells": 1.0,
+  "outer_stream_radius_code": null,
+  "outer_stream_radius_factor": 2.0,
+  "outer_stream_shell_cells": 1.0,
+  "compression_threshold_code": null,
+  "compression_percentile": 95.0,
+  "stellar_radius_code": null,
+  "tail_energy_multiplier": 1.0,
+  "tail_j_threshold_code": null,
+  "tail_j_percentile": 25.0,
+  "tail_e_threshold": 0.8,
+  "fit_tail_alpha": true,
+  "tail_fit_min_populated_bins": 8,
+  "density_threshold_factor": 10.0,
+  "ecrit": 0.2,
+  "Rcrit_code": 1.0,
+  "binning": {
+    "energy": {
+      "nbins": 640,
+      "min_code": null,
+      "max_code": null,
+      "spacing": "symlog",
+      "linthresh_code": null
+    },
+    "j": {
+      "nbins": 480,
+      "min_code": 0.0,
+      "max_code": null,
+      "spacing": "log"
+    },
+    "Be": {
+      "nbins": 640,
+      "min_code": null,
+      "max_code": null,
+      "spacing": "symlog",
+      "linthresh_code": null
+    },
+    "e": {
+      "nbins": 240,
+      "min_code": 0.0,
+      "max_code": 2.0,
+      "spacing": "linear"
+    }
+  },
+  "binning_2d": {
+    "energy_j": {
+      "nbins_x": 160,
+      "nbins_y": 128
+    },
+    "energy_e": {
+      "nbins_x": 160,
+      "nbins_y": 128
+    },
+    "j_e": {
+      "nbins_x": 128,
+      "nbins_y": 128
+    }
+  }
+}

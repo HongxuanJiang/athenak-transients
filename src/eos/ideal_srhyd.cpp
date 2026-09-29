@@ -20,9 +20,13 @@
 
 IdealSRHydro::IdealSRHydro(MeshBlockPack *pp, ParameterInput *pin) :
     EquationOfState("hydro", pp, pin) {
+  eos_data.hydro_eos = HydroEOSModel::gamma_law;
   eos_data.is_ideal = true;
+  eos_data.is_gamma_law = true;
   eos_data.gamma = pin->GetReal("hydro","gamma");
   eos_data.iso_cs = 0.0;
+  eos_data.use_e = true;  // ideal gas EOS always uses internal energy
+  eos_data.use_t = false;
   eos_data.gamma_max = pin->GetOrAddReal("hydro","gamma_max",(FLT_MAX));  // gamma ceiling
 }
 
@@ -44,7 +48,8 @@ IdealSRHydro::IdealSRHydro(MeshBlockPack *pp, ParameterInput *pin) :
 //!    m^i = \gamma w u^i are components of the momentum in the lab frame.
 //! Note we evolve (E-D). This improves accuracy/stability in high-density regions.
 //!
-//! In SR hydrodynamics, the primitive variables are: (\rho, P_gas, u^i).
+//! In SR hydrodynamics, the primitive variables are: (\rho, e_int, u^i), with
+//! P_gas = (\Gamma - 1) e_int.
 //! Note components of the 4-velocity (not 3-velocity) are stored in the primitive
 //! variables because tests show it is better to reconstruct the 4-vel.
 //!
@@ -59,19 +64,24 @@ void IdealSRHydro::ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
   int &nmb = pmy_pack->nmb_thispack;
   auto &fofc_ = pmy_pack->phydro->fofc;
   auto eos = eos_data;
+  const bool lat_enabled = pmy_pack->lat_active_mask_enabled;
+  auto active_indices = pmy_pack->lat_active_indices.d_view;
+  const int nwork = lat_enabled ? pmy_pack->lat_nactive_thispack : nmb;
+  if (nwork <= 0) return;
 
   const int ni   = (iu - il + 1);
   const int nji  = (ju - jl + 1)*ni;
   const int nkji = (ku - kl + 1)*nji;
-  const int nmkji = nmb*nkji;
+  const int nmkji = nwork*nkji;
 
   int nfloord_=0, nfloore_=0, nceilv_=0, nfail_=0, maxit_=0;
   Kokkos::parallel_reduce("srhyd_c2p",Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
   KOKKOS_LAMBDA(const int &idx, int &sumd, int &sume, int &sumv, int &sumf, int &max_it) {
-    int m = (idx)/nkji;
-    int k = (idx - m*nkji)/nji;
-    int j = (idx - m*nkji - k*nji)/ni;
-    int i = (idx - m*nkji - k*nji - j*ni) + il;
+    const int a = (idx)/nkji;
+    const int m = lat_enabled ? active_indices(a) : a;
+    int k = (idx - a*nkji)/nji;
+    int j = (idx - a*nkji - k*nji)/ni;
+    int i = (idx - a*nkji - k*nji - j*ni) + il;
     j += jl;
     k += kl;
 
@@ -82,6 +92,7 @@ void IdealSRHydro::ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
     u.my = cons(m,IM2,k,j,i);
     u.mz = cons(m,IM3,k,j,i);
     u.e  = cons(m,IEN,k,j,i);
+    const Real scalar_cons_density = u.d;
 
     // Compute (S^i S_i) (eqn C2)
     Real s2 = SQR(u.mx) + SQR(u.my) + SQR(u.mz);
@@ -134,8 +145,15 @@ void IdealSRHydro::ConsToPrim(DvceArray5D<Real> &cons, DvceArray5D<Real> &prim,
         cons(m,IEN,k,j,i) = u.e;
       }
       // convert scalars (if any)
+      const bool preserve_scalars_across_kinematic_repair = vceiling_used &&
+          !dfloor_used && !efloor_used && !c2p_failure;
       for (int n=nhyd; n<(nhyd+nscal); ++n) {
-        prim(m,n,k,j,i) = cons(m,n,k,j,i)/u.d;
+        const Real scalar_den = preserve_scalars_across_kinematic_repair ?
+            scalar_cons_density : u.d;
+        prim(m,n,k,j,i) = cons(m,n,k,j,i)/scalar_den;
+        if (preserve_scalars_across_kinematic_repair) {
+          cons(m,n,k,j,i) = u.d*prim(m,n,k,j,i);
+        }
       }
     }
   }, Kokkos::Sum<int>(nfloord_), Kokkos::Sum<int>(nfloore_), Kokkos::Sum<int>(nceilv_),
@@ -169,9 +187,14 @@ void IdealSRHydro::PrimToCons(const DvceArray5D<Real> &prim, DvceArray5D<Real> &
   int &nscal = pmy_pack->phydro->nscalars;
   int &nmb = pmy_pack->nmb_thispack;
   Real &gamma = eos_data.gamma;
+  const bool lat_enabled = pmy_pack->lat_active_mask_enabled;
+  auto active_indices = pmy_pack->lat_active_indices.d_view;
+  const int nwork = lat_enabled ? pmy_pack->lat_nactive_thispack : nmb;
+  if (nwork <= 0) return;
 
-  par_for("srhyd_p2c", DevExeSpace(), 0, (nmb-1), kl, ku, jl, ju, il, iu,
-  KOKKOS_LAMBDA(int m, int k, int j, int i) {
+  par_for("srhyd_p2c", DevExeSpace(), 0, (nwork-1), kl, ku, jl, ju, il, iu,
+  KOKKOS_LAMBDA(int a, int k, int j, int i) {
+    const int m = lat_enabled ? active_indices(a) : a;
     // Load single state of primitive variables
     HydPrim1D w;
     w.d  = prim(m,IDN,k,j,i);

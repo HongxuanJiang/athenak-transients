@@ -15,16 +15,361 @@
 #include "athena.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
+#include "mesh/nghbr_index.hpp"
 #include "bvals.hpp"
+#include "bvals/narrow_blocks.hpp"
 #include "mesh/prolongation.hpp" // implements prolongation operators
 #include "mesh/restriction.hpp" // implements restriction operators
 
 #include "coordinates/cell_locations.hpp"
+namespace {
+
+KOKKOS_INLINE_FUNCTION
+void NeighborOffsetFromIndex(const int n, int &ox1, int &ox2, int &ox3) {
+  ox1 = 0;
+  ox2 = 0;
+  ox3 = 0;
+  for (int iz = -1; iz <= 1; ++iz) {
+    for (int iy = -1; iy <= 1; ++iy) {
+      for (int ix = -1; ix <= 1; ++ix) {
+        if ((ix == 0) && (iy == 0) && (iz == 0)) continue;
+        for (int n1 = 0; n1 <= 1; ++n1) {
+          for (int n2 = 0; n2 <= 1; ++n2) {
+            if (NeighborIndex(ix, iy, iz, n1, n2) == n) {
+              ox1 = ix;
+              ox2 = iy;
+              ox3 = iz;
+              return;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+KOKKOS_INLINE_FUNCTION
+int MaxNeighborLevelAtOffset(const int m, const int nnghbr, const int ox1,
+                             const int ox2, const int ox3,
+                             const DualArray2D<NeighborBlock> &nghbr) {
+  int max_lev = -1;
+  for (int n1 = 0; n1 <= 1; ++n1) {
+    for (int n2 = 0; n2 <= 1; ++n2) {
+      const int idx = NeighborIndex(ox1, ox2, ox3, n1, n2);
+      if ((idx >= 0) && (idx < nnghbr) && (nghbr.d_view(m, idx).gid >= 0)) {
+        max_lev =
+            (nghbr.d_view(m, idx).lev > max_lev) ? nghbr.d_view(m, idx).lev : max_lev;
+      }
+    }
+  }
+  return max_lev;
+}
+
+KOKKOS_INLINE_FUNCTION
+bool IsActiveFCFace(const int v, const int k, const int j, const int i,
+                    const RegionIndcs &indcs) {
+  if (v == 0) {
+    return (i >= indcs.is) && (i <= indcs.ie + 1) &&
+           (j >= indcs.js) && (j <= indcs.je) &&
+           (k >= indcs.ks) && (k <= indcs.ke);
+  } else if (v == 1) {
+    return (i >= indcs.is) && (i <= indcs.ie) &&
+           (j >= indcs.js) && (j <= indcs.je + 1) &&
+           (k >= indcs.ks) && (k <= indcs.ke);
+  } else {
+    return (i >= indcs.is) && (i <= indcs.ie) &&
+           (j >= indcs.js) && (j <= indcs.je) &&
+           (k >= indcs.ks) && (k <= indcs.ke + 1);
+  }
+}
+
+KOKKOS_INLINE_FUNCTION
+bool CanProlongateFCFace(const int m, const int nnghbr, const int v,
+                         const int k, const int j, const int i,
+                         const int ox1, const int ox2, const int ox3,
+                         const int my_lev, const RegionIndcs &indcs,
+                         const DualArray2D<NeighborBlock> &nghbr) {
+  if (!IsActiveFCFace(v, k, j, i, indcs)) {
+    return true;
+  }
+
+  // Coarse-neighbor prolongation may write active faces only at the physical
+  // fine/coarse interface normal to the face component. Active interior faces and active
+  // boundary faces owned by same-level or finer neighbors are left untouched.
+  if (v == 0) {
+    int normal_ox = 0;
+    if (i == indcs.is) {
+      normal_ox = -1;
+    } else if (i == indcs.ie + 1) {
+      normal_ox = 1;
+    } else {
+      return false;
+    }
+    return (ox1 == normal_ox) && (ox2 == 0) && (ox3 == 0) &&
+           (MaxNeighborLevelAtOffset(m, nnghbr, normal_ox, 0, 0, nghbr) < my_lev);
+  } else if (v == 1) {
+    int normal_ox = 0;
+    if (j == indcs.js) {
+      normal_ox = -1;
+    } else if (j == indcs.je + 1) {
+      normal_ox = 1;
+    } else {
+      return false;
+    }
+    return (ox1 == 0) && (ox2 == normal_ox) && (ox3 == 0) &&
+           (MaxNeighborLevelAtOffset(m, nnghbr, 0, normal_ox, 0, nghbr) < my_lev);
+  } else {
+    int normal_ox = 0;
+    if (k == indcs.ks) {
+      normal_ox = -1;
+    } else if (k == indcs.ke + 1) {
+      normal_ox = 1;
+    } else {
+      return false;
+    }
+    return (ox1 == 0) && (ox2 == 0) && (ox3 == normal_ox) &&
+           (MaxNeighborLevelAtOffset(m, nnghbr, 0, 0, normal_ox, nghbr) < my_lev);
+  }
+}
+
+KOKKOS_INLINE_FUNCTION
+void StoreProlongatedFCFace(const int m, const int nnghbr, const int v,
+                            const int k, const int j, const int i,
+                            const int ox1, const int ox2, const int ox3,
+                            const int my_lev, const RegionIndcs &indcs,
+                            const DualArray2D<NeighborBlock> &nghbr,
+                            const Real value, const DvceArray4D<Real> &bf) {
+  if (CanProlongateFCFace(m, nnghbr, v, k, j, i, ox1, ox2, ox3,
+                          my_lev, indcs, nghbr)) {
+    bf(m,k,j,i) = value;
+  }
+}
+
+KOKKOS_INLINE_FUNCTION
+void ProlongFCSharedX1FaceOwned(const int m, const int nnghbr,
+                                const int k, const int j, const int i,
+                                const int fk, const int fj, const int fi,
+                                const int ox1, const int ox2, const int ox3,
+                                const int my_lev, const bool multi_d,
+                                const bool three_d, const RegionIndcs &indcs,
+                                const DualArray2D<NeighborBlock> &nghbr,
+                                const DvceArray4D<Real> &cbx1f,
+                                const DvceArray4D<Real> &bx1f) {
+  Real dvar2 = 0.0;
+  if (multi_d) {
+    Real dl = cbx1f(m,k,j  ,i) - cbx1f(m,k,j-1,i);
+    Real dr = cbx1f(m,k,j+1,i) - cbx1f(m,k,j  ,i);
+    dvar2 = 0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr));
+  }
+
+  Real dvar3 = 0.0;
+  if (three_d) {
+    Real dl = cbx1f(m,k  ,j,i) - cbx1f(m,k-1,j,i);
+    Real dr = cbx1f(m,k+1,j,i) - cbx1f(m,k  ,j,i);
+    dvar3 = 0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr));
+  }
+
+  StoreProlongatedFCFace(m, nnghbr, 0, fk, fj, fi, ox1, ox2, ox3,
+                         my_lev, indcs, nghbr, cbx1f(m,k,j,i) - dvar2 - dvar3, bx1f);
+  if (multi_d) {
+    StoreProlongatedFCFace(m, nnghbr, 0, fk, fj+1, fi, ox1, ox2, ox3,
+                           my_lev, indcs, nghbr, cbx1f(m,k,j,i) + dvar2 - dvar3, bx1f);
+  }
+  if (three_d) {
+    StoreProlongatedFCFace(m, nnghbr, 0, fk+1, fj, fi, ox1, ox2, ox3,
+                           my_lev, indcs, nghbr, cbx1f(m,k,j,i) - dvar2 + dvar3, bx1f);
+    StoreProlongatedFCFace(m, nnghbr, 0, fk+1, fj+1, fi, ox1, ox2, ox3,
+                           my_lev, indcs, nghbr, cbx1f(m,k,j,i) + dvar2 + dvar3, bx1f);
+  }
+}
+
+KOKKOS_INLINE_FUNCTION
+void ProlongFCSharedX2FaceOwned(const int m, const int nnghbr,
+                                const int k, const int j, const int i,
+                                const int fk, const int fj, const int fi,
+                                const int ox1, const int ox2, const int ox3,
+                                const int my_lev, const bool three_d,
+                                const RegionIndcs &indcs,
+                                const DualArray2D<NeighborBlock> &nghbr,
+                                const DvceArray4D<Real> &cbx2f,
+                                const DvceArray4D<Real> &bx2f) {
+  Real dl = cbx2f(m,k,j,i  ) - cbx2f(m,k,j,i-1);
+  Real dr = cbx2f(m,k,j,i+1) - cbx2f(m,k,j,i  );
+  Real dvar1 = 0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr));
+
+  Real dvar3 = 0.0;
+  if (three_d) {
+    dl = cbx2f(m,k  ,j,i) - cbx2f(m,k-1,j,i);
+    dr = cbx2f(m,k+1,j,i) - cbx2f(m,k  ,j,i);
+    dvar3 = 0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr));
+  }
+
+  StoreProlongatedFCFace(m, nnghbr, 1, fk, fj, fi, ox1, ox2, ox3,
+                         my_lev, indcs, nghbr, cbx2f(m,k,j,i) - dvar1 - dvar3, bx2f);
+  StoreProlongatedFCFace(m, nnghbr, 1, fk, fj, fi+1, ox1, ox2, ox3,
+                         my_lev, indcs, nghbr, cbx2f(m,k,j,i) + dvar1 - dvar3, bx2f);
+  if (three_d) {
+    StoreProlongatedFCFace(m, nnghbr, 1, fk+1, fj, fi, ox1, ox2, ox3,
+                           my_lev, indcs, nghbr, cbx2f(m,k,j,i) - dvar1 + dvar3, bx2f);
+    StoreProlongatedFCFace(m, nnghbr, 1, fk+1, fj, fi+1, ox1, ox2, ox3,
+                           my_lev, indcs, nghbr, cbx2f(m,k,j,i) + dvar1 + dvar3, bx2f);
+  }
+}
+
+KOKKOS_INLINE_FUNCTION
+void ProlongFCSharedX3FaceOwned(const int m, const int nnghbr,
+                                const int k, const int j, const int i,
+                                const int fk, const int fj, const int fi,
+                                const int ox1, const int ox2, const int ox3,
+                                const int my_lev, const bool multi_d,
+                                const RegionIndcs &indcs,
+                                const DualArray2D<NeighborBlock> &nghbr,
+                                const DvceArray4D<Real> &cbx3f,
+                                const DvceArray4D<Real> &bx3f) {
+  Real dl = cbx3f(m,k,j,i  ) - cbx3f(m,k,j,i-1);
+  Real dr = cbx3f(m,k,j,i+1) - cbx3f(m,k,j,i  );
+  Real dvar1 = 0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr));
+
+  Real dvar2 = 0.0;
+  if (multi_d) {
+    dl = cbx3f(m,k,j  ,i) - cbx3f(m,k,j-1,i);
+    dr = cbx3f(m,k,j+1,i) - cbx3f(m,k,j  ,i);
+    dvar2 = 0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr));
+  }
+
+  StoreProlongatedFCFace(m, nnghbr, 2, fk, fj, fi, ox1, ox2, ox3,
+                         my_lev, indcs, nghbr, cbx3f(m,k,j,i) - dvar1 - dvar2, bx3f);
+  StoreProlongatedFCFace(m, nnghbr, 2, fk, fj, fi+1, ox1, ox2, ox3,
+                         my_lev, indcs, nghbr, cbx3f(m,k,j,i) + dvar1 - dvar2, bx3f);
+  if (multi_d) {
+    StoreProlongatedFCFace(m, nnghbr, 2, fk, fj+1, fi, ox1, ox2, ox3,
+                           my_lev, indcs, nghbr, cbx3f(m,k,j,i) - dvar1 + dvar2, bx3f);
+    StoreProlongatedFCFace(m, nnghbr, 2, fk, fj+1, fi+1, ox1, ox2, ox3,
+                           my_lev, indcs, nghbr, cbx3f(m,k,j,i) + dvar1 + dvar2, bx3f);
+  }
+}
+
+KOKKOS_INLINE_FUNCTION
+void ProlongFCInternalOwned(const int m, const int nnghbr, const int fk, const int fj,
+                            const int fi, const int ox1, const int ox2, const int ox3,
+                            const int my_lev, const bool three_d,
+                            const RegionIndcs &indcs,
+                            const DualArray2D<NeighborBlock> &nghbr,
+                            const DvceFaceFld4D<Real> &b) {
+  if (three_d) {
+    Real Uxx  = 0.0, Vyy  = 0.0, Wzz  = 0.0;
+    Real Uxyz = 0.0, Vxyz = 0.0, Wxyz = 0.0;
+    for (int jj=0; jj<2; jj++) {
+      int jsgn = 2*jj - 1;
+      int fjj  = fj + jj, fjp = fj + 2*jj;
+      for (int ii=0; ii<2; ii++) {
+        int isgn = 2*ii - 1;
+        int fii = fi + ii, fip = fi + 2*ii;
+        Uxx += isgn*(jsgn*(b.x2f(m,fk  ,fjp,fii) + b.x2f(m,fk+1,fjp,fii)) +
+                          (b.x3f(m,fk+2,fjj,fii) - b.x3f(m,fk  ,fjj,fii)));
+
+        Vyy += jsgn*(     (b.x3f(m,fk+2,fjj,fii) - b.x3f(m,fk  ,fjj,fii)) +
+                     isgn*(b.x1f(m,fk  ,fjj,fip) + b.x1f(m,fk+1,fjj,fip)));
+
+        Wzz +=       isgn*(b.x1f(m,fk+1,fjj,fip) - b.x1f(m,fk  ,fjj,fip)) +
+                     jsgn*(b.x2f(m,fk+1,fjp,fii) - b.x2f(m,fk  ,fjp,fii));
+
+        Uxyz += isgn*jsgn*(b.x1f(m,fk+1,fjj,fip) - b.x1f(m,fk  ,fjj,fip));
+        Vxyz += isgn*jsgn*(b.x2f(m,fk+1,fjp,fii) - b.x2f(m,fk  ,fjp,fii));
+        Wxyz += isgn*jsgn*(b.x3f(m,fk+2,fjj,fii) - b.x3f(m,fk  ,fjj,fii));
+      }
+    }
+    Uxx *= 0.125;  Vyy *= 0.125;  Wzz *= 0.125;
+    Uxyz *= 0.0625; Vxyz *= 0.0625; Wxyz *= 0.0625;
+
+    StoreProlongatedFCFace(m, nnghbr, 0, fk, fj, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x1f(m,fk,fj,fi) + b.x1f(m,fk,fj,fi+2))
+                           + Uxx - Vxyz - Wxyz, b.x1f);
+    StoreProlongatedFCFace(m, nnghbr, 0, fk, fj+1, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x1f(m,fk,fj+1,fi) + b.x1f(m,fk,fj+1,fi+2))
+                           + Uxx - Vxyz + Wxyz, b.x1f);
+    StoreProlongatedFCFace(m, nnghbr, 0, fk+1, fj, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x1f(m,fk+1,fj,fi) + b.x1f(m,fk+1,fj,fi+2))
+                           + Uxx + Vxyz - Wxyz, b.x1f);
+    StoreProlongatedFCFace(m, nnghbr, 0, fk+1, fj+1, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x1f(m,fk+1,fj+1,fi) + b.x1f(m,fk+1,fj+1,fi+2))
+                           + Uxx + Vxyz + Wxyz, b.x1f);
+
+    StoreProlongatedFCFace(m, nnghbr, 1, fk, fj+1, fi, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x2f(m,fk,fj,fi) + b.x2f(m,fk,fj+2,fi))
+                           + Vyy - Uxyz - Wxyz, b.x2f);
+    StoreProlongatedFCFace(m, nnghbr, 1, fk, fj+1, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x2f(m,fk,fj,fi+1) + b.x2f(m,fk,fj+2,fi+1))
+                           + Vyy - Uxyz + Wxyz, b.x2f);
+    StoreProlongatedFCFace(m, nnghbr, 1, fk+1, fj+1, fi, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x2f(m,fk+1,fj,fi) + b.x2f(m,fk+1,fj+2,fi))
+                           + Vyy + Uxyz - Wxyz, b.x2f);
+    StoreProlongatedFCFace(m, nnghbr, 1, fk+1, fj+1, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x2f(m,fk+1,fj,fi+1) + b.x2f(m,fk+1,fj+2,fi+1))
+                           + Vyy + Uxyz + Wxyz, b.x2f);
+
+    StoreProlongatedFCFace(m, nnghbr, 2, fk+1, fj, fi, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x3f(m,fk+2,fj,fi) + b.x3f(m,fk,fj,fi))
+                           + Wzz - Uxyz - Vxyz, b.x3f);
+    StoreProlongatedFCFace(m, nnghbr, 2, fk+1, fj, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x3f(m,fk+2,fj,fi+1) + b.x3f(m,fk,fj,fi+1))
+                           + Wzz - Uxyz + Vxyz, b.x3f);
+    StoreProlongatedFCFace(m, nnghbr, 2, fk+1, fj+1, fi, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x3f(m,fk+2,fj+1,fi) + b.x3f(m,fk,fj+1,fi))
+                           + Wzz + Uxyz - Vxyz, b.x3f);
+    StoreProlongatedFCFace(m, nnghbr, 2, fk+1, fj+1, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x3f(m,fk+2,fj+1,fi+1) + b.x3f(m,fk,fj+1,fi+1))
+                           + Wzz + Uxyz + Vxyz, b.x3f);
+  } else {
+    Real tmp1 = 0.25*(b.x2f(m,fk,fj+2,fi+1) - b.x2f(m,fk,fj,  fi+1)
+                    - b.x2f(m,fk,fj+2,fi  ) + b.x2f(m,fk,fj,  fi  ));
+    Real tmp2 = 0.25*(b.x1f(m,fk,fj,  fi  ) - b.x1f(m,fk,fj,  fi+2)
+                    - b.x1f(m,fk,fj+1,fi  ) + b.x1f(m,fk,fj+1,fi+2));
+    StoreProlongatedFCFace(m, nnghbr, 0, fk, fj, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x1f(m,fk,fj,fi) + b.x1f(m,fk,fj,fi+2)) + tmp1,
+                           b.x1f);
+    StoreProlongatedFCFace(m, nnghbr, 0, fk, fj+1, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x1f(m,fk,fj+1,fi) + b.x1f(m,fk,fj+1,fi+2)) + tmp1,
+                           b.x1f);
+    StoreProlongatedFCFace(m, nnghbr, 1, fk, fj+1, fi, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x2f(m,fk,fj,fi) + b.x2f(m,fk,fj+2,fi)) + tmp2,
+                           b.x2f);
+    StoreProlongatedFCFace(m, nnghbr, 1, fk, fj+1, fi+1, ox1, ox2, ox3, my_lev,
+                           indcs, nghbr,
+                           0.5*(b.x2f(m,fk,fj,fi+1) + b.x2f(m,fk,fj+2,fi+1)) + tmp2,
+                           b.x2f);
+  }
+}
+
+} // namespace
+
 //----------------------------------------------------------------------------------------
 //! \fn void FillCoarseInBndryCC()
 //! \brief To ensure that the coarse array is up-to-date in all neighboring cells touched
 //! by the prolongation interpolation stencil, data is restricted to coarse array in
 //! boundaries between MeshBlocks at the same level.
+//!
+//! On a mesh of MeshBlocks narrower than 2*nghost the coarse ghost cells are also sent
+//! on (NarrowMeshBlocks), so there every coarse ghost cell whose fine cells hold this
+//! block's level is restricted: in 1D as well, and across faces, edges and corners
+//! shared with a finer neighbour, whose restricted cells fill the fine ghost zone there.
+//! Without it the coarser neighbour's outer ghost cells would receive coarse ghost cells
+//! nothing writes.
 
 void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
                                                DvceArray5D<Real> &ca,
@@ -35,10 +380,14 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
   //bool not_z4c = (pmbp->pz4c == nullptr)? true : false;
 
   int nvar = a.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
-  int nmnv = nmb*nnghbr*nvar;
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &mblev = pmy_pack->pmb->mb_lev;
-  auto &rbuf = recvbuf;
+  const bool lat_enabled = pmy_pack->lat_active_mask_enabled;
+  auto lat_active_indices = pmy_pack->lat_active_indices.d_view;
+  const int nwork = lat_enabled ? pmy_pack->lat_nactive_thispack : nmb;
+  if (nwork <= 0) return;
+  int nmnv = nwork*nnghbr*nvar;
+  auto rbuf = recvbuf_device;
   auto &indcs  = pmy_pack->pmesh->mb_indcs;
   const bool multi_d = pmy_pack->pmesh->multi_d;
   const bool three_d = pmy_pack->pmesh->three_d;
@@ -52,29 +401,42 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
   // Restrict data into coarse array in any boundary filled with data from the same
   // level.  This ensures data in the coarse array at corners where one direction is a
   // coarser level and the other the same level is filled properly.
-  // (Only needed in multidimensions)
+  // (Only needed in multidimensions, except on a mesh of narrow MeshBlocks, which also
+  // restricts what finer neighbours sent.  Not for z4c: its own coarse exchange fills its
+  // same-level coarse ghosts, and its restriction stencil does not fit a ghost zone.)
+  const bool narrow = NarrowMeshBlocks(pmy_pack->pmesh) && !is_z4c;
 
-  if (multi_d) {
+  if (multi_d || narrow) {
     auto &cis = indcs.cis;
     auto &cjs = indcs.cjs;
     auto &cks = indcs.cks;
     // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
     Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
-    Kokkos::parallel_for("ProlCCSame", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-      const int m = (tmember.league_rank())/(nnghbr*nvar);
-      const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
-      const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+    Kokkos::parallel_for("ProlCCSame", athenak_lw(policy),
+        KOKKOS_LAMBDA(TeamMember_t tmember) {
+      const int im = (tmember.league_rank())/(nnghbr*nvar);
+      const int m = lat_enabled ? lat_active_indices(im) : im;
+      const int n = (tmember.league_rank() - im*(nnghbr*nvar))/nvar;
+      const int v = (tmember.league_rank() - im*(nnghbr*nvar) - n*nvar);
 
-      // only restrict when neighbor exists and is at SAME level
-      if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev == mblev.d_view(m))) {
-        // loop over indices for receives at same level, but convert loop limits to
-        // coarse array
-        int il = (rbuf[n].isame[0].bis + cis)/2;
-        int iu = (rbuf[n].isame[0].bie + cis)/2;
-        int jl = (rbuf[n].isame[0].bjs + cjs)/2;
-        int ju = (rbuf[n].isame[0].bje + cjs)/2;
-        int kl = (rbuf[n].isame[0].bks + cks)/2;
-        int ku = (rbuf[n].isame[0].bke + cks)/2;
+      // only restrict when neighbor exists and is at SAME level (or, on a narrow mesh,
+      // FINER; in 1D only on a narrow mesh)
+      const bool exists = (nghbr.d_view(m,n).gid >= 0);
+      const bool same = exists && (nghbr.d_view(m,n).lev == mblev.d_view(m));
+      const bool finer = narrow && exists && (nghbr.d_view(m,n).lev > mblev.d_view(m));
+      if (same || finer) {
+        // loop over indices for receives from this neighbor, but convert loop limits to
+        // coarse array.  The sub-face of a finer neighbor may end half way through a
+        // coarse cell (odd coarse width); that cell is restricted once, by the range
+        // holding its first fine cell.
+        const auto &ib = same ? rbuf(n).isame[0] : rbuf(n).ifine[0];
+        const int r = same ? 0 : 1;
+        int il = (ib.bis + cis + r)/2;
+        int iu = (ib.bie + cis)/2;
+        int jl = (ib.bjs + cjs + r)/2;
+        int ju = (ib.bje + cjs)/2;
+        int kl = (ib.bks + cks + r)/2;
+        int ku = (ib.bke + cks)/2;
 
         const int ni = iu - il + 1;
         const int nj = ju - jl + 1;
@@ -95,8 +457,11 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
           int finej = (j - indcs.cjs)*2 + indcs.js;
           int finek = (k - indcs.cks)*2 + indcs.ks;
 
+          // restrict in 1D (narrow mesh only)
+          if (!(multi_d)) {
+            ca(m,v,k,j,i) = 0.5*(a(m,v,k,j,finei) + a(m,v,k,j,finei+1));
           // restrict in 2D
-          if (!(three_d)) {
+          } else if (!(three_d)) {
             ca(m,v,kl,j,i) = 0.25*(a(m,v,kl,finej  ,finei) + a(m,v,kl,finej  ,finei+1)
                                  + a(m,v,kl,finej+1,finei) + a(m,v,kl,finej+1,finei+1));
           // restrict in 3D
@@ -127,6 +492,70 @@ void MeshBoundaryValuesCC::FillCoarseInBndryCC(DvceArray5D<Real> &a,
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn void FillCoarseUserBndryCC()
+//! \brief Defines the coarse-array ghost cells across every face that carries the user
+//! boundary flag by restricting the fine ghost cells the user boundary function wrote.
+//! The built-in physical boundaries are re-applied to the coarse array by the *BCsCoarse
+//! helpers, but a user function writes the fine array only, while the prolongation
+//! stencil of a MeshBlock touching a user face reads the coarse ghost cell across that
+//! face (ProlongCC uses ca(i-1) at i = cis).  Without this the stencil reads whatever the
+//! storage slot last held, which depends on the rank layout.
+
+void MeshBoundaryValuesCC::FillCoarseUserBndryCC(DvceArray5D<Real> &a,
+                                                 DvceArray5D<Real> &ca) {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int cn = indcs.ng/2;     // the fine ghost zone covers ng/2 coarse cells
+  const int cis = indcs.cis, cie = indcs.cie;
+  const int cjs = indcs.cjs, cje = indcs.cje;
+  const int cks = indcs.cks, cke = indcs.cke;
+  const bool multi_d = pmy_pack->pmesh->multi_d;
+  const bool three_d = pmy_pack->pmesh->three_d;
+  const int nvar = a.extent_int(1);
+  auto &mb_bcs = pmy_pack->pmb->mb_bcs;
+  const bool lat_enabled = pmy_pack->lat_active_mask_enabled;
+  auto lat_active_indices = pmy_pack->lat_active_indices.d_view;
+  const int nwork = lat_enabled ? pmy_pack->lat_nactive_thispack : pmy_pack->nmb_thispack;
+  if (nwork <= 0) return;
+
+  // tangential extent of the restricted region (the fine ghosts span cn coarse cells)
+  const int ti1 = cis - cn, ti2 = cie + cn;
+  const int tj1 = multi_d ? cjs - cn : cjs, tj2 = multi_d ? cje + cn : cje;
+  const int tk1 = three_d ? cks - cn : cks, tk2 = three_d ? cke + cn : cke;
+  const int nfaces = three_d ? 6 : (multi_d ? 4 : 2);
+  for (int f = 0; f < nfaces; ++f) {
+    if (pmy_pack->pmesh->mesh_bcs[f] != BoundaryFlag::user) continue;
+    // box of coarse ghost cells across face f
+    const int il = (f == BoundaryFace::outer_x1) ? cie + 1 : ti1;
+    const int iu = (f == BoundaryFace::inner_x1) ? cis - 1 : ti2;
+    const int jl = (f == BoundaryFace::outer_x2) ? cje + 1 : tj1;
+    const int ju = (f == BoundaryFace::inner_x2) ? cjs - 1 : tj2;
+    const int kl = (f == BoundaryFace::outer_x3) ? cke + 1 : tk1;
+    const int ku = (f == BoundaryFace::inner_x3) ? cks - 1 : tk2;
+    par_for("fill_coarse_user_cc", DevExeSpace(), 0, nwork-1, 0, nvar-1, kl, ku, jl, ju,
+            il, iu, KOKKOS_LAMBDA(const int n, const int v, const int k, const int j,
+                                  const int i) {
+      const int m = lat_enabled ? lat_active_indices(n) : n;
+      if (mb_bcs.d_view(m,f) != BoundaryFlag::user) return;
+      const int fi = 2*i - cis;  // correct when cis=is
+      const int fj = 2*j - cjs;  // correct when cjs=js
+      const int fk = 2*k - cks;  // correct when cks=ks
+      if (three_d) {
+        ca(m,v,k,j,i) = 0.125*(a(m,v,fk  ,fj  ,fi) + a(m,v,fk  ,fj  ,fi+1)
+                             + a(m,v,fk  ,fj+1,fi) + a(m,v,fk  ,fj+1,fi+1)
+                             + a(m,v,fk+1,fj  ,fi) + a(m,v,fk+1,fj  ,fi+1)
+                             + a(m,v,fk+1,fj+1,fi) + a(m,v,fk+1,fj+1,fi+1));
+      } else if (multi_d) {
+        ca(m,v,k,j,i) = 0.25*(a(m,v,k,fj  ,fi) + a(m,v,k,fj  ,fi+1)
+                            + a(m,v,k,fj+1,fi) + a(m,v,k,fj+1,fi+1));
+      } else {
+        ca(m,v,k,j,i) = 0.5*(a(m,v,k,j,fi) + a(m,v,k,j,fi+1));
+      }
+    });
+  }
+  return;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn void ProlongateCC()
 //! \brief Prolongate data at boundaries for cell-centered data.
 //! Code here is based on MeshRefinement::ProlongateCellCenteredValues() in C++ version
@@ -141,10 +570,14 @@ void MeshBoundaryValuesCC::ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> 
   //bool not_z4c = (pmbp->pz4c == nullptr)? true : false;
 
   int nvar = a.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
-  int nmnv = nmb*nnghbr*nvar;
   auto &nghbr = pmy_pack->pmb->nghbr;
   auto &mblev = pmy_pack->pmb->mb_lev;
-  auto &rbuf = recvbuf;
+  const bool lat_enabled = pmy_pack->lat_active_mask_enabled;
+  auto lat_active_indices = pmy_pack->lat_active_indices.d_view;
+  const int nwork = lat_enabled ? pmy_pack->lat_nactive_thispack : nmb;
+  if (nwork <= 0) return;
+  int nmnv = nwork*nnghbr*nvar;
+  auto rbuf = recvbuf_device;
   auto &indcs  = pmy_pack->pmesh->mb_indcs;
   const bool multi_d = pmy_pack->pmesh->multi_d;
   const bool three_d = pmy_pack->pmesh->three_d;
@@ -156,20 +589,21 @@ void MeshBoundaryValuesCC::ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> 
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
-  Kokkos::parallel_for("ProlCC", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(nnghbr*nvar);
-    const int n = (tmember.league_rank() - m*(nnghbr*nvar))/nvar;
-    const int v = (tmember.league_rank() - m*(nnghbr*nvar) - n*nvar);
+  Kokkos::parallel_for("ProlCC", athenak_lw(policy), KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int im = (tmember.league_rank())/(nnghbr*nvar);
+    const int m = lat_enabled ? lat_active_indices(im) : im;
+    const int n = (tmember.league_rank() - im*(nnghbr*nvar))/nvar;
+    const int v = (tmember.league_rank() - im*(nnghbr*nvar) - n*nvar);
 
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
       // loop over indices for prolongation on this buffer
-      int il = rbuf[n].iprol[0].bis;
-      int iu = rbuf[n].iprol[0].bie;
-      int jl = rbuf[n].iprol[0].bjs;
-      int ju = rbuf[n].iprol[0].bje;
-      int kl = rbuf[n].iprol[0].bks;
-      int ku = rbuf[n].iprol[0].bke;
+      int il = rbuf(n).iprol[0].bis;
+      int iu = rbuf(n).iprol[0].bie;
+      int jl = rbuf(n).iprol[0].bjs;
+      int ju = rbuf(n).iprol[0].bje;
+      int kl = rbuf(n).iprol[0].bks;
+      int ku = rbuf(n).iprol[0].bke;
       const int ni = iu - il + 1;
       const int nj = ju - jl + 1;
       const int nk = ku - kl + 1;
@@ -214,7 +648,8 @@ void MeshBoundaryValuesCC::ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> 
 //! \brief As in the case of cell-centered variables, to ensure that the coarse field is
 //! up-to-date in all neighboring cells touched by the prolongation interpolation stencil,
 //! data is also restricted to coarse array in boundaries between MeshBlocks at the same
-//! level.
+//! level.  On a mesh of narrow MeshBlocks, also in 1D and from finer neighbors, as for
+//! cell-centered variables.
 
 void MeshBoundaryValuesFC::FillCoarseInBndryFC(DvceFaceFld4D<Real> &b,
                                            DvceFaceFld4D<Real> &cb) {
@@ -227,33 +662,46 @@ void MeshBoundaryValuesFC::FillCoarseInBndryFC(DvceFaceFld4D<Real> &b,
   auto &mblev = pmy_pack->pmb->mb_lev;
   bool &multi_d = pmy_pack->pmesh->multi_d;
   bool &three_d = pmy_pack->pmesh->three_d;
+  const int nwork = nmb;
+  if (nwork <= 0) return;
 
   // Restrict data into coarse array in any boundary filled with data from the same
-  // level. (Only needed in multidimensions)
+  // level. (Only needed in multidimensions, except on a mesh of narrow MeshBlocks, which
+  // also restricts what finer neighbours sent.)
+  const bool narrow = NarrowMeshBlocks(pmy_pack->pmesh);
 
-  if (multi_d) {
-    int nmnv = 3*nmb*nnghbr;
-    auto &rbuf = recvbuf;
+  if (multi_d || narrow) {
+    int nmnv = 3*nwork*nnghbr;
+    auto rbuf = recvbuf_device;
     auto &cis = indcs.cis;
     auto &cjs = indcs.cjs;
     auto &cks = indcs.cks;
     // Outer loop over (# of MeshBlocks)*(# of buffers)*(# of variables)
     Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
-    Kokkos::parallel_for("ProlFCSame", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-      const int m = (tmember.league_rank())/(3*nnghbr);
-      const int n = (tmember.league_rank() - m*(3*nnghbr))/3;
-      const int v = (tmember.league_rank() - m*(3*nnghbr) - 3*n);
+    Kokkos::parallel_for("ProlFCSame", athenak_lw(policy),
+        KOKKOS_LAMBDA(TeamMember_t tmember) {
+      const int im = (tmember.league_rank())/(3*nnghbr);
+      const int m = im;
+      const int n = (tmember.league_rank() - im*(3*nnghbr))/3;
+      const int v = (tmember.league_rank() - im*(3*nnghbr) - 3*n);
 
-      // only restrict when neighbor exists and is at SAME level
-      if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev == mblev.d_view(m))) {
-        // loop over indices for receives at same level, but convert loop limits to
-        // coarse array
-        int il = (rbuf[n].isame[v].bis + cis)/2;
-        int iu = (rbuf[n].isame[v].bie + cis)/2;
-        int jl = (rbuf[n].isame[v].bjs + cjs)/2;
-        int ju = (rbuf[n].isame[v].bje + cjs)/2;
-        int kl = (rbuf[n].isame[v].bks + cks)/2;
-        int ku = (rbuf[n].isame[v].bke + cks)/2;
+      // only restrict when neighbor exists and is at SAME level (or, on a narrow mesh,
+      // FINER; in 1D only on a narrow mesh)
+      const bool exists = (nghbr.d_view(m,n).gid >= 0);
+      const bool same = exists && (nghbr.d_view(m,n).lev == mblev.d_view(m));
+      const bool finer = narrow && exists && (nghbr.d_view(m,n).lev > mblev.d_view(m));
+      if (same || finer) {
+        // loop over indices for receives from this neighbor, but convert loop limits to
+        // coarse array (a coarse cell a finer neighbor's range splits is restricted by
+        // the range holding its first fine cell)
+        const auto &ib = same ? rbuf(n).isame[v] : rbuf(n).ifine[v];
+        const int r = same ? 0 : 1;
+        int il = (ib.bis + cis + r)/2;
+        int iu = (ib.bie + cis)/2;
+        int jl = (ib.bjs + cjs + r)/2;
+        int ju = (ib.bje + cjs)/2;
+        int kl = (ib.bks + cks + r)/2;
+        int ku = (ib.bke + cks)/2;
 
         const int ni = iu - il + 1;
         const int nj = ju - jl + 1;
@@ -274,8 +722,22 @@ void MeshBoundaryValuesFC::FillCoarseInBndryFC(DvceFaceFld4D<Real> &b,
           int fj = (j - indcs.cjs)*2 + indcs.js;
           int fi = (i - indcs.cis)*2 + indcs.is;
 
+          // restrict in 1D (narrow mesh only)
+          if (!(multi_d)) {
+            if (v==0) {
+              cb.x1f(m,k,j,i) = b.x1f(m,k,j,fi);
+            } else if (v==1) {
+              Real b2c = 0.5*(b.x2f(m,k,j,fi) + b.x2f(m,k,j,fi+1));
+              cb.x2f(m,k,j  ,i) = b2c;
+              cb.x2f(m,k,j+1,i) = b2c;
+            } else {
+              Real b3c = 0.5*(b.x3f(m,k,j,fi) + b.x3f(m,k,j,fi+1));
+              cb.x3f(m,k  ,j,i) = b3c;
+              cb.x3f(m,k+1,j,i) = b3c;
+            }
+
           // restrict in 2D
-          if (!(three_d)) {
+          } else if (!(three_d)) {
             if (v==0) {
               cb.x1f(m,kl,j,i) = 0.5*(b.x1f(m,kl,fj,fi) + b.x1f(m,kl,fj+1,fi));
             } else if (v==1) {
@@ -309,6 +771,102 @@ void MeshBoundaryValuesFC::FillCoarseInBndryFC(DvceFaceFld4D<Real> &b,
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn void FillCoarseUserBndryFC()
+//! \brief Same as FillCoarseUserBndryCC, for face-centered variables: the coarse faces
+//! of every coarse ghost cell across a user face are restricted from the fine faces the
+//! user boundary function wrote (the operator of MeshRefinement::RestrictFC).
+
+void MeshBoundaryValuesFC::FillCoarseUserBndryFC(DvceFaceFld4D<Real> &b,
+                                                 DvceFaceFld4D<Real> &cb) {
+  auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int cn = indcs.ng/2;     // the fine ghost zone covers ng/2 coarse cells
+  const int cis = indcs.cis, cie = indcs.cie;
+  const int cjs = indcs.cjs, cje = indcs.cje;
+  const int cks = indcs.cks, cke = indcs.cke;
+  const bool multi_d = pmy_pack->pmesh->multi_d;
+  const bool three_d = pmy_pack->pmesh->three_d;
+  auto &mb_bcs = pmy_pack->pmb->mb_bcs;
+  const int nwork = pmy_pack->nmb_thispack;
+  if (nwork <= 0) return;
+
+  // tangential extent of the restricted region (the fine ghosts span cn coarse cells)
+  const int ti1 = cis - cn, ti2 = cie + cn;
+  const int tj1 = multi_d ? cjs - cn : cjs, tj2 = multi_d ? cje + cn : cje;
+  const int tk1 = three_d ? cks - cn : cks, tk2 = three_d ? cke + cn : cke;
+  const int nfaces = three_d ? 6 : (multi_d ? 4 : 2);
+  for (int f = 0; f < nfaces; ++f) {
+    if (pmy_pack->pmesh->mesh_bcs[f] != BoundaryFlag::user) continue;
+    // box of coarse ghost cells across face f; the face at the upper end of the box in
+    // each direction is written by the last cell of the box, as in RestrictFC
+    const int il = (f == BoundaryFace::outer_x1) ? cie + 1 : ti1;
+    const int iu = (f == BoundaryFace::inner_x1) ? cis - 1 : ti2;
+    const int jl = (f == BoundaryFace::outer_x2) ? cje + 1 : tj1;
+    const int ju = (f == BoundaryFace::inner_x2) ? cjs - 1 : tj2;
+    const int kl = (f == BoundaryFace::outer_x3) ? cke + 1 : tk1;
+    const int ku = (f == BoundaryFace::inner_x3) ? cks - 1 : tk2;
+    par_for("fill_coarse_user_fc", DevExeSpace(), 0, nwork-1, kl, ku, jl, ju, il, iu,
+    KOKKOS_LAMBDA(const int n, const int k, const int j, const int i) {
+      const int m = n;
+      if (mb_bcs.d_view(m,f) != BoundaryFlag::user) return;
+      const int fi = 2*i - cis;  // correct when cis=is
+      const int fj = 2*j - cjs;  // correct when cjs=js
+      const int fk = 2*k - cks;  // correct when cks=ks
+      if (three_d) {
+        cb.x1f(m,k,j,i) =
+          0.25*(b.x1f(m,fk  ,fj,fi) + b.x1f(m,fk  ,fj+1,fi)
+              + b.x1f(m,fk+1,fj,fi) + b.x1f(m,fk+1,fj+1,fi));
+        if (i==iu) {
+          cb.x1f(m,k,j,i+1) =
+            0.25*(b.x1f(m,fk  ,fj,fi+2) + b.x1f(m,fk  ,fj+1,fi+2)
+                + b.x1f(m,fk+1,fj,fi+2) + b.x1f(m,fk+1,fj+1,fi+2));
+        }
+        cb.x2f(m,k,j,i) =
+          0.25*(b.x2f(m,fk  ,fj,fi) + b.x2f(m,fk  ,fj,fi+1)
+              + b.x2f(m,fk+1,fj,fi) + b.x2f(m,fk+1,fj,fi+1));
+        if (j==ju) {
+          cb.x2f(m,k,j+1,i) =
+            0.25*(b.x2f(m,fk  ,fj+2,fi) + b.x2f(m,fk  ,fj+2,fi+1)
+                + b.x2f(m,fk+1,fj+2,fi) + b.x2f(m,fk+1,fj+2,fi+1));
+        }
+        cb.x3f(m,k,j,i) =
+          0.25*(b.x3f(m,fk,fj  ,fi) + b.x3f(m,fk,fj  ,fi+1)
+              + b.x3f(m,fk,fj+1,fi) + b.x3f(m,fk,fj+1,fi+1));
+        if (k==ku) {
+          cb.x3f(m,k+1,j,i) =
+            0.25*(b.x3f(m,fk+2,fj  ,fi) + b.x3f(m,fk+2,fj  ,fi+1)
+                + b.x3f(m,fk+2,fj+1,fi) + b.x3f(m,fk+2,fj+1,fi+1));
+        }
+      } else if (multi_d) {
+        cb.x1f(m,k,j,i) = 0.5*(b.x1f(m,k,fj,fi) + b.x1f(m,k,fj+1,fi));
+        if (i==iu) {
+          cb.x1f(m,k,j,i+1) = 0.5*(b.x1f(m,k,fj,fi+2) + b.x1f(m,k,fj+1,fi+2));
+        }
+        cb.x2f(m,k,j,i) = 0.5*(b.x2f(m,k,fj,fi) + b.x2f(m,k,fj,fi+1));
+        if (j==ju) {
+          cb.x2f(m,k,j+1,i) = 0.5*(b.x2f(m,k,fj+2,fi) + b.x2f(m,k,fj+2,fi+1));
+        }
+        Real b3coarse = 0.25*(b.x3f(m,k,fj  ,fi) + b.x3f(m,k,fj  ,fi+1)
+                            + b.x3f(m,k,fj+1,fi) + b.x3f(m,k,fj+1,fi+1));
+        cb.x3f(m,k  ,j,i) = b3coarse;
+        cb.x3f(m,k+1,j,i) = b3coarse;
+      } else {
+        cb.x1f(m,k,j,i) = b.x1f(m,k,j,fi);
+        if (i==iu) {
+          cb.x1f(m,k,j,i+1) = b.x1f(m,k,j,fi+2);
+        }
+        Real b2coarse = 0.5*(b.x2f(m,k,j,fi) + b.x2f(m,k,j,fi+1));
+        cb.x2f(m,k,j  ,i) = b2coarse;
+        cb.x2f(m,k,j+1,i) = b2coarse;
+        Real b3coarse = 0.5*(b.x3f(m,k,j,fi) + b.x3f(m,k,j,fi+1));
+        cb.x3f(m,k  ,j,i) = b3coarse;
+        cb.x3f(m,k+1,j,i) = b3coarse;
+      }
+    });
+  }
+  return;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn void ProlongateFC()
 //! \brief Prolongate data at boundaries for face-centered data (e.g. magnetic fields).
 
@@ -322,28 +880,35 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
   auto &mblev = pmy_pack->pmb->mb_lev;
   bool &multi_d = pmy_pack->pmesh->multi_d;
   bool &three_d = pmy_pack->pmesh->three_d;
+  const int nwork = nmb;
+  if (nwork <= 0) return;
 
   // Prolongate b.x1f/b.x2f/b.x3f at all shared coarse/fine cell edges
   // Code here is based on MeshRefinement::ProlongateSharedFieldX1/2/3() and
   // MeshRefinement::ProlongateInternalField() in C++ version
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)*(three field components)
-  {int nmnv = 3*nmb*nnghbr;
-  auto &rbuf = recvbuf;
+  {int nmnv = 3*nwork*nnghbr;
+  auto rbuf = recvbuf_device;
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmnv, Kokkos::AUTO);
-  Kokkos::parallel_for("ProFC-2d-shared", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(3*nnghbr);
-    const int n = (tmember.league_rank() - m*(3*nnghbr))/3;
-    const int v = (tmember.league_rank() - m*(3*nnghbr) - 3*n);
+  Kokkos::parallel_for("ProFC-2d-shared", athenak_lw(policy),
+      KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int im = (tmember.league_rank())/(3*nnghbr);
+    const int m = im;
+    const int n = (tmember.league_rank() - im*(3*nnghbr))/3;
+    const int v = (tmember.league_rank() - im*(3*nnghbr) - 3*n);
 
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
-      int il = rbuf[n].iprol[v].bis;
-      int iu = rbuf[n].iprol[v].bie;
-      int jl = rbuf[n].iprol[v].bjs;
-      int ju = rbuf[n].iprol[v].bje;
-      int kl = rbuf[n].iprol[v].bks;
-      int ku = rbuf[n].iprol[v].bke;
+      int ox1, ox2, ox3;
+      NeighborOffsetFromIndex(n, ox1, ox2, ox3);
+      const int my_lev = mblev.d_view(m);
+      int il = rbuf(n).iprol[v].bis;
+      int iu = rbuf(n).iprol[v].bie;
+      int jl = rbuf(n).iprol[v].bjs;
+      int ju = rbuf(n).iprol[v].bje;
+      int kl = rbuf(n).iprol[v].bks;
+      int ku = rbuf(n).iprol[v].bke;
       const int ni = iu - il + 1;
       const int nj = ju - jl + 1;
       const int nk = ku - kl + 1;
@@ -365,11 +930,14 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
         // Prolongate face-centered fields at shared faces betwen fine and coarse cells
         // by calling inlined prolongation operator for FC variables
         if (v==0) {
-          ProlongFCSharedX1Face(m,k,j,i,fk,fj,fi,multi_d,three_d,cb.x1f,b.x1f);
+          ProlongFCSharedX1FaceOwned(m,nnghbr,k,j,i,fk,fj,fi,ox1,ox2,ox3,my_lev,
+                                     multi_d,three_d,indcs,nghbr,cb.x1f,b.x1f);
         } else if (v==1) {
-          ProlongFCSharedX2Face(m,k,j,i,fk,fj,fi,three_d,cb.x2f,b.x2f);
+          ProlongFCSharedX2FaceOwned(m,nnghbr,k,j,i,fk,fj,fi,ox1,ox2,ox3,my_lev,
+                                     three_d,indcs,nghbr,cb.x2f,b.x2f);
         } else {
-          ProlongFCSharedX3Face(m,k,j,i,fk,fj,fi,multi_d,cb.x3f,b.x3f);
+          ProlongFCSharedX3FaceOwned(m,nnghbr,k,j,i,fk,fj,fi,ox1,ox2,ox3,my_lev,
+                                     multi_d,indcs,nghbr,cb.x3f,b.x3f);
         }
       });
     }
@@ -382,23 +950,28 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
   // interpolation formulae use these values.
 
   // Outer loop over (# of MeshBlocks)*(# of buffers)
-  {int nmn = nmb*nnghbr;
+  {int nmn = nwork*nnghbr;
   bool &one_d = pmy_pack->pmesh->one_d;
-  auto &rbuf = recvbuf;
+  auto rbuf = recvbuf_device;
   Kokkos::TeamPolicy<> policy(DevExeSpace(), nmn, Kokkos::AUTO);
-  Kokkos::parallel_for("ProFC-2d-int", policy, KOKKOS_LAMBDA(TeamMember_t tmember) {
-    const int m = (tmember.league_rank())/(nnghbr);
-    const int n = (tmember.league_rank() - m*(nnghbr));
+  Kokkos::parallel_for("ProFC-2d-int", athenak_lw(policy),
+      KOKKOS_LAMBDA(TeamMember_t tmember) {
+    const int im = (tmember.league_rank())/(nnghbr);
+    const int m = im;
+    const int n = (tmember.league_rank() - im*(nnghbr));
 
     // only prolongate when neighbor exists and is at coarser level
     if ((nghbr.d_view(m,n).gid >= 0) && (nghbr.d_view(m,n).lev < mblev.d_view(m))) {
+      int ox1, ox2, ox3;
+      NeighborOffsetFromIndex(n, ox1, ox2, ox3);
+      const int my_lev = mblev.d_view(m);
       // use prolongation indices of different field components for interior fine cells
-      int il = rbuf[n].iprol[2].bis;
-      int iu = rbuf[n].iprol[2].bie;
-      int jl = rbuf[n].iprol[0].bjs;
-      int ju = rbuf[n].iprol[0].bje;
-      int kl = rbuf[n].iprol[1].bks;
-      int ku = rbuf[n].iprol[1].bke;
+      int il = rbuf(n).iprol[2].bis;
+      int iu = rbuf(n).iprol[2].bie;
+      int jl = rbuf(n).iprol[0].bjs;
+      int ju = rbuf(n).iprol[0].bje;
+      int kl = rbuf(n).iprol[1].bks;
+      int ku = rbuf(n).iprol[1].bke;
       const int ni = iu - il + 1;
       const int nj = ju - jl + 1;
       const int nk = ku - kl + 1;
@@ -419,10 +992,14 @@ void MeshBoundaryValuesFC::ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Re
 
         if (one_d) {
           // In 1D, interior face field is trivial
-          b.x1f(m,fk,fj,fi+1) = 0.5*(b.x1f(m,fk,fj,fi) + b.x1f(m,fk,fj,fi+2));
+          StoreProlongatedFCFace(m, nnghbr, 0, fk, fj, fi+1, ox1, ox2, ox3,
+                                 my_lev, indcs, nghbr,
+                                 0.5*(b.x1f(m,fk,fj,fi) + b.x1f(m,fk,fj,fi+2)),
+                                 b.x1f);
         } else {
           // in multi-D call inlined prolongation operator for FC fields at internal faces
-          ProlongFCInternal(m,fk,fj,fi,three_d,b);
+          ProlongFCInternalOwned(m,nnghbr,fk,fj,fi,ox1,ox2,ox3,my_lev,
+                                 three_d,indcs,nghbr,b);
         }
       });
     }

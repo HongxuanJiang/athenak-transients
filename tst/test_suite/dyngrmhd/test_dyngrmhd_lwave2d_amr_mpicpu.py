@@ -1,7 +1,7 @@
 """
 Linear wave convergence test for general-relativistic MHD in dynamical spacetime (dyngr)
 in 2D and with AMR + MPI.
-Runs tests in MHD for RK2+PLM and RK3+WENOZ using HLLE Riemann solver.
+Runs tests in MHD for RK2+PLM and RK3+WENOZ using the HLLE and HLLD Riemann solvers.
 Only tests "0" wave
 """
 
@@ -14,6 +14,15 @@ import test_suite.testutils as testutils
 maxerrors = {
     ("mhd", "rk2", "plm", "0"): (2.9e-05, 0.27),
     ("mhd", "rk3", "wenoz", "0"): (2e-06, 0.22),
+}
+# Calibrated on HLLE; hlld measures a plm ratio of 0.2704 and a wenoz error of 2.0034e-06
+# on this deck (2026-09-12), and the AMR + MPI run is itself reproducible only to 2.6e-5
+# relative, so hlld gets its own bars with a few per cent of room.
+flux_overrides = {
+    "hlld": {
+        ("mhd", "rk2", "plm", "0"): (2.9e-05, 0.28),
+        ("mhd", "rk3", "wenoz", "0"): (2.1e-06, 0.22),
+    },
 }
 
 _wave = ["0"]  # do not change order
@@ -46,7 +55,7 @@ def arguments(iv, rv, fv, wv, res, soe, name):
 
 
 @pytest.mark.parametrize("rv", _recon)
-@pytest.mark.parametrize("fv", ["hlle"])
+@pytest.mark.parametrize("fv", ["hlle", "hlld"])
 @pytest.mark.parametrize("soe", _soe)
 def test_run(fv, rv, soe):
     """Run a single test with given parameters."""
@@ -56,7 +65,7 @@ def test_run(fv, rv, soe):
         "inputs/lwave_dyngrmhd.athinput",
         "gr_lwave_{soe}",
         arguments,
-        maxerrors,
+        {**maxerrors, **flux_overrides.get(fv, {})},
         _wave,
         _res,
         iv,

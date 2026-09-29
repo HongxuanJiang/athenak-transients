@@ -47,7 +47,9 @@ eos         = ideal    # EOS type
 reconstruct = wenoz    # spatial reconstruction method
 rsolver     = advect   # Riemann-solver to be used
 gamma       = 1.66666666667   # gamma = C_p/C_v
+viscosity   = isotropic # activates the viscosity module (Hydro gates on this key)
 nu_iso      = 0.0      # isotropic kinematic viscosity (set by viscosity tests)
+conductivity = isotropic # activates the conduction module (Hydro gates on this key)
 alpha_iso   = 0.0      # isotropic thermal diffusivity (set by conduction tests)
 
 <units>

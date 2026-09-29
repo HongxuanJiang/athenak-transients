@@ -10,6 +10,8 @@
 #include <stdio.h>        // BUFSIZ
 #include <string.h>       // snprintf
 
+#include <cstdlib>
+#include <iostream>
 #include <string>
 
 #include "../../parameter_input.hpp"
@@ -46,6 +48,19 @@ bool Primitive::PiecewisePolytrope::ReadParametersFromInput(std::string block,
 
   // Initialize the EOS
   InitializeFromData(densities, gammas, P0, 1.0, np);
+
+  // A deck key the run would not read is an error: "pwp_gamma_thermal" reads like the
+  // rest of the pwp_* family but is not the key this reader takes, and a deck carrying it
+  // silently ran on the 5/3 default instead of the value it asked for.  From a restart
+  // header it is history and is dropped instead (ParameterInput::RetireDeadParameter).
+  if (pin->RetireDeadParameter(block, "pwp_gamma_thermal")) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl
+              << "<" << block << ">/pwp_gamma_thermal is read by no code path; the "
+              << "piecewise-polytrope thermal index is <" << block << ">/gamma_thermal."
+              << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
 
   // Set the gamma thermal (the default is 5/3)
   if (pin->DoesParameterExist(block, "gamma_thermal")) {

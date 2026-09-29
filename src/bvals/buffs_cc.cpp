@@ -149,6 +149,36 @@ void MeshBoundaryValuesCC::InitSendIndices(MeshBoundaryBuffer &buf,
   buf.iflxc_ndat = (iflux.bie - iflux.bis + 1)*(iflux.bje - iflux.bjs + 1)*
                    (iflux.bke - iflux.bks + 1);
   }
+
+  // set indices for sends for same-level LAT flux synchronization
+  if (f1 != 0 || f2 != 0) {
+    buf.iflxs_ndat = 0;
+  } else
+  {auto &iflux = buf.iflux_same[0];
+  if (ox1 == 0) {
+    iflux.bis = mb_indcs.is;           iflux.bie = mb_indcs.ie;
+  } else if (ox1 > 0) {
+    iflux.bis = mb_indcs.ie + 1;       iflux.bie = mb_indcs.ie + 1;
+  } else {
+    iflux.bis = mb_indcs.is;           iflux.bie = mb_indcs.is;
+  }
+  if (ox2 == 0) {
+    iflux.bjs = mb_indcs.js;           iflux.bje = mb_indcs.je;
+  } else if (ox2 > 0) {
+    iflux.bjs = mb_indcs.je + 1;       iflux.bje = mb_indcs.je + 1;
+  } else {
+    iflux.bjs = mb_indcs.js;           iflux.bje = mb_indcs.js;
+  }
+  if (ox3 == 0) {
+    iflux.bks = mb_indcs.ks;           iflux.bke = mb_indcs.ke;
+  } else if (ox3 > 0) {
+    iflux.bks = mb_indcs.ke + 1;       iflux.bke = mb_indcs.ke + 1;
+  } else {
+    iflux.bks = mb_indcs.ks;           iflux.bke = mb_indcs.ks;
+  }
+  buf.iflxs_ndat = (iflux.bie - iflux.bis + 1)*(iflux.bje - iflux.bjs + 1)*
+                   (iflux.bke - iflux.bks + 1);
+  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -479,6 +509,36 @@ void MeshBoundaryValuesCC::InitRecvIndices(MeshBoundaryBuffer &buf,
     iflux.bks = mb_indcs.ks;           iflux.bke = mb_indcs.ks;
   }
   buf.iflxc_ndat = (iflux.bie - iflux.bis + 1)*(iflux.bje - iflux.bjs + 1)*
+                   (iflux.bke - iflux.bks + 1);
+  }
+
+  // set indices for receives for same-level LAT flux synchronization
+  if (f1 != 0 || f2 != 0) {
+    buf.iflxs_ndat = 0;
+  } else
+  {auto &iflux = buf.iflux_same[0];
+  if (ox1 == 0) {
+    iflux.bis = mb_indcs.is;           iflux.bie = mb_indcs.ie;
+  } else if (ox1 > 0) {
+    iflux.bis = mb_indcs.ie + 1;       iflux.bie = mb_indcs.ie + 1;
+  } else {
+    iflux.bis = mb_indcs.is;           iflux.bie = mb_indcs.is;
+  }
+  if (ox2 == 0) {
+    iflux.bjs = mb_indcs.js;           iflux.bje = mb_indcs.je;
+  } else if (ox2 > 0) {
+    iflux.bjs = mb_indcs.je + 1;       iflux.bje = mb_indcs.je + 1;
+  } else {
+    iflux.bjs = mb_indcs.js;           iflux.bje = mb_indcs.js;
+  }
+  if (ox3 == 0) {
+    iflux.bks = mb_indcs.ks;           iflux.bke = mb_indcs.ke;
+  } else if (ox3 > 0) {
+    iflux.bks = mb_indcs.ke + 1;       iflux.bke = mb_indcs.ke + 1;
+  } else {
+    iflux.bks = mb_indcs.ks;           iflux.bke = mb_indcs.ks;
+  }
+  buf.iflxs_ndat = (iflux.bie - iflux.bis + 1)*(iflux.bje - iflux.bjs + 1)*
                    (iflux.bke - iflux.bks + 1);
   }
 }

@@ -29,4 +29,6 @@ IonNeutral::IonNeutral(MeshBlockPack *pp, ParameterInput *pin) :
   ionization_coeff = pin->GetOrAddReal("ion-neutral","ionization_coeff",0.0);
   recombination_coeff = pin->GetOrAddReal("ion-neutral","recombination_coeff",0.0);
 }
+
+IonNeutral::~IonNeutral() {}
 } // namespace ion_neutral

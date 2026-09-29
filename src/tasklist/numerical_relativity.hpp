@@ -37,6 +37,7 @@ enum TaskName {
   MHD_RecvFlux,
   MHD_ExplRK,
   MHD_AddSrc,
+  MHD_DualE,
   MHD_RestU,
   MHD_SendU,
   MHD_RecvU,
@@ -51,7 +52,16 @@ enum TaskName {
   MHD_Prolong,
   MHD_SetADM,
   MHD_Excise,
+  // The prescribed metric of the time level the stage update advanced U to, installed
+  // ahead of every recovery of it (DynGRMHD::SetADMVariablesAtStageEnd).
+  MHD_SetADMEnd,
+  MHD_PreFluxC2P,
   MHD_C2P,
+  // Interior-first ConsToPrim (dyn_grmhd.cpp): MHD_C2P_Int recovers the deep interior
+  // while the conserved-variable exchange is in flight; MHD_C2P then keeps its name and
+  // all its downstream dependents but covers only the complement (ghosts + the
+  // boundary-condition read shell).  See DynGRMHD::ConToPrimInteriorFirst.
+  MHD_C2P_Int,
   MHD_Newdt,
   MHD_ClearS,
   MHD_ClearR,

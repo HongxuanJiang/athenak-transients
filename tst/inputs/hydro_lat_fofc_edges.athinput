@@ -1,0 +1,85 @@
+<job>
+basename = hydro_lat_fofc_edges
+
+<mesh>
+nghost = 4
+nx1 = 32
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 16
+x2min = -0.25
+x2max = 0.25
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 16
+x3min = -0.25
+x3max = 0.25
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement = static
+
+<refined_region0>
+level = 1
+x1min = -0.25
+x1max = 0.25
+x2min = -0.25
+x2max = 0.0
+x3min = -0.25
+x3max = 0.0
+
+<refined_region1>
+level = 2
+x1min = -0.125
+x1max = 0.125
+x2min = -0.125
+x2max = 0.0
+x3min = -0.125
+x3max = 0.0
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = 4
+tlim = 100
+ndiag = 100000
+lat = true
+lat_levels = 3
+hydro_lat_min_bin_count = 1
+lat_union_stage1 = auto
+
+<hydro>
+eos = ideal
+reconstruct = plm
+rsolver = hllc
+fofc = true
+gamma = 1.6666666666666667
+dfloor = 1e-12
+pfloor = 1e-12
+
+<problem>
+pgen_name = linear_wave
+wave_flag = 2
+amp = 0.9
+dens = 1.0
+pgas = 1e-4
+vx0 = 0.05
+
+<output1>
+file_type = bin
+variable = hydro_u
+variable_precision = float64
+dt = 1e6
+
+<output2>
+file_type = log
+dt = 1e-9

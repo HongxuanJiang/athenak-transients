@@ -246,7 +246,7 @@ void Resistivity::AddEMFConstantAmbipolar(const DvceFaceFld4D<Real> &b0,
 //  cell-centered B (bcc0). J is recomputed inline via EdgeJ{1,2,3}().
 
 void Resistivity::AddFluxConstantAmbipolar(const DvceFaceFld4D<Real> &b0,
-    DvceFaceFld5D<Real> &flx) {
+    const BandFaceFld5D<Real> &flx) {
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   int is = indcs.is, ie = indcs.ie;
   int js = indcs.js, je = indcs.je;

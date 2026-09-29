@@ -59,7 +59,7 @@ x3max =  10.0
 <refined_region2>
 level = 6
 x1min = -24.0    # co_1_x - NS_radius
-x1max = - 4.0    # co_1_x + NS_radius
+x1max = -4.0    # co_1_x + NS_radius
 x2min = -10.0
 x2max =  10.0
 x3min = -10.0
@@ -80,8 +80,7 @@ m           = 0.0
 a           = 0.0
 
 <mhd>
-eos         = ideal          # placeholder (unused, required by parser)
-gamma       = 2.0            # placeholder (unused, required by parser)
+eos         = ideal          # selects the DynGRMHD no-op EOS; dyn_eos is the real one
 
 dyn_eos     = piecewise_poly # PrimitiveSolver EOSPolicy — must match Kadath EOS
 dyn_error   = reset_floor    # PrimitiveSolver ErrorPolicy
@@ -106,7 +105,7 @@ pwp_gamma_pieces_0   = 2.000000000000000e+00
 pwp_gamma_pieces_1   = 2.000000000000000e+00
 pwp_gamma_pieces_2   = 2.000000000000000e+00
 pwp_gamma_pieces_3   = 2.000000000000000e+00
-pwp_gamma_thermal    = 1.7
+gamma_thermal        = 1.7
 
 <adm>
 

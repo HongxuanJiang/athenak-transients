@@ -14,7 +14,7 @@
 
 #include "athena.hpp"
 
-#define MAX_SPECIES 3
+#define MAX_SPECIES 8
 #define NHYDRO ((5) + (MAX_SPECIES))
 
 enum ConsIndex {CDN=0, CSX=1, CSY=2, CSZ=3, CTA=4, CYD=5, NCONS=(NHYDRO)};
@@ -26,6 +26,12 @@ enum PrimIndex {PRH=0,PVX=1, PVY=2, PVZ=3, PPR=4, PTM=5, PYF=6, NPRIM=((NHYDRO)+
 enum SpatialMetricIndex{S11=0, S12=1, S13=2, S22=3, S23=4, S33=5, NSPMETRIC=6};
 
 class SupportsEntropy{};
+//! Tag for EOS policies that carry an adiabatic invariant kappa = p/rho^Gamma, the
+//! quantity the GR dual-energy formalism advects.  Constant along a streamline for
+//! smooth adiabatic flow, so rho*kappa obeys a conservation law and rides the mass
+//! flux; it is NOT conserved across a shock, which is why the eta1 test decides per
+//! cell which of the two channels the pressure comes from.
+class SupportsAdiabat{};
 class SupportsChemicalPotentials{};
 
 #endif  // EOS_PRIMITIVE_SOLVER_PS_TYPES_HPP_

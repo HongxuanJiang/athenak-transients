@@ -22,6 +22,7 @@
 #endif
 
 #include <algorithm>  // max(), max_element(), min(), min_element()
+#include <array>
 #include <iomanip>
 #include <iostream>   // endl
 #include <limits>     // numeric_limits::max()
@@ -43,89 +44,22 @@
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
 #include "radiation/radiation.hpp"
+#include "radiation/radiation_opacities.hpp"
+#include "units/units.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
+#include "torus_ic.hpp"
 
 #include <Kokkos_Random.hpp>
 
-// prototypes for functions used internally to this pgen
+// The disk initial condition -- the Fishbone-Moncrief and Chakrabarti tori, the
+// Novikov-Thorne thin disk, the vector potential and the parameters that describe them
+// -- lives in torus_ic.hpp, shared with the binary generator BBH.cpp.  One problem
+// generator is compiled per binary, so importing the namespace here is unambiguous.
+using namespace torus_ic;  // NOLINT(build/namespaces)
+
 namespace {
-KOKKOS_INLINE_FUNCTION
-static void CalculateCN(struct torus_pgen pgen, Real *cparam, Real *nparam);
-
-KOKKOS_INLINE_FUNCTION
-static Real CalculateL(struct torus_pgen pgen, Real r, Real sin_theta);
-
-KOKKOS_INLINE_FUNCTION
-static Real CalculateCovariantUT(struct torus_pgen pgen, Real r, Real sin_theta, Real l);
-
-KOKKOS_INLINE_FUNCTION
-static Real CalculateLFromRPeak(struct torus_pgen pgen, Real r);
-
-KOKKOS_INLINE_FUNCTION
-static Real LogHAux(struct torus_pgen pgen, Real r, Real sin_theta);
-
-KOKKOS_INLINE_FUNCTION
-static Real CalculateT(struct torus_pgen pgen, Real rho, Real ptot_over_rho);
-
-KOKKOS_INLINE_FUNCTION
-static void GetBoyerLindquistCoordinates(struct torus_pgen pgen,
-                                         Real x1, Real x2, Real x3,
-                                         Real *pr, Real *ptheta, Real *pphi);
-
-KOKKOS_INLINE_FUNCTION
-static void CalculateVelocityInTiltedTorus(struct torus_pgen pgen,
-                                           Real r, Real theta, Real phi, Real *pu0,
-                                           Real *pu1, Real *pu2, Real *pu3);
-
-KOKKOS_INLINE_FUNCTION
-static void CalculateVelocityInTorus(struct torus_pgen pgen,
-                                     Real r, Real sin_theta, Real *pu0, Real *pu3);
-
-KOKKOS_INLINE_FUNCTION
-static void CalculateVectorPotentialInTiltedTorus(struct torus_pgen pgen,
-                                                  Real r, Real theta, Real phi,
-                                                  Real *patheta, Real *paphi);
-
-KOKKOS_INLINE_FUNCTION
-static void TransformVector(struct torus_pgen pgen,
-                            Real a0_bl, Real a1_bl, Real a2_bl, Real a3_bl,
-                            Real x1, Real x2, Real x3,
-                            Real *pa0, Real *pa1, Real *pa2, Real *pa3);
-
-KOKKOS_INLINE_FUNCTION
-Real A1(struct torus_pgen pgen, Real x1, Real x2, Real x3);
-KOKKOS_INLINE_FUNCTION
-Real A2(struct torus_pgen pgen, Real x1, Real x2, Real x3);
-KOKKOS_INLINE_FUNCTION
-Real A3(struct torus_pgen pgen, Real x1, Real x2, Real x3);
-
-// Useful container for physical parameters of torus
-struct torus_pgen {
-  Real spin;                                  // black hole spin
-  Real dexcise, pexcise;                      // excision parameters
-  Real gamma_adi;                             // EOS parameters
-  Real arad;                                  // radiation constant
-  bool prograde;                              // flag indicating disk is prograde (FM)
-  Real r_edge, r_peak, l, rho_max;            // fixed torus parameters
-  Real l_peak;                                // fixed torus parameters
-  Real c_param;                               // calculated chakrabarti parameter
-  Real n_param;                               // fixed or calculated chakrabarti parameter
-  Real log_h_edge, log_h_peak;                // calculated torus parameters
-  Real ptot_over_rho_peak, rho_peak;          // more calculated torus parameters
-  Real r_outer_edge;                          // even more calculated torus parameters
-  Real psi, sin_psi, cos_psi;                 // tilt parameters
-  Real rho_min, rho_pow, pgas_min, pgas_pow;  // background parameters
-  bool is_vertical_field;                     // use vertical field configuration
-  bool fm_torus, chakrabarti_torus;           // FM versus Chakrabarti torus ICs
-  Real potential_cutoff, potential_falloff;   // sets region of torus to magnetize
-  Real potential_r_pow;                       // set how vector potential scales
-  Real potential_beta_min;                    // set how vector potential scales (cont.)
-  Real potential_rho_pow;                     // set vector potential dependence on rho
-};
-
-  torus_pgen torus;
-
-} // namespace
+torus_pgen torus;
+}  // namespace
 
 // Prototypes for user-defined BCs and history functions
 void NoInflowTorus(Mesh *pm);
@@ -167,10 +101,12 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const Real r_excise = coord.rexcise;
   const bool is_radiation_enabled = (pmbp->prad != nullptr);
 
-  // Spherical Grid for user-defined history
+  // Spherical Grid for user-defined history.  Either radiation module moves the excision
+  // out to the horizon (coordinates.cpp), so the innermost sphere must sit outside it.
   auto &grids = spherical_grids;
-  const Real rflux =
-    (is_radiation_enabled) ? ceil(r_excise + 1.0) : 1.0 + sqrt(1.0 - SQR(torus.spin));
+  const bool radiation_excises_horizon = is_radiation_enabled;
+  const Real rflux = (radiation_excises_horizon) ? ceil(r_excise + 1.0)
+                                                 : 1.0 + sqrt(1.0 - SQR(torus.spin));
   grids.push_back(std::make_unique<SphericalGrid>(pmbp, 5, rflux));
   // NOTE(@pdmullen): Enroll additional radii for flux analysis by
   // pushing back the grids vector with additional SphericalGrid instances
@@ -178,8 +114,9 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   grids.push_back(std::make_unique<SphericalGrid>(pmbp, 5, 24.0));
   user_hist_func = TorusFluxes;
 
-  // return if restart
-  if (restart) return;
+  if (restart) {
+    return;
+  }
 
   // Select either Hydro or MHD
   DvceArray5D<Real> u0_, w0_;
@@ -218,22 +155,46 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     torus.arad = pmbp->prad->arad;
   }
 
+  const bool is_rad_split = is_radiation_enabled;
+
   // Read problem-specific parameters from input file
-  // global parameters
+  // global parameters.  <coord>/a is the dimensionless spin, so the hole has unit mass;
+  // the shared profiles carry the mass explicitly for the binary generator's sake.
+  torus.M = 1.0;
   torus.rho_min = pin->GetReal("problem", "rho_min");
-  torus.rho_pow = pin->GetReal("problem", "rho_pow");
+  torus.rho_pow = pin->GetOrAddReal("problem", "rho_pow", 0.0);
   torus.pgas_min = pin->GetReal("problem", "pgas_min");
-  torus.pgas_pow = pin->GetReal("problem", "pgas_pow");
+  torus.pgas_pow = pin->GetOrAddReal("problem", "pgas_pow", 0.0);
   torus.psi = pin->GetOrAddReal("problem", "tilt_angle", 0.0) * (M_PI/180.0);
   torus.sin_psi = sin(torus.psi);
   torus.cos_psi = cos(torus.psi);
   torus.rho_max = pin->GetReal("problem", "rho_max");
-  torus.r_edge = pin->GetReal("problem", "r_edge");
-  torus.r_peak = pin->GetReal("problem", "r_peak");
+  const bool fm_torus = pin->GetOrAddBoolean("problem", "fm_torus", false);
+  const bool chakrabarti_torus =
+      pin->GetOrAddBoolean("problem", "chakrabarti_torus", false);
+  // The Novikov-Thorne thin disk, selected and described by exactly the keys the binary
+  // generator uses, so that one <problem> block means the same disk to both.  Its
+  // pressure maximum is not a deck parameter: it is where the Page-Thorne flux function
+  // peaks, and is derived below once the spin is known.
+  torus.use_nt_disk = pin->GetOrAddBoolean("problem", "use_nt_disk", false);
+  torus.use_chakrabarti_torus = chakrabarti_torus;
+  const int nmodel = (fm_torus ? 1 : 0) + (chakrabarti_torus ? 1 : 0) +
+                     (torus.use_nt_disk ? 1 : 0);
+  if (nmodel != 1) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "Exactly one of problem/fm_torus, problem/chakrabarti_torus and "
+              << "problem/use_nt_disk must be true." << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  torus.r_peak = torus.use_nt_disk ? 0.0 : pin->GetReal("problem", "r_peak");
   torus.n_param = pin->GetOrAddReal("problem", "n_param",0.0);
   torus.prograde = pin->GetOrAddBoolean("problem","prograde",true);
-  torus.fm_torus = pin->GetOrAddBoolean("problem", "fm_torus", false);
-  torus.chakrabarti_torus = pin->GetOrAddBoolean("problem", "chakrabarti_torus", false);
+  const Real eos_tfloor = (pmbp->pmhd != nullptr)
+      ? pmbp->pmhd->peos->eos_data.tfloor
+      : ((pmbp->phydro != nullptr) ? pmbp->phydro->peos->eos_data.tfloor : 0.0);
+  ReadNTDiskParameters(pin, torus, torus.use_nt_disk, false,
+                       pin->GetOrAddReal("problem", "nt_arad", 0.0),
+                       eos_tfloor);
 
   // local parameters
   Real pert_amp = pin->GetOrAddReal("problem", "pert_amp", 0.0);
@@ -243,50 +204,80 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   torus.pexcise = coord.pexcise;
 
   // Compute angular momentum and prepare constants describing primitives
-  if (torus.fm_torus) {
-    torus.l_peak = CalculateLFromRPeak(torus, torus.r_peak);
-  } else if (torus.chakrabarti_torus) {
-    CalculateCN(torus, &torus.c_param, &torus.n_param);
-    torus.l_peak = CalculateL(torus, torus.r_peak, 1.0);
+  if (torus.use_nt_disk) {
+    // The thin disk carries no enthalpy solution: it rides on circular geodesics, so the
+    // reference state is the radius at which the Page-Thorne flux function peaks.
+    if (!FindLocalNTProfilePeakRadius(torus, &torus.r_peak)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "Could not find a valid NT thin-disk profile peak. Check nt_r_trunc, "
+                << "nt_r_out, prograde and the black hole spin." << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    if (!(torus.nt_r_trunc > 0.0) || !(torus.nt_h_over_r > 0.0) ||
+        !(torus.nt_r_out > torus.r_peak) || !(torus.r_peak > torus.nt_r_trunc) ||
+        !(torus.nt_inner_taper_width > 0.0) || !(torus.nt_outer_taper_width > 0.0) ||
+        !(torus.rho_max > torus.rho_min)) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "Invalid NT thin-disk parameters. Require nt_r_trunc>0, "
+                << "nt_h_over_r>0, nt_r_out>r_peak>nt_r_trunc, nt_inner_taper_width>0, "
+                << "nt_outer_taper_width>0, and rho_max>rho_min." << std::endl;
+      exit(EXIT_FAILURE);
+    }
+    if (global_variable::my_rank == 0) {
+      std::cout << "NT thin disk r_peak = " << torus.r_peak << std::endl;
+    }
+    torus.r_outer_edge = torus.nt_r_out;
   } else {
-    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
-              << "Unrecognized torus type in input file" << std::endl;
-    exit(EXIT_FAILURE);
+    if (fm_torus) {
+      torus.l_peak = CalculateFMLFromRPeak(torus, torus.r_peak);
+    } else {
+      CalculateCN(torus, &torus.c_param, &torus.n_param);
+      torus.l_peak = CalculateL(torus, torus.r_peak, 1.0);
+    }
+    // Common to both tori:
+    torus.log_h_edge = LogHAux(torus, torus.r_edge, 1.0);
+    torus.log_h_peak = LogHAux(torus, torus.r_peak, 1.0) - torus.log_h_edge;
+    torus.ptot_over_rho_peak = gm1/torus.gamma_adi * (exp(torus.log_h_peak)-1.0);
+    torus.rho_peak = pow(torus.ptot_over_rho_peak, 1.0/gm1) / torus.rho_max;
   }
-  // Common to both tori:
-  torus.log_h_edge = LogHAux(torus, torus.r_edge, 1.0);
-  torus.log_h_peak = LogHAux(torus, torus.r_peak, 1.0) - torus.log_h_edge;
-  torus.ptot_over_rho_peak = gm1/torus.gamma_adi * (exp(torus.log_h_peak)-1.0);
-  torus.rho_peak = pow(torus.ptot_over_rho_peak, 1.0/gm1) / torus.rho_max;
 
   // find "outer edge" of torus (first place log_h > 0)
-  Real ra = torus.r_peak;
-  Real rb = 2. * ra;
-  Real log_h_trial = LogHAux(torus, rb, 1.) - torus.log_h_edge;
-  for (int iter=0; iter<10000; ++iter) {
-    if (log_h_trial <= 0) {
-      break;
+  if (!torus.use_nt_disk) {
+    Real ra = torus.r_peak;
+    Real rb = 2. * ra;
+    Real log_h_trial = LogHAux(torus, rb, 1.) - torus.log_h_edge;
+    for (int iter=0; iter<10000; ++iter) {
+      if (log_h_trial <= 0) {
+        break;
+      }
+      rb *= 2.;
+      log_h_trial = LogHAux(torus, rb, 1.) - torus.log_h_edge;
     }
-    rb *= 2.;
-    log_h_trial = LogHAux(torus, rb, 1.) - torus.log_h_edge;
+    for (int iter=0; iter<10000; ++iter) {
+      if (fabs(ra - rb) < 1.e-3) {
+        break;
+      }
+      Real r_trial = (ra + rb) / 2.;
+      if (LogHAux(torus, r_trial, 1.) > torus.log_h_edge) {
+        ra = r_trial;
+      } else {
+        rb = r_trial;
+      }
+    }
+    torus.r_outer_edge = ra;
+    std::cout << "Found torus outer edge: " << torus.r_outer_edge << std::endl;
   }
-  for (int iter=0; iter<10000; ++iter) {
-    if (fabs(ra - rb) < 1.e-3) {
-      break;
-    }
-    Real r_trial = (ra + rb) / 2.;
-    if (LogHAux(torus, r_trial, 1.) > torus.log_h_edge) {
-      ra = r_trial;
-    } else {
-      rb = r_trial;
-    }
-  }
-  torus.r_outer_edge = ra;
-  std::cout << "Found torus outer edge: " << torus.r_outer_edge << std::endl;
 
   // initialize primitive variables for new run ---------------------------------------
 
+  const bool torus_split = is_rad_split;
   auto trs = torus;
+  // The initial background must be excised on the same sphere the runtime masks use --
+  // r_+ with a radiation module, r = 1 without one (coordinates.cpp) -- or the horizon
+  // interior starts as ordinary atmosphere and is only floored on the first C2P.
+  const Real rexcise_radius = coord.rexcise;
   auto &size = pmbp->pmb->mb_size;
   Kokkos::Random_XorShift64_Pool<> rand_pool64(pmbp->gids);
   Real ptotmax = std::numeric_limits<float>::min();
@@ -346,10 +337,17 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       sin_vartheta = fabs(sin_theta);
     }
 
-    // Determine if we are in the torus
+    // Determine if we are in the disk.  The equilibrium tori are bounded by their own
+    // enthalpy; the thin disk is reconstructed from the Novikov-Thorne profile instead,
+    // which also returns the state, so do that here and reuse it below.
     Real log_h;
     bool in_torus = false;
-    if (r >= trs.r_edge) {
+    Real nt_rho = 0.0, nt_pgas = 0.0;
+    Real nt_u0_bl = 0.0, nt_u1_bl = 0.0, nt_u2_bl = 0.0, nt_u3_bl = 0.0;
+    if (trs.use_nt_disk) {
+      in_torus = ReconstructLocalNTDiskState(trs, x1v, x2v, x3v, &nt_rho, &nt_pgas,
+                                             &nt_u0_bl, &nt_u1_bl, &nt_u2_bl, &nt_u3_bl);
+    } else if (r >= trs.r_edge) {
       log_h = LogHAux(trs, r, sin_vartheta) - trs.log_h_edge;  // (FM 3.6)
       if (log_h >= 0.0) {
         in_torus = true;
@@ -365,7 +363,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
                                       x3v + copysign(0.5*dx3,x3v), &r_excise,
                                       &theta_excise, &phi_excise);
     Real rho_bg, pgas_bg;
-    if (r_excise > 1.0) {
+    if (r_excise > rexcise_radius) {
       rho_bg = trs.rho_min * pow(r, trs.rho_pow);
       pgas_bg = trs.pgas_min * pow(r, trs.pgas_pow);
     } else {
@@ -389,28 +387,32 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       rand_pool64.free_state(rand_gen);        // free state for use by other threads
 
       // Calculate thermodynamic variables
-      Real ptot_over_rho = gm1/trs.gamma_adi * (exp(log_h) - 1.0);
-      rho = pow(ptot_over_rho, 1.0/gm1) / trs.rho_peak;
-      Real temp = ptot_over_rho;
-      if (is_radiation_enabled) temp = CalculateT(trs, rho, ptot_over_rho);
-      pgas = temp * rho;
-
-      // Calculate radiation variables (if radiation enabled)
-      if (is_radiation_enabled) urad = trs.arad * SQR(SQR(temp));
-
-      // Calculate velocities in Boyer-Lindquist coordinates
       Real u0_bl, u1_bl, u2_bl, u3_bl;
-      CalculateVelocityInTiltedTorus(trs, r, theta, phi,
-                                     &u0_bl, &u1_bl, &u2_bl, &u3_bl);
+      if (trs.use_nt_disk) {
+        // The thin disk's pressure is its whole support.
+        rho = nt_rho;
+        pgas = nt_pgas;
+        u0_bl = nt_u0_bl; u1_bl = nt_u1_bl; u2_bl = nt_u2_bl; u3_bl = nt_u3_bl;
+      } else {
+        Real ptot_over_rho = gm1/trs.gamma_adi * (exp(log_h) - 1.0);
+        rho = pow(ptot_over_rho, 1.0/gm1) / trs.rho_peak;
+        Real temp = ptot_over_rho;
+        if (torus_split) temp = CalculateT(trs, rho, ptot_over_rho);
+        pgas = temp * rho;
+
+        // Calculate radiation variables (if radiation enabled)
+        if (torus_split) urad = trs.arad * SQR(SQR(temp));
+
+        // Calculate velocities in Boyer-Lindquist coordinates
+        CalculateVelocityInTiltedTorus(trs, r, theta, phi,
+                                       &u0_bl, &u1_bl, &u2_bl, &u3_bl);
+      }
 
       // Transform to preferred coordinates
       Real u0, u1, u2, u3;
       TransformVector(trs, u0_bl, 0.0, u2_bl, u3_bl,
                       x1v, x2v, x3v, &u0, &u1, &u2, &u3);
 
-      Real glower[4][4], gupper[4][4];
-      ComputeMetricAndInverse(x1v, x2v, x3v, coord.is_minkowski, coord.bh_spin,
-                              glower, gupper);
       uu1 = u1 - gupper[0][1]/gupper[0][0] * u0;
       uu2 = u2 - gupper[0][2]/gupper[0][0] * u0;
       uu3 = u3 - gupper[0][3]/gupper[0][0] * u0;
@@ -418,10 +420,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 
     // Set primitive values, including random perturbations to pressure
     w0_(m,IDN,k,j,i) = fmax(rho, rho_bg);
+    const Real pgas_pert = fmax(pgas, pgas_bg) * (1.0 + perturbation);
     if (!use_dyngr) {
-      w0_(m,IEN,k,j,i) = fmax(pgas, pgas_bg) * (1.0 + perturbation) / gm1;
+      w0_(m,IEN,k,j,i) = pgas_pert / gm1;
     } else {
-      w0_(m,IPR,k,j,i) = fmax(pgas, pgas_bg) * (1.0 + perturbation);
+      w0_(m,IPR,k,j,i) = pgas_pert;
     }
     w0_(m,IVX,k,j,i) = uu1;
     w0_(m,IVY,k,j,i) = uu2;
@@ -457,14 +460,14 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       }
     }
 
-    // Compute total pressure (equal to gas pressure in non-radiating runs)
+    // Compute total pressure (equal to gas pressure in non-radiating runs).
     Real ptot;
     if (!use_dyngr) {
       ptot = gm1*w0_(m,IEN,k,j,i);
     } else {
       ptot = w0_(m,IPR,k,j,i);
     }
-    if (is_radiation_enabled) ptot += urad/3.0;
+    if (is_rad_split) ptot += urad/3.0;
     max_ptot = fmax(ptot, max_ptot);
   }, Kokkos::Max<Real>(ptotmax));
 
@@ -494,6 +497,45 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     torus.potential_falloff  = pin->GetOrAddReal("problem", "potential_falloff", 0.0);
     torus.potential_r_pow    = pin->GetOrAddReal("problem", "potential_r_pow", 0.0);
     torus.potential_rho_pow  = pin->GetOrAddReal("problem", "potential_rho_pow", 1.0);
+
+    // Which initial field to seed.  "torus" is the density-tied loop above (the SANE/MAD
+    // family), and is the default so that every existing deck is unchanged.  "inclined"
+    // is the inclined large-scale poloidal field of Zanni et al. (2007), in the form
+    // written as eq. (1.18) of Dihingia & Fendt, "Thin Accretion Disks in GR-MHD
+    // simulations" (arXiv:2404.06140).  Because it is not tied to the density it threads
+    // the disk with OPEN field lines -- there is no closed loop -- which is what a
+    // Blandford-Payne wind needs.  problem/potential_incl_m is then required: it is the
+    // m of that equation, the inclination of the field lines to the disk surface and with
+    // it the total flux threading the disk.  Small m bends the lines away from the axis
+    // (Dihingia & Fendt run m = 0.1), large m approaches a uniform vertical field.
+    torus.potential_inclined =
+        (pin->GetOrAddString("problem", "potential_config", "torus") == "inclined");
+    torus.potential_incl_m = 0.0;
+    // Where the inclined potential is normalized and its switch-on ends: the inner edge
+    // of an equilibrium torus, and for the thin disk the end of its inner smoothstep, as
+    // BBH.cpp sets it.  The thin disk's switch-on runs in cylindrical radius from
+    // nt_r_trunc = r_edge, so ending it on r_edge would make it a step in A_phi, a
+    // current sheet on the cylinder R = nt_r_trunc.
+    torus.potential_r_norm = (torus.potential_inclined && torus.use_nt_disk)
+        ? NTDiskInnerTaperEndRadius(torus) : torus.r_edge;
+    if (torus.potential_inclined) {
+      torus.potential_incl_m = pin->GetReal("problem", "potential_incl_m");
+      if (!(torus.potential_incl_m > 0.0)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl
+                  << "problem/potential_incl_m must be positive; m sets the field-line "
+                  << "inclination and enters as m^(5/4)." << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      if (torus.is_vertical_field) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl
+                  << "problem/potential_config = inclined and problem/vertical_field = "
+                  << "true are two different large-scale field prescriptions; pick one."
+                  << std::endl;
+        exit(EXIT_FAILURE);
+      }
+    }
 
     // compute vector potential over all faces
     int ncells1 = indcs.nx1 + 2*(indcs.ng);
@@ -532,9 +574,9 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       Real dx2 = size.d_view(m).dx2;
       Real dx3 = size.d_view(m).dx3;
 
-      a1(m,k,j,i) = A1(trs, x1v, x2f, x3f);
-      a2(m,k,j,i) = A2(trs, x1f, x2v, x3f);
-      a3(m,k,j,i) = A3(trs, x1f, x2f, x3v);
+      a1(m,k,j,i) = ErodedA1(trs, x1v, x2f, x3f, 0.5*dx2, 0.5*dx3);
+      a2(m,k,j,i) = ErodedA2(trs, x1f, x2v, x3f, 0.5*dx1, 0.5*dx3);
+      a3(m,k,j,i) = ErodedA3(trs, x1f, x2f, x3v, 0.5*dx1, 0.5*dx2);
 
       // When neighboring MeshBock is at finer level, compute vector potential as sum of
       // values at fine grid resolution.  This guarantees flux on shared fine/coarse
@@ -567,7 +609,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
           (nghbr.d_view(m,47).lev > mblev.d_view(m) && j==je+1 && k==ke+1)) {
         Real xl = x1v + 0.25*dx1;
         Real xr = x1v - 0.25*dx1;
-        a1(m,k,j,i) = 0.5*(A1(trs, xl,x2f,x3f) + A1(trs, xr,x2f,x3f));
+        a1(m,k,j,i) = 0.5*(ErodedA1(trs, xl,x2f,x3f, 0.25*dx2, 0.25*dx3) +
+                           ErodedA1(trs, xr,x2f,x3f, 0.25*dx2, 0.25*dx3));
       }
 
       // Correct A2 at x1-faces, x3-faces, and x1x3-edges
@@ -597,7 +640,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
           (nghbr.d_view(m,39).lev > mblev.d_view(m) && i==ie+1 && k==ke+1)) {
         Real xl = x2v + 0.25*dx2;
         Real xr = x2v - 0.25*dx2;
-        a2(m,k,j,i) = 0.5*(A2(trs, x1f,xl,x3f) + A2(trs, x1f,xr,x3f));
+        a2(m,k,j,i) = 0.5*(ErodedA2(trs, x1f,xl,x3f, 0.25*dx1, 0.25*dx3) +
+                           ErodedA2(trs, x1f,xr,x3f, 0.25*dx1, 0.25*dx3));
       }
 
       // Correct A3 at x1-faces, x2-faces, and x1x2-edges
@@ -627,7 +671,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
           (nghbr.d_view(m,23).lev > mblev.d_view(m) && i==ie+1 && j==je+1)) {
         Real xl = x3v + 0.25*dx3;
         Real xr = x3v - 0.25*dx3;
-        a3(m,k,j,i) = 0.5*(A3(trs, x1f,x2f,xl) + A3(trs, x1f,x2f,xr));
+        a3(m,k,j,i) = 0.5*(ErodedA3(trs, x1f,x2f,xl, 0.25*dx1, 0.25*dx2) +
+                           ErodedA3(trs, x1f,x2f,xr, 0.25*dx1, 0.25*dx2));
       }
     });
 
@@ -680,8 +725,18 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     const int nmkji = (pmbp->nmb_thispack)*indcs.nx3*indcs.nx2*indcs.nx1;
     const int nkji = indcs.nx3*indcs.nx2*indcs.nx1;
     const int nji  = indcs.nx2*indcs.nx1;
+    // The inclined seed on the thin disk is normalized as BBH.cpp normalizes it:
+    // potential_beta_min is the MINIMUM plasma beta 2p/b^2 over the disk's midplane body
+    // (NTDiskMidplaneBodyPressure), on the unperturbed support pressure.  The ratio of
+    // the in-disk maxima put max(b^2) of the open R^{-5/4} field in the inner taper,
+    // where the disk has been removed.  val = max b^2/p, loc = the radius it was found at.
+    const bool midplane_beta_norm = torus.potential_inclined && torus.use_nt_disk;
+    Kokkos::MaxLoc<Real, Real>::value_type midplane_peak;
+    midplane_peak.val = std::numeric_limits<Real>::lowest();
+    midplane_peak.loc = -1.0;
     Kokkos::parallel_reduce("torus_beta", Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
-    KOKKOS_LAMBDA(const int &idx, Real &max_bsq, Real &max_bsq_intorus) {
+    KOKKOS_LAMBDA(const int &idx, Real &max_bsq, Real &max_bsq_intorus,
+                  Kokkos::ValLocScalar<Real, Real> &mp_peak) {
       // compute m,k,j,i indices of thread and call function
       int m = (idx)/nkji;
       int k = (idx - m*nkji)/nji;
@@ -715,27 +770,29 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       Real cos_phi = cos(phi);
 
       // Account for tilt
-      Real sin_vartheta;
+      Real sin_vartheta, cos_vartheta;
       if (trs.psi != 0.0) {
         Real x = sin_theta * cos_phi;
         Real y = sin_theta * sin_phi;
         Real z = cos_theta;
         Real varx = trs.cos_psi * x - trs.sin_psi * z;
         Real vary = y;
+        Real varz = trs.sin_psi * x + trs.cos_psi * z;
         sin_vartheta = sqrt(SQR(varx) + SQR(vary));
+        cos_vartheta = varz;
       } else {
         sin_vartheta = fabs(sin_theta);
+        cos_vartheta = cos_theta;
       }
 
-      // Determine if we are in the torus
-      Real log_h;
-      bool in_torus = false;
-      if (r >= trs.r_edge) {
-        log_h = LogHAux(trs, r, sin_vartheta) - trs.log_h_edge;  // (FM 3.6)
-        if (log_h >= 0.0) {
-          in_torus = true;
-        }
-      }
+      // Determine if we are in the disk, by the disk's own density profile -- the
+      // Novikov-Thorne one when that is the disk, otherwise FM 3.6 / Chakrabarti, the
+      // same test the vector potential uses.  This gate is what the vertical field, and
+      // the inclined field on an equilibrium torus, are normalized on, and it must be
+      // the disk they thread, not the FM log h evaluated with a thin disk's parameters.
+      Real rho_disk = 0.0;
+      const bool in_torus = (r >= trs.r_edge) &&
+          TorusDensityForPotential(trs, r, sin_vartheta, cos_vartheta, &rho_disk);
 
       // Extract primitive velocity, magnetic field B^i, and gas pressure
       Real &wvx = w0_(m,IVX,k,j,i);
@@ -778,19 +835,60 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       if (in_torus) {
         max_bsq_intorus = fmax(bsq, max_bsq_intorus);
       }
-    }, Kokkos::Max<Real>(bsqmax), Kokkos::Max<Real>(bsqmax_intorus));
+      Real pgas_d = 0.0;
+      if (midplane_beta_norm && bsq > 0.0 &&
+          NTDiskMidplaneBodyPressure(trs, x1v, x2v, x3v, r, cos_vartheta,
+                                     size.d_view(m).dx3, &pgas_d) &&
+          bsq/pgas_d > mp_peak.val) {
+        mp_peak.val = bsq/pgas_d;
+        mp_peak.loc = r;
+      }
+    }, Kokkos::Max<Real>(bsqmax), Kokkos::Max<Real>(bsqmax_intorus),
+       Kokkos::MaxLoc<Real, Real>(midplane_peak));
 
 #if MPI_PARALLEL_ENABLED
     // get maximum value of gas pressure and bsq over all MPI ranks
     MPI_Allreduce(MPI_IN_PLACE, &ptotmax, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &bsqmax, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
     MPI_Allreduce(MPI_IN_PLACE, &bsqmax_intorus, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+    if (midplane_beta_norm) {
+      // MPI_MAX returns one of its inputs unchanged, so the rank owning the winning cell
+      // recognizes itself and the second reduction carries that cell's radius.
+      const Real local_peak = midplane_peak.val;
+      MPI_Allreduce(MPI_IN_PLACE, &midplane_peak.val, 1, MPI_DOUBLE, MPI_MAX,
+                    MPI_COMM_WORLD);
+      if (local_peak != midplane_peak.val) { midplane_peak.loc = -1.0; }
+      MPI_Allreduce(MPI_IN_PLACE, &midplane_peak.loc, 1, MPI_DOUBLE, MPI_MAX,
+                    MPI_COMM_WORLD);
+    }
 #endif
 
     // Apply renormalization of magnetic field
     Real bnorm = sqrt((ptotmax/(0.5*bsqmax))/torus.potential_beta_min);
-    // Since vertical field extends beyond torus, normalize based on values in torus
-    if (torus.is_vertical_field) {
+    if (midplane_beta_norm) {
+      if (!(isfinite(midplane_peak.val) && midplane_peak.val > 0.0) ||
+          !(isfinite(torus.potential_beta_min) && torus.potential_beta_min > 0.0)) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl
+                  << "The inclined seed sampled no midplane cell of the disk body "
+                  << "carrying field, so the disk's minimum plasma beta cannot be "
+                  << "set. Check that the disk lies inside the mesh and that the "
+                  << "mesh resolves its scale height."
+                  << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      // beta = 2 p / b^2, so the smallest midplane beta is 2/max(b^2/p), and scaling b
+      // by bnorm scales b^2 by bnorm^2.
+      bnorm = sqrt(2.0/(torus.potential_beta_min*midplane_peak.val));
+      if (global_variable::my_rank == 0) {
+        std::cout << "gr_torus inclined seed: minimum midplane beta before "
+                  << "normalization = " << 2.0/midplane_peak.val
+                  << " at r = " << midplane_peak.loc
+                  << ", bnorm = " << bnorm << std::endl;
+      }
+    } else if (torus.is_vertical_field || torus.potential_inclined) {
+      // Since vertical field extends beyond torus, normalize based on values in torus
+      // (the inclined large-scale field extends beyond it in exactly the same way)
       bnorm = sqrt((ptotmax/(0.5*bsqmax_intorus))/torus.potential_beta_min);
     }
 
@@ -833,593 +931,6 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   return;
 }
 
-namespace {
-
-//----------------------------------------------------------------------------------------
-// Function for calculating angular momentum variable l in Fishbone-Moncrief torus
-// Inputs:
-//   r: desired radius of pressure maximum
-// Outputs:
-//   returned value: l = u^t u_\phi such that pressure maximum occurs at r_peak
-// Notes:
-//   beware many different definitions of l abound; this is *not* -u_phi/u_t
-//   Harm has a similar function: lfish_calc() in init.c
-//     Harm's function assumes M = 1 and that corotation is desired
-//     it is equivalent to this, though seeing this requires much manipulation
-//   implements (3.8) from Fishbone & Moncrief 1976, ApJ 207 962
-//   assumes corotation
-
-KOKKOS_INLINE_FUNCTION
-static Real CalculateLFromRPeak(struct torus_pgen pgen, Real r) {
-  Real sgn = (pgen.prograde) ? 1.0 : -1.0;
-  Real num = sgn*(SQR(r*r) + SQR(pgen.spin*r) - 2.0*SQR(pgen.spin)*r)
-           - pgen.spin*(r*r - pgen.spin*pgen.spin)*sqrt(r);
-  Real denom = SQR(r) - 3.0*r + sgn*2.0*pgen.spin*sqrt(r);
-  return 1.0/r * sqrt(1.0/r) * num/denom;
-}
-
-
-//----------------------------------------------------------------------------------------
-// Function to calculate enthalpy in Fishbone-Moncrief torus or Chakrabarti torus
-// Inputs:
-//   r: radial Boyer-Lindquist coordinate
-//   sin_theta: sine of polar Boyer-Lindquist coordinate
-// Outputs:
-//   returned value: log(h)
-// Notes:
-//   enthalpy defined here as h = p_gas/rho
-//   references Fishbone & Moncrief 1976, ApJ 207 962 (FM)
-//   implements first half of (FM 3.6)
-//   references Chakrabarti, S. 1985, ApJ 288, 1
-
-KOKKOS_INLINE_FUNCTION
-static Real LogHAux(struct torus_pgen pgen, Real r, Real sin_theta) {
-  Real tol_trunc=1e-15;
-  Real logh;
-  if (pgen.fm_torus) {
-    Real sin_sq_theta = SQR(sin_theta);
-    Real cos_sq_theta = 1.0 - sin_sq_theta;
-    Real delta = SQR(r) - 2.0*r + SQR(pgen.spin);            // \Delta
-    Real sigma = SQR(r) + SQR(pgen.spin)*cos_sq_theta;       // \Sigma
-    Real aa = SQR(SQR(r)+SQR(pgen.spin)) - delta*SQR(pgen.spin)*sin_sq_theta;  // A
-    Real exp_2nu = sigma * delta / aa;                       // \exp(2\nu) (FM 3.5)
-    Real exp_2psi = aa / sigma * sin_sq_theta;               // \exp(2\psi) (FM 3.5)
-    Real exp_neg2chi = exp_2nu / exp_2psi;                   // \exp(-2\chi) (cf. FM 2.15)
-    Real omega = 2.0*pgen.spin*r/aa;                         // \omega (FM 3.5)
-    Real var_a = sqrt(1.0 + 4.0*SQR(pgen.l_peak)*exp_neg2chi);
-    Real var_b = 0.5 * log((1.0+var_a) / (sigma*delta/aa));
-    Real var_c = -0.5 * var_a;
-    Real var_d = -pgen.l_peak * omega;
-    logh = var_b + var_c + var_d;                            // (FM 3.4)
-  } else { // Chakrabarti
-    Real l = CalculateL(pgen, r, sin_theta);
-    Real u_t = CalculateCovariantUT(pgen, r, sin_theta, l);
-    Real l_edge = CalculateL(pgen, pgen.r_edge, 1.0);
-    Real u_t_edge = CalculateCovariantUT(pgen, pgen.r_edge, 1.0, l_edge);
-    Real h = u_t_edge/u_t;
-    if (pgen.n_param==1.0) {
-      h *= pow(l_edge/l, SQR(pgen.c_param)/(SQR(pgen.c_param)-1.0));
-    } else {
-      Real pow_c = 2.0/pgen.n_param;
-      Real pow_l = 2.0-2.0/pgen.n_param;
-      Real pow_abs = pgen.n_param/(2.0-2.0*pgen.n_param);
-      h *= (pow(fabs(1.0 - pow(pgen.c_param, pow_c)*pow(l   , pow_l)), pow_abs) *
-            pow(fabs(1.0 - pow(pgen.c_param, pow_c)*pow(l_edge, pow_l)), -1.0*pow_abs));
-    }
-    if (isfinite(h) && h >= 1.0) {
-      logh = log(h);
-    } else if (fabs(h-1.0) <= 1e-15) {
-      logh = 0.0;
-    } else {
-      logh = -1.0;
-    }
-  }
-  return logh;
-}
-
-//----------------------------------------------------------------------------------------
-// Function to calculate T for radiating runs, assuming pressure and temp equilibrium
-// Outputs:
-//   returned value: temperature (p_gas / rho)
-// Notes:
-//   equation has form b4 * T^4 + T + b0 = 0
-
-KOKKOS_INLINE_FUNCTION
-static Real CalculateT(struct torus_pgen pgen, Real rho, Real ptot_over_rho) {
-  // Calculate quartic coefficients
-  Real b4 = pgen.arad / (3.0 * rho);
-  Real b0 = -ptot_over_rho;
-
-  // Calculate real root of z^3 - 4*b0/b4 * z - 1/b4^2 = 0
-  Real delta1 = 0.25 - 64.0 * b0 * b0 * b0 * b4 / 27.0;
-  if (delta1 < 0.0) {
-    return 0.0;
-  }
-  delta1 = sqrt(delta1);
-  if (delta1 < 0.5) {
-    return 0.0;
-  }
-  Real zroot;
-  if (delta1 > 1.0e11) {  // to avoid small number cancellation
-    zroot = pow(delta1, -2.0/3.0) / 3.0;
-  } else {
-    zroot = pow(0.5 + delta1, 1.0/3.0) - pow(-0.5 + delta1, 1.0/3.0);
-  }
-  if (zroot < 0.0) {
-    return 0.0;
-  }
-  zroot *= pow(b4, -2.0/3.0);
-
-  // Calculate quartic root using cubic root
-  Real rcoef = sqrt(zroot);
-  Real delta2 = -zroot + 2.0 / (b4 * rcoef);
-  if (delta2 < 0.0) {
-    return 0.0;
-  }
-  delta2 = sqrt(delta2);
-  Real root = 0.5 * (delta2 - rcoef);
-  if (root < 0.0) {
-    return 0.0;
-  }
-  return root;
-}
-
-//----------------------------------------------------------------------------------------
-// Function for calculating c, n parameters controlling angular momentum profile
-// in Chakrabarti torus, where l = c * lambda^n. edited so that n can be pre-specified
-// such that the assumption of keplerian angular momentum at the inner edge is dropped
-
-KOKKOS_INLINE_FUNCTION
-static void CalculateCN(struct torus_pgen pgen, Real *cparam, Real *nparam) {
-  Real n_input = pgen.n_param;
-  Real nn; // slope of angular momentum profile
-  Real cc; // constant of angular momentum profile
-  Real l_edge = ((SQR(pgen.r_edge) + SQR(pgen.spin) - 2.0*pgen.spin*sqrt(pgen.r_edge))/
-                 (sqrt(pgen.r_edge)*(pgen.r_edge - 2.0) + pgen.spin));
-  Real l_peak = ((SQR(pgen.r_peak) + SQR(pgen.spin) - 2.0*pgen.spin*sqrt(pgen.r_peak))/
-                 (sqrt(pgen.r_peak)*(pgen.r_peak - 2.0) + pgen.spin));
-  Real lambda_edge = sqrt((l_edge*(-2.0*pgen.spin*l_edge + SQR(pgen.r_edge)*pgen.r_edge
-                                   + SQR(pgen.spin)*(2.0+pgen.r_edge)))/
-                          (2.0*pgen.spin + l_edge*(pgen.r_edge - 2.0)));
-  Real lambda_peak = sqrt((l_peak*(-2.0*pgen.spin*l_peak + SQR(pgen.r_peak)*pgen.r_peak
-                                   + SQR(pgen.spin)*(2.0+pgen.r_peak)))/
-                          (2.0*pgen.spin + l_peak*(pgen.r_peak - 2.0)));
-  if (n_input == 0.0) {
-    nn = log(l_peak/l_edge)/log(lambda_peak/lambda_edge);
-    cc = l_edge*pow(lambda_edge, -nn);
-  } else {
-    nn = n_input;
-    cc = l_peak*pow(lambda_peak, -nn);
-  }
-  *cparam = cc;
-  *nparam = nn;
-  return;
-}
-
-//----------------------------------------------------------------------------------------
-// Function for calculating l in Chakrabarti torus
-
-KOKKOS_INLINE_FUNCTION
-static Real CalculateL(struct torus_pgen pgen, Real r, Real sin_theta) {
-  // Compute BL metric components
-  Real sigma = SQR(r) + SQR(pgen.spin)*(1.0-SQR(sin_theta));
-  Real g_00 = -1.0 + 2.0*r/sigma;
-  Real g_03 = -2.0*pgen.spin*r/sigma*SQR(sin_theta);
-  Real g_33 = (SQR(r) + SQR(pgen.spin) +
-               2.0*SQR(pgen.spin)*r/sigma*SQR(sin_theta))*SQR(sin_theta);
-
-  // Perform bisection
-  Real l_min = 1.0;
-  Real l_max = 100.0;
-  Real l_val = 0.5*(l_min + l_max);
-  int max_iterations = 25;
-  Real tol_rel = 1.0e-8;
-  for (int n=0; n<max_iterations; ++n) {
-    Real error_rel = 0.5*(l_max - l_min)/l_val;
-    if (error_rel < tol_rel) {
-      break;
-    }
-    Real residual = pow(l_val/pgen.c_param, 2.0/pgen.n_param) +
-                    (l_val*g_33 + SQR(l_val)*g_03)/(g_03 + l_val*g_00);
-    if (residual < 0.0) {
-      l_min = l_val;
-      l_val = 0.5 * (l_min + l_max);
-    } else if (residual > 0.0) {
-      l_max = l_val;
-      l_val = 0.5 * (l_min + l_max);
-    } else if (residual == 0.0) {
-      break;
-    }
-  }
-  return l_val;
-}
-
-//----------------------------------------------------------------------------------------
-// Function to calculate time component of contravariant four velocity in BL
-// Inputs:
-//   r: radial Boyer-Lindquist coordinate
-//   sin_theta: sine of polar Boyer-Lindquist coordinate
-// Outputs:
-//   returned value: u_t
-
-KOKKOS_INLINE_FUNCTION
-static Real CalculateCovariantUT(struct torus_pgen pgen, Real r, Real sin_theta, Real l) {
-  // Compute BL metric components
-  Real sigma = SQR(r) + SQR(pgen.spin)*(1.0-SQR(sin_theta));
-  Real g_00 = -1.0 + 2.0*r/sigma;
-  Real g_03 = -2.0*pgen.spin*r/sigma*SQR(sin_theta);
-  Real g_33 = (SQR(r) + SQR(pgen.spin) +
-               2.0*SQR(pgen.spin)*r/sigma*SQR(sin_theta))*SQR(sin_theta);
-
-  // Compute time component of covariant BL 4-velocity
-  Real u_t = -sqrt(fmax((SQR(g_03) - g_00*g_33)/(g_33 + 2.0*l*g_03 + SQR(l)*g_00), 0.0));
-  return u_t;
-}
-
-//----------------------------------------------------------------------------------------
-// Function for returning corresponding Boyer-Lindquist coordinates of point
-// Inputs:
-//   x1,x2,x3: global coordinates to be converted
-// Outputs:
-//   pr,ptheta,pphi: variables pointed to set to Boyer-Lindquist coordinates
-
-KOKKOS_INLINE_FUNCTION
-static void GetBoyerLindquistCoordinates(struct torus_pgen pgen,
-                                         Real x1, Real x2, Real x3,
-                                         Real *pr, Real *ptheta, Real *pphi) {
-  Real rad = sqrt(SQR(x1) + SQR(x2) + SQR(x3));
-  Real r = fmax((sqrt( SQR(rad) - SQR(pgen.spin) + sqrt(SQR(SQR(rad)-SQR(pgen.spin))
-                      + 4.0*SQR(pgen.spin)*SQR(x3)) ) / sqrt(2.0)), 1.0);
-  *pr = r;
-  *ptheta = (fabs(x3/r) < 1.0) ? acos(x3/r) : acos(copysign(1.0, x3));
-  *pphi = atan2(r*x2-pgen.spin*x1, pgen.spin*x2+r*x1) -
-          pgen.spin*r/(SQR(r)-2.0*r+SQR(pgen.spin));
-  return;
-}
-
-//----------------------------------------------------------------------------------------
-// Function for computing 4-velocity components at a given position inside tilted torus
-// Inputs:
-//   r: Boyer-Lindquist r
-//   theta,phi: Boyer-Lindquist theta and phi in BH-aligned coordinates
-// Outputs:
-//   pu0,pu1,pu2,pu3: u^\mu set (Boyer-Lindquist coordinates)
-// Notes:
-//   first finds corresponding location in untilted torus
-//   next calculates velocity at that point in untilted case
-//   finally transforms that velocity into coordinates in which torus is tilted
-
-KOKKOS_INLINE_FUNCTION
-static void CalculateVelocityInTiltedTorus(struct torus_pgen pgen,
-                                           Real r, Real theta, Real phi, Real *pu0,
-                                           Real *pu1, Real *pu2, Real *pu3) {
-  // Calculate corresponding location
-  Real sin_theta = sin(theta);
-  Real cos_theta = cos(theta);
-  Real sin_phi = sin(phi);
-  Real cos_phi = cos(phi);
-  Real sin_vartheta, cos_vartheta, varphi;
-  if (pgen.psi != 0.0) {
-    Real x = sin_theta * cos_phi;
-    Real y = sin_theta * sin_phi;
-    Real z = cos_theta;
-    Real varx = pgen.cos_psi * x - pgen.sin_psi * z;
-    Real vary = y;
-    Real varz = pgen.sin_psi * x + pgen.cos_psi * z;
-    sin_vartheta = sqrt(SQR(varx) + SQR(vary));
-    cos_vartheta = varz;
-    varphi = atan2(vary, varx);
-  } else {
-    sin_vartheta = fabs(sin_theta);
-    cos_vartheta = cos_theta;
-    varphi = (sin_theta < 0.0) ? (phi - M_PI) : phi;
-  }
-  Real sin_varphi = sin(varphi);
-  Real cos_varphi = cos(varphi);
-
-  // Calculate untilted velocity
-  Real u0_tilt, u3_tilt;
-  CalculateVelocityInTorus(pgen, r, sin_vartheta, &u0_tilt, &u3_tilt);
-  Real u1_tilt = 0.0;
-  Real u2_tilt = 0.0;
-
-  // Account for tilt
-  *pu0 = u0_tilt;
-  *pu1 = u1_tilt;
-  if (pgen.psi != 0.0) {
-    Real dtheta_dvartheta =
-        (pgen.cos_psi * sin_vartheta
-         + pgen.sin_psi * cos_vartheta * cos_varphi) / sin_theta;
-    Real dtheta_dvarphi = -pgen.sin_psi * sin_vartheta * sin_varphi / sin_theta;
-    Real dphi_dvartheta = pgen.sin_psi * sin_varphi / SQR(sin_theta);
-    Real dphi_dvarphi = sin_vartheta / SQR(sin_theta)
-        * (pgen.cos_psi * sin_vartheta + pgen.sin_psi * cos_vartheta * cos_varphi);
-    *pu2 = dtheta_dvartheta * u2_tilt + dtheta_dvarphi * u3_tilt;
-    *pu3 = dphi_dvartheta * u2_tilt + dphi_dvarphi * u3_tilt;
-  } else {
-    *pu2 = u2_tilt;
-    *pu3 = u3_tilt;
-  }
-  if (sin_theta < 0.0) {
-    *pu2 *= -1.0;
-    *pu3 *= -1.0;
-  }
-  return;
-}
-
-//----------------------------------------------------------------------------------------
-// Function for computing 4-velocity components at a given position inside untilted disk
-// Inputs:
-//   r: Boyer-Lindquist r
-//   sin_theta: sine of Boyer-Lindquist theta
-// Outputs:
-//   pu0: u^t set (Boyer-Lindquist coordinates)
-//   pu3: u^\phi set (Boyer-Lindquist coordinates)
-// Notes:
-//   The formula for u^3 as a function of u_{(\phi)} is tedious to derive, but this
-//       matches the formula used in Harm (init.c).
-
-KOKKOS_INLINE_FUNCTION
-static void CalculateVelocityInTorus(struct torus_pgen pgen,
-                                    Real r, Real sin_theta, Real *pu0, Real *pu3) {
-  // Compute BL metric components
-  Real sin_sq_theta = SQR(sin_theta);
-  Real cos_sq_theta = 1.0 - sin_sq_theta;
-  Real delta = SQR(r) - 2.0*r + SQR(pgen.spin);              // \Delta
-  Real sigma = SQR(r) + SQR(pgen.spin)*cos_sq_theta;         // \Sigma
-  Real aa = SQR(SQR(r)+SQR(pgen.spin)) - delta*SQR(pgen.spin)*sin_sq_theta;  // A
-  Real g_00 = -(1.0 - 2.0*r/sigma); // g_tt
-  Real g_03 = -2.0*pgen.spin*r/sigma * sin_sq_theta; // g_tp
-  Real g_33 = (sigma + (1.0 + 2.0*r/sigma) *
-              SQR(pgen.spin) * sin_sq_theta) * sin_sq_theta; // g_pp
-  Real g00 = -aa/(delta*sigma); // g^tt
-  Real g03 = -2.0*pgen.spin*r/(delta*sigma); // g^tp
-
-  Real u0 = 0.0, u3 = 0.0;
-  // Compute non-zero components of 4-velocity
-  if (pgen.fm_torus) {
-    Real exp_2nu = sigma * delta / aa;                 // \exp(2\nu) (FM 3.5)
-    Real exp_2psi = aa / sigma * sin_sq_theta;         // \exp(2\psi) (FM 3.5)
-    Real exp_neg2chi = exp_2nu / exp_2psi;             // \exp(-2\chi) (cf. FM 2.15)
-    Real u_phi_proj_a = 1.0 + 4.0*SQR(pgen.l_peak)*exp_neg2chi;
-    Real u_phi_proj_b = -1.0 + sqrt(u_phi_proj_a);
-    Real u_phi_proj = sqrt(0.5 * u_phi_proj_b);        // (FM 3.3)
-    u_phi_proj *= (pgen.prograde) ? 1.0 : -1.0;
-    Real u3_a = (1.0+SQR(u_phi_proj)) / (aa*sigma*delta);
-    Real u3_b = 2.0*pgen.spin*r * sqrt(u3_a);
-    Real u3_c = sqrt(sigma/aa) / sin_theta;
-    u3 = u3_b + u3_c * u_phi_proj;
-    Real u0_a = (SQR(g_03) - g_00*g_33) * SQR(u3);
-    Real u0_b = sqrt(u0_a - g_00);
-    u0 = -1.0/g_00 * (g_03*u3 + u0_b);
-  } else { // Chakrabarti torus
-    Real l = CalculateL(pgen, r, sin_theta);
-    Real u_0 = CalculateCovariantUT(pgen, r, sin_theta, l); // u_t
-    Real omega = -(g_03 + l*g_00)/(g_33 + l*g_03);
-    u0 = (g00 - l*g03) * u_0; // u^t
-    u3 = omega * u0; // u^p
-  }
-  *pu0 = u0;
-  *pu3 = u3;
-  return;
-}
-
-//----------------------------------------------------------------------------------------
-// Function for transforming 4-vector from Boyer-Lindquist to desired coordinates
-// Inputs:
-//   a0_bl,a1_bl,a2_bl,a3_bl: upper 4-vector components in Boyer-Lindquist coordinates
-//   x1,x2,x3: Cartesian Kerr-Schild coordinates of point
-// Outputs:
-//   pa0,pa1,pa2,pa3: pointers to upper 4-vector components in desired coordinates
-// Notes:
-//   Schwarzschild coordinates match Boyer-Lindquist when a = 0
-
-KOKKOS_INLINE_FUNCTION
-static void TransformVector(struct torus_pgen pgen,
-                            Real a0_bl, Real a1_bl, Real a2_bl, Real a3_bl,
-                            Real x1, Real x2, Real x3,
-                            Real *pa0, Real *pa1, Real *pa2, Real *pa3) {
-  Real rad = sqrt( SQR(x1) + SQR(x2) + SQR(x3) );
-  Real r = fmax((sqrt( SQR(rad) - SQR(pgen.spin) + sqrt(SQR(SQR(rad)-SQR(pgen.spin))
-                      + 4.0*SQR(pgen.spin)*SQR(x3)) ) / sqrt(2.0)), 1.0);
-  Real delta = SQR(r) - 2.0*r + SQR(pgen.spin);
-  *pa0 = a0_bl + 2.0*r/delta * a1_bl;
-  *pa1 = a1_bl * ( (r*x1+pgen.spin*x2)/(SQR(r) + SQR(pgen.spin)) - x2*pgen.spin/delta) +
-         a2_bl * x1*x3/r * sqrt((SQR(r) + SQR(pgen.spin))/(SQR(x1) + SQR(x2))) -
-         a3_bl * x2;
-  *pa2 = a1_bl * ( (r*x2-pgen.spin*x1)/(SQR(r) + SQR(pgen.spin)) + x1*pgen.spin/delta) +
-         a2_bl * x2*x3/r * sqrt((SQR(r) + SQR(pgen.spin))/(SQR(x1) + SQR(x2))) +
-         a3_bl * x1;
-  *pa3 = a1_bl * x3/r -
-         a2_bl * r * sqrt((SQR(x1) + SQR(x2))/(SQR(r) + SQR(pgen.spin)));
-  return;
-}
-
-//----------------------------------------------------------------------------------------
-// Function for calculating vector potential in Spherical KS given CKS coordinates
-// Inputs:
-//   r,theta,phi spherical Boyer-Lindquist coordinates of point
-// Outputs:
-//   patheta,paphi: pointers to lower theta, phi components in desired coordinates
-
-KOKKOS_INLINE_FUNCTION
-static void CalculateVectorPotentialInTiltedTorus(struct torus_pgen pgen,
-                                                  Real r, Real theta, Real phi,
-                                                  Real *patheta, Real *paphi) {
-  // Find vector potential components, accounting for tilt
-  Real atheta = 0.0, aphi = 0.0;
-
-  Real sin_theta = sin(theta);
-  Real cos_theta = cos(theta);
-  Real sin_phi = sin(phi);
-  Real cos_phi = cos(phi);
-  Real sin_vartheta;
-
-  if (pgen.psi != 0.0) {
-    Real x = sin_theta * cos_phi;
-    Real y = sin_theta * sin_phi;
-    Real z = cos_theta;
-    Real varx = pgen.cos_psi * x - pgen.sin_psi * z;
-    Real vary = y;
-    sin_vartheta = sqrt(SQR(varx) + SQR(vary));
-  } else {
-    sin_vartheta = fabs(sin(theta));
-  }
-
-  if (pgen.is_vertical_field) {
-    // Determine if we are in the torus
-    Real rho;
-    Real gm1 = pgen.gamma_adi - 1.0;
-    bool in_torus = false;
-    Real log_h = LogHAux(pgen, r, sin_vartheta) - pgen.log_h_edge;  // (FM 3.6)
-    if (log_h >= 0.0) {
-      in_torus = true;
-      Real ptot_over_rho = gm1/pgen.gamma_adi * (exp(log_h) - 1.0);
-      rho = pow(ptot_over_rho, 1.0/gm1) / pgen.rho_peak;
-    }
-
-    // more-or-less vertical geometry but falling to zero on edges
-    Real cyl_radius = r * sin_vartheta;
-    Real rcyl_in = pgen.r_edge;
-    Real rcyl_falloff = pgen.potential_falloff;
-
-    Real aphi_tilt = pow(cyl_radius/rcyl_in, pgen.potential_r_pow);
-    if (pgen.potential_falloff != 0) {
-      aphi_tilt *= exp(-cyl_radius/rcyl_falloff);
-    }
-
-    Real aphi_offset = exp(-rcyl_in/rcyl_falloff);
-    if (cyl_radius < rcyl_in) {
-      aphi_tilt = 0.0;
-    } else {
-      aphi_tilt -= aphi_offset;
-    }
-
-    if (pgen.potential_rho_pow != 0) {
-      if (in_torus) {
-        aphi_tilt *= pow(rho/pgen.rho_max, pgen.potential_rho_pow);
-      } else {
-        aphi_tilt = 0.0;
-      }
-    }
-
-    if (pgen.psi != 0.0) {
-      Real dvarphi_dtheta = -pgen.sin_psi * sin_phi / SQR(sin_vartheta);
-      Real dvarphi_dphi = sin_theta / SQR(sin_vartheta)
-          * (pgen.cos_psi * sin_theta - pgen.sin_psi * cos_theta * cos_phi);
-      atheta = dvarphi_dtheta * aphi_tilt;
-      aphi = dvarphi_dphi * aphi_tilt;
-    } else {
-      atheta = 0.0;
-      aphi = aphi_tilt;
-    }
-
-  } else {
-    if (r >= pgen.r_edge) {
-      // Determine if we are in the torus
-      Real rho;
-      Real gm1 = pgen.gamma_adi-1.0;
-      bool in_torus = false;
-      Real log_h = LogHAux(pgen, r, sin_vartheta) - pgen.log_h_edge;  // (FM 3.6)
-      if (log_h >= 0.0) {
-        in_torus = true;
-        Real ptot_over_rho = gm1/pgen.gamma_adi * (exp(log_h) - 1.0);
-        rho = pow(ptot_over_rho, 1.0/gm1) / pgen.rho_peak;
-      }
-
-      Real aphi_tilt = 0.0;
-      if (in_torus) {
-        Real scaling_param = pow((r/pgen.r_edge)*sin_vartheta, pgen.potential_r_pow);
-        if (pgen.potential_falloff != 0) {
-          scaling_param *= exp(-r/pgen.potential_falloff);
-        }
-        aphi_tilt = pow(rho/pgen.rho_max, pgen.potential_rho_pow)*scaling_param;
-        aphi_tilt -= pgen.potential_cutoff;
-        aphi_tilt = fmax(aphi_tilt, 0.0);
-        if (pgen.psi != 0.0) {
-          Real dvarphi_dtheta = -pgen.sin_psi * sin_phi / SQR(sin_vartheta);
-          Real dvarphi_dphi = sin_theta / SQR(sin_vartheta)
-              * (pgen.cos_psi * sin_theta - pgen.sin_psi * cos_theta * cos_phi);
-          atheta = dvarphi_dtheta * aphi_tilt;
-          aphi = dvarphi_dphi * aphi_tilt;
-        } else {
-          atheta = 0.0;
-          aphi = aphi_tilt;
-        }
-      }
-    }
-  }
-
-  *patheta = atheta;
-  *paphi = aphi;
-
-  return;
-}
-//----------------------------------------------------------------------------------------
-// Function to compute 1-component of vector potential.  First computes phi-componenent
-// in spherical KS coordinates, then transforms to Cartesian KS
-
-KOKKOS_INLINE_FUNCTION
-Real A1(struct torus_pgen pgen, Real x1, Real x2, Real x3) {
-  // BL coordinates
-  Real r, theta, phi;
-  GetBoyerLindquistCoordinates(pgen, x1, x2, x3, &r, &theta, &phi);
-
-  // calculate vector potential in spherical KS
-  Real atheta, aphi;
-  CalculateVectorPotentialInTiltedTorus(pgen, r, theta, phi, &atheta, &aphi);
-
-  Real big_r = sqrt( SQR(x1) + SQR(x2) + SQR(x3) );
-  Real sqrt_term =  2.0*SQR(r) - SQR(big_r) + SQR(pgen.spin);
-  Real isin_term = sqrt((SQR(pgen.spin)+SQR(r))/fmax(SQR(x1)+SQR(x2),1.0e-12));
-
-  return atheta*(x1*x3*isin_term/(r*sqrt_term)) +
-         aphi*(-x2/(SQR(x1)+SQR(x2))+pgen.spin*x1*r/((SQR(pgen.spin)+SQR(r))*sqrt_term));
-}
-
-//----------------------------------------------------------------------------------------
-// Function to compute 2-component of vector potential. See comments for A1.
-
-KOKKOS_INLINE_FUNCTION
-Real A2(struct torus_pgen pgen, Real x1, Real x2, Real x3) {
-  // BL coordinates
-  Real r, theta, phi;
-  GetBoyerLindquistCoordinates(pgen, x1, x2, x3, &r, &theta, &phi);
-
-  // calculate vector potential in spherical KS
-  Real atheta, aphi;
-  CalculateVectorPotentialInTiltedTorus(pgen, r, theta, phi, &atheta, &aphi);
-
-  Real big_r = sqrt( SQR(x1) + SQR(x2) + SQR(x3) );
-  Real sqrt_term =  2.0*SQR(r) - SQR(big_r) + SQR(pgen.spin);
-  Real isin_term = sqrt((SQR(pgen.spin)+SQR(r))/fmax(SQR(x1)+SQR(x2),1.0e-12));
-
-  return atheta*(x2*x3*isin_term/(r*sqrt_term)) +
-         aphi*(x1/(SQR(x1)+SQR(x2))+pgen.spin*x2*r/((SQR(pgen.spin)+SQR(r))*sqrt_term));
-}
-
-//----------------------------------------------------------------------------------------
-// Function to compute 3-component of vector potential. See comments for A1.
-
-KOKKOS_INLINE_FUNCTION
-Real A3(struct torus_pgen pgen, Real x1, Real x2, Real x3) {
-  // BL coordinates
-  Real r, theta, phi;
-  GetBoyerLindquistCoordinates(pgen, x1, x2, x3, &r, &theta, &phi);
-
-  // calculate vector potential in spherical KS
-  Real atheta, aphi;
-  CalculateVectorPotentialInTiltedTorus(pgen, r, theta, phi, &atheta, &aphi);
-
-  Real big_r = sqrt( SQR(x1) + SQR(x2) + SQR(x3) );
-  Real sqrt_term =  2.0*SQR(r) - SQR(big_r) + SQR(pgen.spin);
-  Real isin_term = sqrt((SQR(pgen.spin)+SQR(r))/fmax(SQR(x1)+SQR(x2),1.0e-12));
-
-  return atheta*(((1.0+SQR(pgen.spin/r))*SQR(x3)-sqrt_term)*isin_term/(r*sqrt_term)) +
-         aphi*(pgen.spin*x3/(r*sqrt_term));
-}
-
-} // namespace
 
 //----------------------------------------------------------------------------------------
 //! \fn NoInflowTorus
@@ -1448,6 +959,24 @@ void NoInflowTorus(Mesh *pm) {
   }
   int nmb = pm->pmb_pack->nmb_thispack;
   int nvar = u0_.extent_int(1);
+  const int nwork = nmb;
+  if (nwork <= 0) return;
+
+  // Most LAT bins in a nested torus mesh contain only interior MeshBlocks.  Avoid the
+  // expensive GRMHD C2P/P2C boundary sequence for those bins, and identify the exact
+  // user faces so conversion kernels do not alter unrelated interior ghost zones.
+  std::array<bool, 6> active_user_face{};
+  for (int a=0; a<nwork; ++a) {
+    const int m = a;
+    for (int face=0; face<6; ++face) {
+      active_user_face[face] = active_user_face[face] ||
+          (mb_bcs.h_view(m,face) == BoundaryFlag::user);
+    }
+  }
+  if (std::none_of(active_user_face.begin(), active_user_face.end(),
+                   [](const bool active) { return active; })) {
+    return;
+  }
 
   // Determine if radiation is enabled
   const bool is_radiation_enabled = (pm->pmb_pack->prad != nullptr);
@@ -1458,11 +987,14 @@ void NoInflowTorus(Mesh *pm) {
   }
 
   // X1-Boundary
+  if (active_user_face[BoundaryFace::inner_x1] ||
+      active_user_face[BoundaryFace::outer_x1]) {
   // Set X1-BCs on b0 if Meshblock face is at the edge of computational domain
   if (pm->pmb_pack->pmhd != nullptr) {
     auto &b0 = pm->pmb_pack->pmhd->b0;
-    par_for("noinflow_field_x1", DevExeSpace(),0,(nmb-1),0,(n3-1),0,(n2-1),
-    KOKKOS_LAMBDA(int m, int k, int j) {
+    par_for("noinflow_field_x1", DevExeSpace(),0,(nwork-1),0,(n3-1),0,(n2-1),
+    KOKKOS_LAMBDA(int a, int k, int j) {
+      const int m = a;
       if (mb_bcs.d_view(m,BoundaryFace::inner_x1) == BoundaryFlag::user) {
         for (int i=0; i<ng; ++i) {
           b0.x1f(m,k,j,is-i-1) = b0.x1f(m,k,j,is);
@@ -1484,19 +1016,35 @@ void NoInflowTorus(Mesh *pm) {
     });
   }
   // ConsToPrim over all X1 ghost zones *and* at the innermost/outermost X1-active zones
-  // of Meshblocks, even if Meshblock face is not at the edge of computational domain
+  // of MeshBlocks carrying the corresponding user boundary face.
   if (pm->pmb_pack->phydro != nullptr) {
-    pm->pmb_pack->phydro->peos->ConsToPrim(u0_,w0_,false,is-ng,is,0,(n2-1),0,(n3-1));
-    pm->pmb_pack->phydro->peos->ConsToPrim(u0_,w0_,false,ie,ie+ng,0,(n2-1),0,(n3-1));
+    if (active_user_face[BoundaryFace::inner_x1]) {
+      pm->pmb_pack->phydro->peos->ConsToPrim(
+          u0_,w0_,false,is-ng,is,0,(n2-1),0,(n3-1));
+    }
+    if (active_user_face[BoundaryFace::outer_x1]) {
+      pm->pmb_pack->phydro->peos->ConsToPrim(
+          u0_,w0_,false,ie,ie+ng,0,(n2-1),0,(n3-1));
+    }
   } else if (pm->pmb_pack->pmhd != nullptr) {
     auto &b0 = pm->pmb_pack->pmhd->b0;
     auto &bcc = pm->pmb_pack->pmhd->bcc0;
-    pm->pmb_pack->pmhd->peos->ConsToPrim(u0_,b0,w0_,bcc,false,is-ng,is,0,(n2-1),0,(n3-1));
-    pm->pmb_pack->pmhd->peos->ConsToPrim(u0_,b0,w0_,bcc,false,ie,ie+ng,0,(n2-1),0,(n3-1));
+    auto *peos = pm->pmb_pack->pmhd->peos;
+    if (active_user_face[BoundaryFace::inner_x1]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::inner_x1);
+      peos->ConsToPrim(u0_,b0,w0_,bcc,false,is-ng,is,0,(n2-1),0,(n3-1));
+      peos->ClearUserBoundaryFaceFilter();
+    }
+    if (active_user_face[BoundaryFace::outer_x1]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::outer_x1);
+      peos->ConsToPrim(u0_,b0,w0_,bcc,false,ie,ie+ng,0,(n2-1),0,(n3-1));
+      peos->ClearUserBoundaryFaceFilter();
+    }
   }
   // Set X1-BCs on w0 if Meshblock face is at the edge of computational domain
-  par_for("noinflow_hydro_x1", DevExeSpace(),0,(nmb-1),0,(nvar-1),0,(n3-1),0,(n2-1),
-  KOKKOS_LAMBDA(int m, int n, int k, int j) {
+  par_for("noinflow_hydro_x1", DevExeSpace(),0,(nwork-1),0,(nvar-1),0,(n3-1),0,(n2-1),
+  KOKKOS_LAMBDA(int a, int n, int k, int j) {
+    const int m = a;
     if (mb_bcs.d_view(m,BoundaryFace::inner_x1) == BoundaryFlag::user) {
       for (int i=0; i<ng; ++i) {
         if (n==(IVX)) {
@@ -1534,20 +1082,39 @@ void NoInflowTorus(Mesh *pm) {
   }
   // PrimToCons on X1 ghost zones
   if (pm->pmb_pack->phydro != nullptr) {
-    pm->pmb_pack->phydro->peos->PrimToCons(w0_,u0_,is-ng,is-1,0,(n2-1),0,(n3-1));
-    pm->pmb_pack->phydro->peos->PrimToCons(w0_,u0_,ie+1,ie+ng,0,(n2-1),0,(n3-1));
+    if (active_user_face[BoundaryFace::inner_x1]) {
+      pm->pmb_pack->phydro->peos->PrimToCons(
+          w0_,u0_,is-ng,is-1,0,(n2-1),0,(n3-1));
+    }
+    if (active_user_face[BoundaryFace::outer_x1]) {
+      pm->pmb_pack->phydro->peos->PrimToCons(
+          w0_,u0_,ie+1,ie+ng,0,(n2-1),0,(n3-1));
+    }
   } else if (pm->pmb_pack->pmhd != nullptr) {
     auto &bcc0_ = pm->pmb_pack->pmhd->bcc0;
-    pm->pmb_pack->pmhd->peos->PrimToCons(w0_,bcc0_,u0_,is-ng,is-1,0,(n2-1),0,(n3-1));
-    pm->pmb_pack->pmhd->peos->PrimToCons(w0_,bcc0_,u0_,ie+1,ie+ng,0,(n2-1),0,(n3-1));
+    auto *peos = pm->pmb_pack->pmhd->peos;
+    if (active_user_face[BoundaryFace::inner_x1]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::inner_x1);
+      peos->PrimToCons(w0_,bcc0_,u0_,is-ng,is-1,0,(n2-1),0,(n3-1));
+      peos->ClearUserBoundaryFaceFilter();
+    }
+    if (active_user_face[BoundaryFace::outer_x1]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::outer_x1);
+      peos->PrimToCons(w0_,bcc0_,u0_,ie+1,ie+ng,0,(n2-1),0,(n3-1));
+      peos->ClearUserBoundaryFaceFilter();
+    }
+  }
   }
 
   // X2-Boundary
+  if (active_user_face[BoundaryFace::inner_x2] ||
+      active_user_face[BoundaryFace::outer_x2]) {
   // Set X2-BCs on b0 if Meshblock face is at the edge of computational domain
   if (pm->pmb_pack->pmhd != nullptr) {
     auto &b0 = pm->pmb_pack->pmhd->b0;
-    par_for("noinflow_field_x2", DevExeSpace(),0,(nmb-1),0,(n3-1),0,(n1-1),
-    KOKKOS_LAMBDA(int m, int k, int i) {
+    par_for("noinflow_field_x2", DevExeSpace(),0,(nwork-1),0,(n3-1),0,(n1-1),
+    KOKKOS_LAMBDA(int a, int k, int i) {
+      const int m = a;
       if (mb_bcs.d_view(m,BoundaryFace::inner_x2) == BoundaryFlag::user) {
         for (int j=0; j<ng; ++j) {
           b0.x1f(m,k,js-j-1,i) = b0.x1f(m,k,js,i);
@@ -1569,19 +1136,35 @@ void NoInflowTorus(Mesh *pm) {
     });
   }
   // ConsToPrim over all X2 ghost zones *and* at the innermost/outermost X2-active zones
-  // of Meshblocks, even if Meshblock face is not at the edge of computational domain
+  // of MeshBlocks carrying the corresponding user boundary face.
   if (pm->pmb_pack->phydro != nullptr) {
-    pm->pmb_pack->phydro->peos->ConsToPrim(u0_,w0_,false,0,(n1-1),js-ng,js,0,(n3-1));
-    pm->pmb_pack->phydro->peos->ConsToPrim(u0_,w0_,false,0,(n1-1),je,je+ng,0,(n3-1));
+    if (active_user_face[BoundaryFace::inner_x2]) {
+      pm->pmb_pack->phydro->peos->ConsToPrim(
+          u0_,w0_,false,0,(n1-1),js-ng,js,0,(n3-1));
+    }
+    if (active_user_face[BoundaryFace::outer_x2]) {
+      pm->pmb_pack->phydro->peos->ConsToPrim(
+          u0_,w0_,false,0,(n1-1),je,je+ng,0,(n3-1));
+    }
   } else if (pm->pmb_pack->pmhd != nullptr) {
     auto &b0 = pm->pmb_pack->pmhd->b0;
     auto &bcc = pm->pmb_pack->pmhd->bcc0;
-    pm->pmb_pack->pmhd->peos->ConsToPrim(u0_,b0,w0_,bcc,false,0,(n1-1),js-ng,js,0,(n3-1));
-    pm->pmb_pack->pmhd->peos->ConsToPrim(u0_,b0,w0_,bcc,false,0,(n1-1),je,je+ng,0,(n3-1));
+    auto *peos = pm->pmb_pack->pmhd->peos;
+    if (active_user_face[BoundaryFace::inner_x2]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::inner_x2);
+      peos->ConsToPrim(u0_,b0,w0_,bcc,false,0,(n1-1),js-ng,js,0,(n3-1));
+      peos->ClearUserBoundaryFaceFilter();
+    }
+    if (active_user_face[BoundaryFace::outer_x2]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::outer_x2);
+      peos->ConsToPrim(u0_,b0,w0_,bcc,false,0,(n1-1),je,je+ng,0,(n3-1));
+      peos->ClearUserBoundaryFaceFilter();
+    }
   }
   // Set X2-BCs on w0 if Meshblock face is at the edge of computational domain
-  par_for("noinflow_hydro_x2", DevExeSpace(),0,(nmb-1),0,(nvar-1),0,(n3-1),0,(n1-1),
-  KOKKOS_LAMBDA(int m, int n, int k, int i) {
+  par_for("noinflow_hydro_x2", DevExeSpace(),0,(nwork-1),0,(nvar-1),0,(n3-1),0,(n1-1),
+  KOKKOS_LAMBDA(int a, int n, int k, int i) {
+    const int m = a;
     if (mb_bcs.d_view(m,BoundaryFace::inner_x2) == BoundaryFlag::user) {
       for (int j=0; j<ng; ++j) {
         if (n==(IVY)) {
@@ -1619,20 +1202,39 @@ void NoInflowTorus(Mesh *pm) {
   }
   // PrimToCons on X2 ghost zones
   if (pm->pmb_pack->phydro != nullptr) {
-    pm->pmb_pack->phydro->peos->PrimToCons(w0_,u0_,0,(n1-1),js-ng,js-1,0,(n3-1));
-    pm->pmb_pack->phydro->peos->PrimToCons(w0_,u0_,0,(n1-1),je+1,je+ng,0,(n3-1));
+    if (active_user_face[BoundaryFace::inner_x2]) {
+      pm->pmb_pack->phydro->peos->PrimToCons(
+          w0_,u0_,0,(n1-1),js-ng,js-1,0,(n3-1));
+    }
+    if (active_user_face[BoundaryFace::outer_x2]) {
+      pm->pmb_pack->phydro->peos->PrimToCons(
+          w0_,u0_,0,(n1-1),je+1,je+ng,0,(n3-1));
+    }
   } else if (pm->pmb_pack->pmhd != nullptr) {
     auto &bcc0_ = pm->pmb_pack->pmhd->bcc0;
-    pm->pmb_pack->pmhd->peos->PrimToCons(w0_,bcc0_,u0_,0,(n1-1),js-ng,js-1,0,(n3-1));
-    pm->pmb_pack->pmhd->peos->PrimToCons(w0_,bcc0_,u0_,0,(n1-1),je+1,je+ng,0,(n3-1));
+    auto *peos = pm->pmb_pack->pmhd->peos;
+    if (active_user_face[BoundaryFace::inner_x2]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::inner_x2);
+      peos->PrimToCons(w0_,bcc0_,u0_,0,(n1-1),js-ng,js-1,0,(n3-1));
+      peos->ClearUserBoundaryFaceFilter();
+    }
+    if (active_user_face[BoundaryFace::outer_x2]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::outer_x2);
+      peos->PrimToCons(w0_,bcc0_,u0_,0,(n1-1),je+1,je+ng,0,(n3-1));
+      peos->ClearUserBoundaryFaceFilter();
+    }
+  }
   }
 
   // X3-Boundary
+  if (active_user_face[BoundaryFace::inner_x3] ||
+      active_user_face[BoundaryFace::outer_x3]) {
   // Set X3-BCs on b0 if Meshblock face is at the edge of computational domain
   if (pm->pmb_pack->pmhd != nullptr) {
     auto &b0 = pm->pmb_pack->pmhd->b0;
-    par_for("noinflow_field_x3", DevExeSpace(),0,(nmb-1),0,(n2-1),0,(n1-1),
-    KOKKOS_LAMBDA(int m, int j, int i) {
+    par_for("noinflow_field_x3", DevExeSpace(),0,(nwork-1),0,(n2-1),0,(n1-1),
+    KOKKOS_LAMBDA(int a, int j, int i) {
+      const int m = a;
       if (mb_bcs.d_view(m,BoundaryFace::inner_x3) == BoundaryFlag::user) {
         for (int k=0; k<ng; ++k) {
           b0.x1f(m,ks-k-1,j,i) = b0.x1f(m,ks,j,i);
@@ -1654,19 +1256,35 @@ void NoInflowTorus(Mesh *pm) {
     });
   }
   // ConsToPrim over all X3 ghost zones *and* at the innermost/outermost X3-active zones
-  // of Meshblocks, even if Meshblock face is not at the edge of computational domain
+  // of MeshBlocks carrying the corresponding user boundary face.
   if (pm->pmb_pack->phydro != nullptr) {
-    pm->pmb_pack->phydro->peos->ConsToPrim(u0_,w0_,false,0,(n1-1),0,(n2-1),ks-ng,ks);
-    pm->pmb_pack->phydro->peos->ConsToPrim(u0_,w0_,false,0,(n1-1),0,(n2-1),ke,ke+ng);
+    if (active_user_face[BoundaryFace::inner_x3]) {
+      pm->pmb_pack->phydro->peos->ConsToPrim(
+          u0_,w0_,false,0,(n1-1),0,(n2-1),ks-ng,ks);
+    }
+    if (active_user_face[BoundaryFace::outer_x3]) {
+      pm->pmb_pack->phydro->peos->ConsToPrim(
+          u0_,w0_,false,0,(n1-1),0,(n2-1),ke,ke+ng);
+    }
   } else if (pm->pmb_pack->pmhd != nullptr) {
     auto &b0 = pm->pmb_pack->pmhd->b0;
     auto &bcc = pm->pmb_pack->pmhd->bcc0;
-    pm->pmb_pack->pmhd->peos->ConsToPrim(u0_,b0,w0_,bcc,false,0,(n1-1),0,(n2-1),ks-ng,ks);
-    pm->pmb_pack->pmhd->peos->ConsToPrim(u0_,b0,w0_,bcc,false,0,(n1-1),0,(n2-1),ke,ke+ng);
+    auto *peos = pm->pmb_pack->pmhd->peos;
+    if (active_user_face[BoundaryFace::inner_x3]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::inner_x3);
+      peos->ConsToPrim(u0_,b0,w0_,bcc,false,0,(n1-1),0,(n2-1),ks-ng,ks);
+      peos->ClearUserBoundaryFaceFilter();
+    }
+    if (active_user_face[BoundaryFace::outer_x3]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::outer_x3);
+      peos->ConsToPrim(u0_,b0,w0_,bcc,false,0,(n1-1),0,(n2-1),ke,ke+ng);
+      peos->ClearUserBoundaryFaceFilter();
+    }
   }
   // Set X3-BCs on w0 if Meshblock face is at the edge of computational domain
-  par_for("noinflow_hydro_x3", DevExeSpace(),0,(nmb-1),0,(nvar-1),0,(n2-1),0,(n1-1),
-  KOKKOS_LAMBDA(int m, int n, int j, int i) {
+  par_for("noinflow_hydro_x3", DevExeSpace(),0,(nwork-1),0,(nvar-1),0,(n2-1),0,(n1-1),
+  KOKKOS_LAMBDA(int a, int n, int j, int i) {
+    const int m = a;
     if (mb_bcs.d_view(m,BoundaryFace::inner_x3) == BoundaryFlag::user) {
       for (int k=0; k<ng; ++k) {
         if (n==(IVZ)) {
@@ -1704,12 +1322,28 @@ void NoInflowTorus(Mesh *pm) {
   }
   // PrimToCons on X3 ghost zones
   if (pm->pmb_pack->phydro != nullptr) {
-    pm->pmb_pack->phydro->peos->PrimToCons(w0_,u0_,0,(n1-1),0,(n2-1),ks-ng,ks-1);
-    pm->pmb_pack->phydro->peos->PrimToCons(w0_,u0_,0,(n1-1),0,(n2-1),ke+1,ke+ng);
+    if (active_user_face[BoundaryFace::inner_x3]) {
+      pm->pmb_pack->phydro->peos->PrimToCons(
+          w0_,u0_,0,(n1-1),0,(n2-1),ks-ng,ks-1);
+    }
+    if (active_user_face[BoundaryFace::outer_x3]) {
+      pm->pmb_pack->phydro->peos->PrimToCons(
+          w0_,u0_,0,(n1-1),0,(n2-1),ke+1,ke+ng);
+    }
   } else if (pm->pmb_pack->pmhd != nullptr) {
     auto &bcc0_ = pm->pmb_pack->pmhd->bcc0;
-    pm->pmb_pack->pmhd->peos->PrimToCons(w0_,bcc0_,u0_,0,(n1-1),0,(n2-1),ks-ng,ks-1);
-    pm->pmb_pack->pmhd->peos->PrimToCons(w0_,bcc0_,u0_,0,(n1-1),0,(n2-1),ke+1,ke+ng);
+    auto *peos = pm->pmb_pack->pmhd->peos;
+    if (active_user_face[BoundaryFace::inner_x3]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::inner_x3);
+      peos->PrimToCons(w0_,bcc0_,u0_,0,(n1-1),0,(n2-1),ks-ng,ks-1);
+      peos->ClearUserBoundaryFaceFilter();
+    }
+    if (active_user_face[BoundaryFace::outer_x3]) {
+      peos->SetUserBoundaryFaceFilter(BoundaryFace::outer_x3);
+      peos->PrimToCons(w0_,bcc0_,u0_,0,(n1-1),0,(n2-1),ke+1,ke+ng);
+      peos->ClearUserBoundaryFaceFilter();
+    }
+  }
   }
 
   return;
@@ -1729,7 +1363,7 @@ void TorusFluxes(HistoryData *pdata, Mesh *pm) {
   int nvars; Real gamma; bool is_mhd = false;
   DvceArray5D<Real> w0_, bcc0_;
   if (pmbp->phydro != nullptr) {
-    nvars = pmbp->phydro->nhydro + pmbp->phydro->nscalars;
+    nvars = pmbp->phydro->nvars;
     gamma = pmbp->phydro->peos->eos_data.gamma;
     w0_ = pmbp->phydro->w0;
   } else if (pmbp->pmhd != nullptr) {

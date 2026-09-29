@@ -5,7 +5,9 @@
 //========================================================================================
 //! \file dyngr.cpp
 //! \brief implementation of functions for DynGRMHD and DynGRMHDPS controlling the task
-//! list
+//! list.  The DynGRMHDPS members are in dyn_grmhd_ps_impl.hpp and
+//! dyn_grmhd_coord_terms_impl.hpp, compiled per EOS policy by the dyn_grmhd_ps_<eos>.cpp
+//! and dyn_grmhd_coord_terms_ideal.cpp units.
 
 #include <math.h>
 
@@ -17,6 +19,7 @@
 #include "athena.hpp"
 #include "globals.hpp"
 #include "parameter_input.hpp"
+#include "pgen/pgen.hpp"
 #include "tasklist/task_list.hpp"
 #include "mesh/mesh.hpp"
 #include "eos/eos.hpp"
@@ -37,6 +40,71 @@
 #include "eos/primitive-solver/reset_floor.hpp"
 
 namespace dyngr {
+
+namespace {
+
+bool OutputVariableRequested(ParameterInput *pin, const std::string &name) {
+  for (auto &block : pin->block) {
+    if (block.block_name.compare(0, 6, "output") != 0) {
+      continue;
+    }
+    InputLine *line = block.GetPtrToLine("variable");
+    if (line != nullptr && line->param_value == name) {
+      return true;
+    }
+    line = block.GetPtrToLine("variable_2");
+    if (line != nullptr && line->param_value == name) {
+      return true;
+    }
+  }
+  return false;
+}
+
+//! \brief An inclusive index box.  Degenerate directions carry (0,0), the convention
+//! every other index range in this file uses.
+struct InteriorC2PBox {
+  int il, iu, jl, ju, kl, ku;
+};
+
+//! \brief The active region shrunk by `depth` layers on every evolved direction.
+//! Depth 0 is the active region itself, which is what the LAT ghost refresh uses.
+InteriorC2PBox MakeInteriorC2PBox(const RegionIndcs &indcs, int depth) {
+  InteriorC2PBox b;
+  b.il = indcs.is + depth;
+  b.iu = indcs.ie - depth;
+  b.jl = (indcs.nx2 > 1) ? (indcs.js + depth) : 0;
+  b.ju = (indcs.nx2 > 1) ? (indcs.je - depth) : 0;
+  b.kl = (indcs.nx3 > 1) ? (indcs.ks + depth) : 0;
+  b.ku = (indcs.nx3 > 1) ? (indcs.ke - depth) : 0;
+  return b;
+}
+
+//! \brief Recover primitives on the complement of `b` inside the full ghost-inclusive
+//! extent, as six disjoint bands (two x3 slabs, two x2 bands, two x1 bands) that cover
+//! the complement exactly.  Exactness matters both ways: a missed cell is stale, and a
+//! cell recovered twice is not a no-op either, because ConsToPrim writes floored or
+//! limited states back into u0.  Shared by the LAT ghost refresh (b = the active region)
+//! and by the late half of the interior-first split (b = the deep interior) so the two
+//! decompositions cannot drift apart.
+void ConToPrimComplementOfBox(DynGRMHD *pdyn, const RegionIndcs &indcs,
+                              const InteriorC2PBox &b) {
+  const int ng = indcs.ng;
+  const int n1m1 = indcs.nx1 + 2*ng - 1;
+  const int n2m1 = (indcs.nx2 > 1) ? (indcs.nx2 + 2*ng - 1) : 0;
+  const int n3m1 = (indcs.nx3 > 1) ? (indcs.nx3 + 2*ng - 1) : 0;
+  if (indcs.nx3 > 1) {
+    pdyn->ConToPrimBC(0, n1m1, 0, n2m1, 0, b.kl-1);
+    pdyn->ConToPrimBC(0, n1m1, 0, n2m1, b.ku+1, n3m1);
+  }
+  if (indcs.nx2 > 1) {
+    pdyn->ConToPrimBC(0, n1m1, 0, b.jl-1, b.kl, b.ku);
+    pdyn->ConToPrimBC(0, n1m1, b.ju+1, n2m1, b.kl, b.ku);
+  }
+  pdyn->ConToPrimBC(0, b.il-1, b.jl, b.ju, b.kl, b.ku);
+  pdyn->ConToPrimBC(b.iu+1, n1m1, b.jl, b.ju, b.kl, b.ku);
+}
+
+} // namespace
 
 // A dumb template function containing the switch statement needed to select an EOS.
 template<class ErrorPolicy>
@@ -120,19 +188,29 @@ DynGRMHD* BuildDynGRMHD(MeshBlockPack *ppack, ParameterInput *pin) {
 
 DynGRMHD::DynGRMHD(MeshBlockPack *pp, ParameterInput *pin) :
     temperature("temperature",1,1,1,1,1),
-    pmy_pack(pp) {
+    pmy_pack(pp),
+    store_temperature(false),
+    fofc_eos_min_y("fofc_eos_min_y", 1),
+    fofc_eos_max_y("fofc_eos_max_y", 1) {
   std::string rsolver = pin->GetString("mhd", "rsolver");
   if (rsolver.compare("llf") == 0) {
     rsolver_method = DynGRMHD_RSolver::llf_dyngr;
   } else if (rsolver.compare("hlle") == 0) {
     rsolver_method = DynGRMHD_RSolver::hlle_dyngr;
+  } else if (rsolver.compare("hlld") == 0) {
+    rsolver_method = DynGRMHD_RSolver::hlld_dyngr;
   } else {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "<mhd> rsolver = '" << rsolver
               << "' not implemented for GR dynamics" << std::endl;
     std::exit(EXIT_FAILURE);
   }
-  std::string fofc = pin->GetOrAddString("mhd", "fofc_method", "llf");
+  // The first-order corrector is the flux used at FOFC-flagged and excised faces only.
+  // Absent the key it is the corrector every dyn-GR deck has actually run: llf under
+  // rsolver = llf, hlle under everything else (hlld included).
+  const char *fofc_default =
+      (rsolver_method == DynGRMHD_RSolver::llf_dyngr) ? "llf" : "hlle";
+  std::string fofc = pin->GetOrAddString("mhd", "fofc_method", fofc_default);
   if (fofc.compare("llf") == 0) {
     fofc_method = DynGRMHD_RSolver::llf_dyngr;
   } else if (fofc.compare("hlle") == 0) {
@@ -140,7 +218,8 @@ DynGRMHD::DynGRMHD(MeshBlockPack *pp, ParameterInput *pin) :
   } else {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl << "<mhd> fofc_method = '" << fofc
-              << "' not implemented for FOFC" << std::endl;
+              << "' is not a first-order corrector; it must be 'llf' or 'hlle' "
+              << "(hlld is a five-wave solver, not a first-order flux)" << std::endl;
     std::exit(EXIT_FAILURE);
   }
   scratch_level = pin->GetOrAddInteger("mhd", "dyn_scratch", 0);
@@ -150,200 +229,26 @@ DynGRMHD::DynGRMHD(MeshBlockPack *pp, ParameterInput *pin) :
 
   fixed_evolution = pin->GetOrAddBoolean("mhd", "fixed", false);
 
-  // allocate memory for temperature
-  {
+  const bool temperature_output_requested =
+      OutputVariableRequested(pin, "mhd_t") ||
+      OutputVariableRequested(pin, "mhd_w") ||
+      OutputVariableRequested(pin, "mhd_w_bcc");
+  const std::string dyn_eos = pin->GetString("mhd", "dyn_eos");
+  store_temperature = temperature_output_requested && dyn_eos != "ideal";
+
+  if (store_temperature) {
     int nmb = std::max((pmy_pack->nmb_thispack), (pmy_pack->pmesh->nmb_maxperrank));
     auto &indcs = pmy_pack->pmesh->mb_indcs;
     int ncells1 = indcs.nx1 + 2*(indcs.ng);
     int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
     int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
     Kokkos::realloc(temperature, nmb, 1, ncells3, ncells2, ncells1);
+  } else {
+    Kokkos::resize(temperature, 1, 1, 1, 1, 1);
   }
 }
 
 DynGRMHD::~DynGRMHD() {
-}
-
-template<class EOSPolicy, class ErrorPolicy>
-void DynGRMHDPS<EOSPolicy, ErrorPolicy>::QueueDynGRMHDTasks() {
-  using namespace mhd;  // NOLINT(build/namespaces)
-  using namespace z4c;  // NOLINT(build/namespaces)
-  using namespace numrel; // NOLINT(build/namespaces))
-  Z4c *pz4c = pmy_pack->pz4c;
-  adm::ADM *padm = pmy_pack->padm;
-  MHD *pmhd = pmy_pack->pmhd;
-  NumericalRelativity *pnr = pmy_pack->pnr;
-
-  // Start task list
-  pnr->QueueTask(&MHD::InitRecv, pmhd, MHD_Recv, "MHD_Recv", Task_Start);
-
-  // Run task list
-  pnr->QueueTask(&MHD::CopyCons, pmhd, MHD_CopyU, "MHD_CopyU", Task_Run);
-
-  // Select which CalculateFlux function to add based on rsolver_method.
-  // CalcFlux requires metric in flux - must happen before z4ctoadm updates the metric
-  if (rsolver_method == DynGRMHD_RSolver::llf_dyngr) {
-    pnr->QueueTask(
-           &DynGRMHDPS<EOSPolicy, ErrorPolicy>::CalcFluxes<DynGRMHD_RSolver::llf_dyngr>,
-           this, MHD_Flux, "MHD_Flux", Task_Run, {MHD_CopyU});
-  } else if (rsolver_method == DynGRMHD_RSolver::hlle_dyngr) {
-    pnr->QueueTask(
-           &DynGRMHDPS<EOSPolicy, ErrorPolicy>::CalcFluxes<DynGRMHD_RSolver::hlle_dyngr>,
-           this, MHD_Flux, "MHD_Flux", Task_Run, {MHD_CopyU});
-  } else { // put more rsolvers here
-    abort();
-  }
-
-  // Now the rest of the MHD run tasks
-  if (pz4c != nullptr) {
-    pnr->QueueTask(&DynGRMHD::SetTmunu, this, MHD_SetTmunu, "MHD_SetTmunu",
-                   Task_Run, {MHD_CopyU});
-  }
-  pnr->QueueTask(&MHD::SendFlux, pmhd, MHD_SendFlux, "MHD_SendFlux",
-                 Task_Run, {MHD_Flux});
-  pnr->QueueTask(&MHD::RecvFlux, pmhd, MHD_RecvFlux, "MHD_RecvFlux",
-                 Task_Run, {MHD_SendFlux});
-  if (pz4c != nullptr) {
-    pnr->QueueTask(&MHD::RKUpdate, pmhd, MHD_ExplRK, "MHD_ExplRK", Task_Run,
-                   {MHD_RecvFlux, MHD_SetTmunu});
-  } else {
-    pnr->QueueTask(&MHD::RKUpdate, pmhd, MHD_ExplRK, "MHD_ExplRK", Task_Run,
-                   {MHD_RecvFlux});
-  }
-  pnr->QueueTask(&MHD::MHDSrcTerms, pmhd, MHD_AddSrc, "MHD_AddSrc", Task_Run,
-                 {MHD_ExplRK});
-  pnr->QueueTask(&MHD::RestrictU, pmhd, MHD_RestU, "MHD_RestU", Task_Run, {MHD_AddSrc});
-  pnr->QueueTask(&MHD::SendU, pmhd, MHD_SendU, "MHD_SendU", Task_Run, {MHD_RestU});
-  pnr->QueueTask(&MHD::RecvU, pmhd, MHD_RecvU, "MHD_RecvU", Task_Run, {MHD_SendU});
-  pnr->QueueTask(&MHD::CornerE, pmhd, MHD_EField, "MHD_EField", Task_Run, {MHD_RecvU});
-  pnr->QueueTask(&MHD::SendE, pmhd, MHD_SendE, "MHD_SendE", Task_Run, {MHD_EField});
-  pnr->QueueTask(&MHD::RecvE, pmhd, MHD_RecvE, "MHD_RecvE", Task_Run, {MHD_SendE});
-  pnr->QueueTask(&MHD::CT, pmhd, MHD_CT, "MHD_CT", Task_Run, {MHD_RecvE});
-  pnr->QueueTask(&MHD::RestrictB, pmhd, MHD_RestB, "MHD_RestB", Task_Run, {MHD_CT});
-  pnr->QueueTask(&MHD::SendB, pmhd, MHD_SendB, "MHD_SendB", Task_Run, {MHD_RestB});
-  pnr->QueueTask(&MHD::RecvB, pmhd, MHD_RecvB, "MHD_RecvB", Task_Run, {MHD_SendB});
-  pnr->QueueTask(&MHD::ApplyPhysicalBCs, pmhd, MHD_BCS, "MHD_BCS", Task_Run, {MHD_RecvB});
-  //pnr->QueueTask(&DynGRMHD::ApplyPhysicalBCs, this, MHD_BCS, "MHD_BCS", Task_Run,
-  //                 {MHD_RecvB});
-  pnr->QueueTask(&MHD::Prolongate, pmhd, MHD_Prolong, "MHD_Prolong", Task_Run, {MHD_BCS});
-  if (pz4c == nullptr && padm->is_dynamic == true) {
-    pnr->QueueTask(&DynGRMHD::SetADMVariables, this, MHD_SetADM, "MHD_SetADM", Task_Run,
-                    {MHD_ExplRK});
-    pnr->QueueTask(&DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrim, this, MHD_C2P,
-                   "MHD_C2P", Task_Run, {MHD_Prolong, MHD_SetADM}, {Z4c_Excise});
-    pnr->QueueTask(&DynGRMHD::UpdateExcisionMasks, this, MHD_Excise, "MHD_Excise",
-                   Task_Run, {MHD_SetADM});
-  } else {
-    pnr->QueueTask(&DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrim, this, MHD_C2P,
-                   "MHD_C2P", Task_Run, {MHD_Prolong}, {Z4c_Excise});
-  }
-  pnr->QueueTask(&MHD::NewTimeStep, pmhd, MHD_Newdt, "MHD_Newdt", Task_Run, {MHD_C2P});
-
-  // End task list
-  pnr->QueueTask(&MHD::ClearSend, pmhd, MHD_ClearS, "MHD_ClearS", Task_End);
-  pnr->QueueTask(&MHD::ClearRecv, pmhd, MHD_ClearR, "MHD_ClearR", Task_End);
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn  TaskStatus DynGRMHD::ADMMatterSource_(Driver *pdrive, int stage) {
-//  \brief
-template<class EOSPolicy, class ErrorPolicy>
-void DynGRMHDPS<EOSPolicy, ErrorPolicy>::PrimToConInit(int is, int ie, int js, int je,
-                                                    int ks, int ke) {
-  eos.PrimToCons(pmy_pack->pmhd->w0, pmy_pack->pmhd->bcc0, pmy_pack->pmhd->u0,
-                 is, ie, js, je, ks, ke);
-  if (pmy_pack->ptmunu != nullptr) {
-    bool fixed = fixed_evolution;
-    fixed_evolution = false;
-    SetTmunu(nullptr, 0);
-    fixed_evolution = fixed;
-  }
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn  void DynGRMHD::ConvertInternalEnergyToPressure
-//  \brief
-template<class EOSPolicy, class ErrorPolicy>
-void DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConvertInternalEnergyToPressure(int is, int ie,
-    int js, int je, int ks, int ke) {
-  int nmb = pmy_pack->nmb_thispack;
-  auto &prim = pmy_pack->pmhd->w0;
-  auto &eos_ = eos.ps.GetEOS();
-  int &nmhd  = pmy_pack->pmhd->nmhd;
-  int &nscal = pmy_pack->pmhd->nscalars;
-
-  const Real mb = eos_.GetBaryonMass();
-
-  par_for("coord_src", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
-  KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-    Real n = prim(m, IDN, k, j, i) / mb;
-    Real egas = mb*n + prim(m, IEN, k, j, i);
-    Real Y[MAX_SPECIES] = {0.};
-    for (int s = 0; s < nscal; s++) {
-      Y[s] = prim(m, nmhd + s, k, j, i);
-    }
-    Real T;
-    // Note that this is done explicitly rather than with a flooring policy because we
-    // don't have the temperature yet, and it's probable that the energy is bunk if the
-    // density is. There may be a cleaner way to do this elsewhere.
-    if (n < eos_.GetMinimumDensity()) {
-      n = eos_.GetMinimumDensity();
-      T = eos_.GetMinimumTemperature();
-    } else {
-      T = eos_.GetTemperatureFromE(n, egas, Y);
-    }
-    prim(m, IPR, k, j, i) = eos_.GetPressure(n, T, Y);
-  });
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn  TaskStatus DynGRMHD::ADMMatterSource_(Driver *pdrive, int stage) {
-//  \brief
-template<class EOSPolicy, class ErrorPolicy>
-TaskStatus DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrim(Driver *pdrive, int stage) {
-  if (fixed_evolution) {
-    return TaskStatus::complete;
-  }
-
-  // Extract the indices
-  auto &indcs = pmy_pack->pmesh->mb_indcs;
-  int &ng = indcs.ng;
-  int n1m1 = indcs.nx1 + 2*ng - 1;
-  int n2m1 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng - 1) : 0;
-  int n3m1 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng - 1) : 0;
-  eos.ConsToPrim(pmy_pack->pmhd->u0, pmy_pack->pmhd->b0, pmy_pack->pmhd->bcc0,
-                 pmy_pack->pmhd->w0, temperature, 0, n1m1, 0, n2m1, 0, n3m1, false);
-  return TaskStatus::complete;
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn void DynGRMHDPS::ConToPrimBC(int is, int ie, int js, int je, int ks, int ke)
-//  \brief
-template<class EOSPolicy, class ErrorPolicy>
-void DynGRMHDPS<EOSPolicy, ErrorPolicy>::ConToPrimBC(int is, int ie, int js, int je,
-                                                int ks, int ke) {
-  if (fixed_evolution) {
-    return;
-  }
-  eos.ConsToPrim(pmy_pack->pmhd->u0, pmy_pack->pmhd->b0, pmy_pack->pmhd->bcc0,
-                 pmy_pack->pmhd->w0, temperature, is, ie, js, je, ks, ke, false);
-}
-
-//----------------------------------------------------------------------------------------
-//! \fn  TaskStatus DynGRMHD::ADMMatterSource_(Driver *pdrive, int stage) {
-//  \brief
-template<class EOSPolicy, class ErrorPolicy>
-void DynGRMHDPS<EOSPolicy, ErrorPolicy>::AddCoordTerms(const DvceArray5D<Real> &prim,
-    const DvceArray5D<Real> &bcc,
-    const Real dt, DvceArray5D<Real> &rhs, int nghost) {
-  switch (nghost) {
-    case 2: AddCoordTermsEOS<2>(prim, bcc, dt, rhs);
-            break;
-    case 3: AddCoordTermsEOS<3>(prim, bcc, dt, rhs);
-            break;
-    case 4: AddCoordTermsEOS<4>(prim, bcc, dt, rhs);
-            break;
-  }
 }
 
 //----------------------------------------------------------------------------------------
@@ -422,7 +327,7 @@ TaskStatus DynGRMHD::SetTmunu(Driver *pdrive, int stage) {
 
   int nmb = pmy_pack->nmb_thispack;
 
-  auto &adm = pmy_pack->padm->adm;
+  const auto metric = pmy_pack->padm->GetMetricView();
   auto &tmunu = pmy_pack->ptmunu->tmunu;
   //auto &nhyd = pmy_pack->pmhd->nmhd;
   //int &nscal = pmy_pack->pmhd->nscalars;
@@ -433,22 +338,29 @@ TaskStatus DynGRMHD::SetTmunu(Driver *pdrive, int stage) {
 
   par_for("dyngr_tmunu_loop",DevExeSpace(),0,nmb-1,ks,ke,js,je,is,ie,
   KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
+    adm::ADMMetricPoint metric_point{};
+    metric.CellMetric(m, k, j, i, metric_point);
     // Calculate the determinant/volume form
-    Real detg = adm::SpatialDet(adm.g_dd(m,0,0,k,j,i),adm.g_dd(m,0,1,k,j,i),
-                                adm.g_dd(m,0,2,k,j,i),adm.g_dd(m,1,1,k,j,i),
-                                adm.g_dd(m,1,2,k,j,i),adm.g_dd(m,2,2,k,j,i));
+    Real detg = adm::SpatialDet(metric_point.g_dd[S11], metric_point.g_dd[S12],
+                                metric_point.g_dd[S13], metric_point.g_dd[S22],
+                                metric_point.g_dd[S23], metric_point.g_dd[S33]);
     Real ivol = 1.0/sqrt(detg);
 
     // Calculate the lower velocity components
+    const int imap[3][3] = {
+      {S11, S12, S13},
+      {S12, S22, S23},
+      {S13, S23, S33}
+    };
     Real v_d[3] = {0.0};
     Real iW = 0.;
     Real B_d[3] = {0.0};
     for (int a = 0; a < 3; ++a) {
       for (int b = 0; b < 3; ++b) {
-        v_d[a] += prim(m, IVX + b, k, j, i)*adm.g_dd(m, a, b, k, j, i);
+        v_d[a] += prim(m, IVX + b, k, j, i)*metric_point.g_dd[imap[a][b]];
         iW += prim(m, IVX + a, k, j, i)*prim(m, IVX + b, k, j, i) *
-                adm.g_dd(m, a, b, k, j, i);
-        B_d[a] += bcc(m, b, k, j, i)*adm.g_dd(m, a, b, k, j, i)*ivol;
+                metric_point.g_dd[imap[a][b]];
+        B_d[a] += bcc(m, b, k, j, i)*metric_point.g_dd[imap[a][b]]*ivol;
       }
     }
     iW = 1.0/sqrt(1. + iW);
@@ -467,7 +379,8 @@ TaskStatus DynGRMHD::SetTmunu(Driver *pdrive, int stage) {
         tmunu.S_dd(m, a, b, k, j, i) =
               cons(m, IM1 + a, k, j, i)*ivol*v_d[b]*iW
               - (B_d[a] + Bv*v_d[a])*SQR(iW)*B_d[b]
-              + (prim(m, IPR, k, j, i) + 0.5*bsq)*adm.g_dd(m, a, b, k, j, i);
+              + (prim(m, IPR, k, j, i) + 0.5*bsq)*
+                metric_point.g_dd[imap[a][b]];
       }
     }
   });
@@ -479,8 +392,192 @@ TaskStatus DynGRMHD::SetTmunu(Driver *pdrive, int stage) {
 //! \brief
 
 TaskStatus DynGRMHD::SetADMVariables(Driver *pdrive, int stage) {
-  pmy_pack->padm->SetADMVariables(pmy_pack);
+  const Real target_time =
+      problem_runtime::HydroStageTimeOr(pmy_pack->pmesh->time);
+  SetADMVariablesAtTime(target_time);
   return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+// INTERIOR-FIRST ConsToPrim
+//
+// The end-of-stage recovery (MHD_C2P) used to be one
+// full-extent ConsToPrim launch queued after MHD_BCS, i.e. after the whole conserved-
+// variable exchange had drained, leaving the GPU idle for most of that exchange.
+// ConsToPrim is pointwise, so the same work is issued as two launches over disjoint
+// index ranges: a DEEP INTERIOR pass queued as soon as the exchange has been posted,
+// and a COMPLEMENT pass in the old DAG slot after MHD_BCS.  Both go through the same
+// virtual ConToPrimBC and therefore the same kernel and template instantiation; only
+// the loop bounds differ, so every cell is recovered from the same inputs by the same
+// arithmetic and the result is bitwise identical.
+//
+// ConsToPrim is NOT read-only: besides w0/bcc0/temperature it writes u0 back whenever a
+// cell is floored or limited.  So the early pass must not run before anything that
+// still reads the pre-recovery u0 of an ACTIVE cell.  The readers between the last u0
+// writer and MHD_BCS are:
+//   * MHD_RestU  -- restricts u0 into coarse_u0; an ancestor of the early pass.
+//   * MHD_SendU  -- packs active cells and fences the pack before MPI_Startall, so a
+//                   dependency on MHD_SendU means "the pack has finished reading u0".
+//                   This is the earliest legal point.  That fence is skipped for
+//                   nranks == 1, which InteriorFirstC2PUsable() therefore refuses.
+//   * MHD_RecvU / MHD_Prolong -- write ghost cells and coarse_u0 only.
+//   * MHD_BCS    -- outflow/diode read one active layer, reflect reads ng layers.  The
+//                   early pass therefore stops PhysicalBCInteriorReadDepth() layers
+//                   short of the active-region faces, and the complement pass, which
+//                   runs after MHD_BCS, covers that shell together with the ghosts.
+// Face fields: the early pass reads x1f(i) and x1f(i+1) of every cell it recovers.
+// Those are final after MHD_CT (expressed by the MHD_SendB dependency) EXCEPT on the
+// active-region faces, which ProlongateFC may rewrite when the normal neighbour is
+// coarser.  That is why the depth is clamped to at least 1: the deep interior then
+// starts at is+1, whose faces are strictly interior and no prolongation touches them.
+//
+// Cost: each band is one launch, so a split recovery is 1 + 6 launches instead of 1.
+// The exchange overlap was measured to outweigh that on this ten-GPU node; where the
+// configuration falls outside the audit, InteriorFirstC2PUsable() returns false and the
+// late pass covers the full extent as it always did.
+//----------------------------------------------------------------------------------------
+
+//----------------------------------------------------------------------------------------
+//! \fn int DynGRMHD::PhysicalBCInteriorReadDepth()
+//! \brief Number of layers of ACTIVE cells the early pass must leave alone: the maximum
+//! over the six mesh faces of what MHD::ApplyPhysicalBCs reads out of u0, clamped to at
+//! least 1.  An upper bound over the mesh faces (a block's own flag can only be milder),
+//! so it is safe for every block in the pack.  The clamp is not about u0: it keeps the
+//! deep interior clear of the active-region faces that ProlongateFC may rewrite.
+
+int DynGRMHD::PhysicalBCInteriorReadDepth() const {
+  auto *pm = pmy_pack->pmesh;
+  const int ng = pm->mb_indcs.ng;
+  int depth = 1;
+  if (!pm->strictly_periodic) {
+    for (int f = 0; f < 6; ++f) {
+      switch (pm->mesh_bcs[f]) {
+        // hydro_bcs.cpp:76-82 -- u0(is-i-1) = +/- u0(is+i), i < ng.
+        case BoundaryFlag::reflect:
+          depth = std::max(depth, ng);
+          break;
+        // hydro_bcs.cpp:84-88, 94-101 -- reads exactly the first active layer.
+        case BoundaryFlag::outflow:
+        case BoundaryFlag::diode:
+          depth = std::max(depth, 1);
+          break;
+        // inflow and vacuum write constants; periodic/shear_periodic/block/undef do
+        // nothing.  `user` is refused outright in InteriorFirstC2PUsable().
+        default:
+          break;
+      }
+    }
+  }
+  return depth;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn bool DynGRMHD::InteriorFirstC2PUsable()
+//! \brief Whether this run's configuration is inside the audit above.  Evaluated per
+//! call (a few loads and a six-way switch) rather than cached at queue time, because the
+//! ProblemGenerator -- and therefore user_bcs -- is constructed after the task graph.
+//! When it is false the early pass does nothing and the late pass covers the FULL
+//! extent, i.e. exactly the old single-pass behaviour in the old DAG slot.
+
+bool DynGRMHD::InteriorFirstC2PUsable() const {
+  // Single-rank runs: MHD_SendU returns before the pack fence, so "SendU complete" does
+  // not imply "the pack has finished reading u0" -- and there is no MPI traffic to
+  // overlap with anyway.
+  if (global_variable::nranks == 1) {
+    return false;
+  }
+  auto *pm = pmy_pack->pmesh;
+  // A user boundary callback runs after HydroBCs and may read any part of u0, so the
+  // shell cannot be bounded.
+  if (pm->pgen != nullptr && pm->pgen->user_bcs) {
+    return false;
+  }
+  for (int f = 0; f < 6; ++f) {
+    if (pm->mesh_bcs[f] == BoundaryFlag::user) {
+      return false;
+    }
+  }
+  // Not audited: Z4c adds its own excision task as an optional MHD_C2P dependency, and
+  // prolong_prims makes MHD::Prolongate run a C2P/P2C round trip that reads w0 between
+  // the two passes.
+  if (pmy_pack->pz4c != nullptr) {
+    return false;
+  }
+  if (pm->multilevel && pm->pmr != nullptr && pm->pmr->prolong_prims) {
+    return false;
+  }
+  // The dual-energy adiabat is resynchronized in MHD_DualE, ahead of MHD_SendU's pack,
+  // so both halves of the split read the column the neighbours were sent.
+  // The shell must leave at least one deep-interior cell in every evolved direction.
+  const auto &indcs = pm->mb_indcs;
+  const int depth = PhysicalBCInteriorReadDepth();
+  if (indcs.nx1 <= 2*depth) {
+    return false;
+  }
+  if (indcs.nx2 > 1 && indcs.nx2 <= 2*depth) {
+    return false;
+  }
+  if (indcs.nx3 > 1 && indcs.nx3 <= 2*depth) {
+    return false;
+  }
+  return true;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus DynGRMHD::ConToPrimInteriorFirst
+//! \brief Early half of the split: the deep interior, issued while the conserved-variable
+//! exchange is in flight.
+
+TaskStatus DynGRMHD::ConToPrimInteriorFirst(Driver *pdrive, int stage) {
+  if (fixed_evolution) {
+    return TaskStatus::complete;
+  }
+  if (!InteriorFirstC2PUsable()) {
+    // The late pass will cover the full extent on its own.
+    return TaskStatus::complete;
+  }
+  const auto &indcs = pmy_pack->pmesh->mb_indcs;
+  const int depth = PhysicalBCInteriorReadDepth();
+  const InteriorC2PBox b = MakeInteriorC2PBox(indcs, depth);
+  ConToPrimBC(b.il, b.iu, b.jl, b.ju, b.kl, b.ku);
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus DynGRMHD::ConToPrimAfterExchange
+//! \brief Late half of the split, in the DAG slot the single full-extent MHD_C2P used to
+//! occupy: the exact complement of the deep-interior box (ghost zones plus the boundary-
+//! condition read shell), or the whole extent when the split is off or not usable.
+
+TaskStatus DynGRMHD::ConToPrimAfterExchange(Driver *pdrive, int stage) {
+  if (fixed_evolution) {
+    return TaskStatus::complete;
+  }
+  const auto &indcs = pmy_pack->pmesh->mb_indcs;
+  if (!InteriorFirstC2PUsable()) {
+    // Byte-for-byte the old DynGRMHDPS::ConToPrim call.
+    const int ng = indcs.ng;
+    const int n1m1 = indcs.nx1 + 2*ng - 1;
+    const int n2m1 = (indcs.nx2 > 1) ? (indcs.nx2 + 2*ng - 1) : 0;
+    const int n3m1 = (indcs.nx3 > 1) ? (indcs.nx3 + 2*ng - 1) : 0;
+    ConToPrimBC(0, n1m1, 0, n2m1, 0, n3m1);
+    return TaskStatus::complete;
+  }
+  ConToPrimComplementOfBox(this, indcs,
+                           MakeInteriorC2PBox(indcs, PhysicalBCInteriorReadDepth()));
+  return TaskStatus::complete;
+}
+
+//----------------------------------------------------------------------------------------
+void DynGRMHD::SetADMVariablesAtTime(const Real time) {
+  auto *padm = pmy_pack->padm;
+  const bool old_override_valid = padm->callback_time_override_valid;
+  const Real old_override = padm->callback_time_override;
+  padm->callback_time_override = time;
+  padm->callback_time_override_valid = true;
+  padm->SetADMVariables(pmy_pack);
+  padm->callback_time_override = old_override;
+  padm->callback_time_override_valid = old_override_valid;
 }
 
 //----------------------------------------------------------------------------------------
@@ -488,237 +585,52 @@ TaskStatus DynGRMHD::SetADMVariables(Driver *pdrive, int stage) {
 //! \brief
 
 TaskStatus DynGRMHD::UpdateExcisionMasks(Driver *pdrive, int stage) {
-  if (pmy_pack->pcoord->coord_data.bh_excise && stage == pdrive->nexp_stages) {
+  if (pmy_pack->pcoord->coord_data.bh_excise) {
     pmy_pack->pcoord->UpdateExcisionMasks();
   }
   return TaskStatus::complete;
 }
 
-template<class EOSPolicy, class ErrorPolicy> template<int NGHOST>
-void DynGRMHDPS<EOSPolicy, ErrorPolicy>::AddCoordTermsEOS(const DvceArray5D<Real> &prim,
-    const DvceArray5D<Real> &bcc,
-    const Real dt, DvceArray5D<Real> &rhs) {
-  if (fixed_evolution) {
-    return;
+//----------------------------------------------------------------------------------------
+//! \fn TaskStatus DynGRMHD::SetADMVariablesAtStageEnd
+//! \brief Install the analytic metric of the time level the stage has just advanced the
+//! conserved state to, before anything inverts that state.
+//!
+//! The stage's right-hand side is evaluated on the metric of its abscissa t_s
+//! (MHD_SetADM), and the update leaves U = sqrt(gamma) (D, S_i, tau) at the next
+//! abscissa (the end of the step after the last stage), the time the geometric source
+//! integrated it to.  Inverting that U on the metric of t_s is not the gas of either
+//! time: sqrt(gamma) and gamma_ij move by O(dt), and the internal energy is what remains
+//! of tau after the kinetic and magnetic parts, so where it is a small fraction of tau
+//! -- cold moving gas, and the magnetized flow near a moving horizon -- the inversion
+//! read it off by O(1) or found it negative.  The floors then fired on the wrong metric
+//! and wrote the floored state back into U, heat the next stage's inversion (on the
+//! right metric) kept, while the radiation's implicit exchange, which inverts the same U
+//! on the metric of its own time level, saw a gas 10-1000 times hotter than the one
+//! published.  So the metric of the new time level is installed here, after the last
+//! consumer of the stage's right-hand-side metric in this graph (the EMF, the source
+//! terms and, when it runs at the stage start, the radiation transport) and ahead of
+//! every recovery of the updated state; the next stage's MHD_SetADM finds it installed.
+//!
+//! Only the metric moves.  The excision masks (and the rest of the problem generator's
+//! per-install state) stay the stage's until MHD_SetADM: they are the geometry of the
+//! hole the stage's fluxes were built around, and an excised cell is set to the
+//! excision state, not inverted, so the recovery re-excises exactly the cells the
+//! stage's operator treated as excised.  A cell the hole uncovers during the step
+//! therefore starts from the excision state at the next stage, as it did.
+//!
+TaskStatus DynGRMHD::SetADMVariablesAtStageEnd(Driver *pdrive, int stage) {
+  if (pdrive == nullptr) {
+    return TaskStatus::complete;
   }
-  auto &indcs = pmy_pack->pmesh->mb_indcs;
-  auto &size  = pmy_pack->pmb->mb_size;
-  int &is = indcs.is; int &ie = indcs.ie;
-  int &js = indcs.js; int &je = indcs.je;
-  int &ks = indcs.ks; int &ke = indcs.ke;
-
-  int nmb = pmy_pack->nmb_thispack;
-
-  auto &adm = pmy_pack->padm->adm;
-  auto &eos_ = eos.ps.GetEOS();
-  //auto &tmunu = pmy_pack->ptmunu->tmunu;
-
-  // fetch flag for smooth excision and
-  // excision mask, and target values
-  bool smoothing = pmy_pack->pcoord->coord_data.smooth_excision;
-  auto &floor = pmy_pack->pcoord->excision_floor;
-  Real &dexcise = pmy_pack->pcoord->coord_data.dexcise;
-  // Real &pexcise = pmy_pack->pcoord->coord_data.pexcise;
-  Real &texcise = pmy_pack->pcoord->coord_data.texcise;
-  Real &tdamp = pmy_pack->pcoord->coord_data.tdamp;
-
-  int &nhyd  = pmy_pack->pmhd->nmhd;
-  int &nscal = pmy_pack->pmhd->nscalars;
-
-  const Real mb = eos.ps.GetEOS().GetBaryonMass();
-  const int imap[3][3] = {
-    {S11, S12, S13},
-    {S12, S22, S23},
-    {S13, S23, S33}
-  };
-
-  // Check the number of dimensions to determine which derivatives we need.
-  int ndim;
-  if (pmy_pack->pmesh->one_d) {
-    ndim = 1;
-  } else if (pmy_pack->pmesh->two_d) {
-    ndim = 2;
-  } else {
-    ndim = 3;
+  const Mesh *pm = pmy_pack->pmesh;
+  const Real stage_end_frac =
+      (stage < pdrive->nexp_stages) ? pdrive->stage_time_frac[stage] : 1.0;
+  const Real t_end = pm->time + stage_end_frac*pm->dt;
+  if (t_end != problem_runtime::HydroStageTimeOr(pm->time)) {
+    pmy_pack->padm->SetMetricTime(t_end);
   }
-
-  par_for("coord_src", DevExeSpace(), 0, nmb-1, ks, ke, js, je, is, ie,
-  KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-    // Extract the metric and coordinate quantities.
-    Real g3d[NSPMETRIC] = {adm.g_dd(m,0,0,k,j,i), adm.g_dd(m,0,1,k,j,i),
-                           adm.g_dd(m,0,2,k,j,i), adm.g_dd(m,1,1,k,j,i),
-                           adm.g_dd(m,1,2,k,j,i), adm.g_dd(m,2,2,k,j,i)};
-    const Real& alpha = adm.alpha(m, k, j, i);
-    Real detg = adm::SpatialDet(g3d[S11], g3d[S12], g3d[S13],
-                                g3d[S22], g3d[S23], g3d[S33]);
-    Real vol = sqrt(detg);
-    Real g3u[NSPMETRIC] = {0.};
-    adm::SpatialInv(1.0/detg, g3d[S11], g3d[S12], g3d[S13], g3d[S22], g3d[S23], g3d[S33],
-                    &g3u[S11], &g3u[S12], &g3u[S13], &g3u[S22], &g3u[S23], &g3u[S33]);
-
-    // Calculate the metric derivatives
-    Real idx[] = {1./size.d_view(m).dx1, 1./size.d_view(m).dx2, 1./size.d_view(m).dx3};
-    Real dalpha_d[3] = {0.};
-    for (int a = 0; a < ndim; a++) {
-      dalpha_d[a] = Dx<NGHOST>(a, idx, adm.alpha, m, k, j, i);
-    }
-    Real dbeta_du[3][3] = {};
-    for (int a = 0; a < 3; a++) {
-      for (int b = 0; b < ndim; b++) {
-        dbeta_du[b][a] = Dx<NGHOST>(b, idx, adm.beta_u, m, a, k, j, i);
-      }
-    }
-    Real dg_ddd[3][3][3] = {};
-    for (int a = 0; a < 3; ++a) {
-      for (int b = 0; b < 3; ++b) {
-        for (int c = 0; c < ndim; ++c) {
-          dg_ddd[c][a][b] = Dx<NGHOST>(c, idx, adm.g_dd, m, a, b, k, j, i);
-        }
-      }
-    }
-
-    // Fluid quantities
-    Real prim_pt[NPRIM] = {0.0};
-    prim_pt[PRH] = prim(m, IDN, k, j, i)/mb;
-    prim_pt[PVX] = prim(m, IVX, k, j, i);
-    prim_pt[PVY] = prim(m, IVY, k, j, i);
-    prim_pt[PVZ] = prim(m, IVZ, k, j, i);
-    for (int s = 0; s < nscal; s++) {
-      prim_pt[PYF + s] = prim(m, nhyd + s, k, j, i);
-    }
-    prim_pt[PPR] = prim(m, IPR, k, j, i);
-    prim_pt[PTM] = eos_.GetTemperatureFromP(prim_pt[PRH], prim_pt[PPR], &prim_pt[PYF]);
-
-    // Get the conserved variables. Note that we don't use PrimitiveSolver here --
-    // that's because we would need to recalculate quantities used in E and S_d in order
-    // to get S_dd.
-    Real H =
-      prim(m, IDN, k, j, i)*eos_.GetEnthalpy(prim_pt[PRH], prim_pt[PTM], &prim_pt[PYF]);
-    Real usq = Primitive::SquareVector(&prim_pt[PVX], g3d);
-    Real const Wsq = 1.0 + usq;
-    Real const W = sqrt(Wsq);
-    Real B_u[NMAG] = {bcc(m, IBX, k, j, i)/vol,
-                      bcc(m, IBY, k, j, i)/vol,
-                      bcc(m, IBZ, k, j, i)/vol};
-    Real Bv = 0.0;
-    for (int a = 0; a < 3; a++) {
-      for (int b = 0; b < 3; b++) {
-        Bv += adm.g_dd(m,a,b,k,j,i)*prim_pt[PVX + a]*B_u[b];
-      }
-    }
-    Real Bsq = Primitive::SquareVector(B_u, g3d);
-    Bv = Bv/W;
-    Real bsq = Bv*Bv + Bsq/Wsq;
-
-    Real E = (H*Wsq + Bsq) - prim_pt[PPR] - 0.5*bsq;
-    //Real E = tmunu.E(m,k,j,i);
-
-    Real S_d[3] = {0.0};
-    for (int a = 0; a < 3; a++) {
-      //S_d[a] = tmunu.S_d(m,a,k,j,i);
-      for (int b = 0; b < 3; b++) {
-        S_d[a] += ((H*Wsq + Bsq)*prim_pt[PVX + b]/W - Bv*B_u[b])*g3d[imap[a][b]];
-      }
-    }
-
-    Real S_uu[3][3];
-    for (int a = 0; a < 3; a++) {
-      for (int b = 0; b <= a; b++) {
-        S_uu[a][b] = (H + Bsq/Wsq)*prim_pt[PVX + a]*prim_pt[PVX + b]
-                      - B_u[a]*B_u[b]/Wsq
-                      - Bv*(B_u[a]*prim_pt[PVX + b] + B_u[b]*prim_pt[PVX + a])/W
-                      + (prim_pt[PPR] + 0.5*bsq)*g3u[imap[a][b]];
-        /*S_uu[a][b] = 0.0;
-        for (int c = 0; c < 3; c++) {
-          for (int d = 0; d < 3; d++) {
-            S_uu[a][b] += tmunu.S_dd(m,c,d,k,j,i)*g3u[imap[a][c]]*g3u[imap[b][d]];
-          }
-        }*/
-        S_uu[b][a] = S_uu[a][b];
-      }
-    }
-
-    // Assemble energy RHS
-    for (int a = 0; a < 3; a++) {
-      for (int b = 0; b < 3; b++) {
-        rhs(m, IEN, k, j, i) += dt*vol*(alpha*adm.vK_dd(m, a, b, k, j, i)*S_uu[a][b] -
-            g3u[imap[a][b]] * S_d[a]*dalpha_d[b]);
-      }
-    }
-
-    // Assemble momentum RHS
-    for (int a = 0; a < 3; a++) {
-      for (int b = 0; b < 3; b++) {
-        for (int c = 0; c < 3; c++) {
-          rhs(m,IM1+a, k, j, i) += 0.5*dt*alpha*vol*S_uu[b][c]*dg_ddd[a][b][c];
-        }
-        rhs(m, IM1+a, k, j, i) += dt*vol*S_d[b]*dbeta_du[a][b];
-      }
-      rhs(m, IM1+a, k, j, i) -= dt*vol*E*dalpha_d[a];
-    }
-
-    // Assemble damping source terms
-    if (smoothing) {
-      // D = rho*W and tau = E-D are needed for the smooth damping terms
-      // inside excised regions, if existing.
-      Real D = prim(m, IDN, k, j, i) * W;
-      Real tau = E - D;
-
-      // Compute the excised value for the energy.
-      // Real tau_ex = (dexcise*eos_.GetEnthalpy(dexcise/mb, texcise, &prim_pt[PYF]))
-      //               + Bsq - pexcise - 0.5*bsq - dexcise;
-      Real tau_ex = eos_.GetEnergy(dexcise/mb, texcise, &prim_pt[PYF])
-                                    + 0.5*Bsq - dexcise;
-
-      rhs(m, IDN, k, j, i) -= (dt*vol*floor(m,k,j,i)*(D-dexcise))/tdamp;
-      rhs(m, IM1, k, j, i) -= (dt*floor(m,k,j,i)*vol*S_d[0])/tdamp;
-      rhs(m, IM2, k, j, i) -= (dt*floor(m,k,j,i)*vol*S_d[1])/tdamp;
-      rhs(m, IM3, k, j, i) -= (dt*floor(m,k,j,i)*vol*S_d[2])/tdamp;
-      rhs(m, IEN, k, j, i) -= dt*vol*floor(m,k,j,i)*(tau - tau_ex)/tdamp;
-      for (int s = 0; s < nscal; s++) {
-        rhs(m, IYF+s, k, j, i) -= (dt*vol*floor(m,k,j,i)*(D-dexcise)*prim_pt[PYF+s])
-                                      /tdamp;
-      }
-    }
-  });
+  return TaskStatus::complete;
 }
-
-// Instantiated templates
-template class DynGRMHDPS<Primitive::IdealGas, Primitive::ResetFloor>;
-template class DynGRMHDPS<Primitive::PiecewisePolytrope, Primitive::ResetFloor>;
-template class DynGRMHDPS<Primitive::EOSCompOSE<Primitive::NormalLogs>,
-                          Primitive::ResetFloor>;
-template class DynGRMHDPS<Primitive::EOSCompOSE<Primitive::NQTLogs>,
-                          Primitive::ResetFloor>;
-template class DynGRMHDPS<Primitive::EOSHybrid<Primitive::NormalLogs>,
-                          Primitive::ResetFloor>;
-template class DynGRMHDPS<Primitive::EOSHybrid<Primitive::NQTLogs>,
-                          Primitive::ResetFloor>;
-
-// Macro for defining CoordTerms templates
-#define INSTANTIATE_COORD_TERMS(EOSPolicy, ErrorPolicy) \
-template \
-void DynGRMHDPS<EOSPolicy, ErrorPolicy>::AddCoordTermsEOS<2>( \
-      const DvceArray5D<Real> &prim, \
-      const DvceArray5D<Real> &bcc, const Real dt, DvceArray5D<Real> &rhs); \
-template \
-void DynGRMHDPS<EOSPolicy, ErrorPolicy>::AddCoordTermsEOS<3>( \
-      const DvceArray5D<Real> &prim, \
-      const DvceArray5D<Real> &bcc, const Real dt, DvceArray5D<Real> &rhs); \
-template \
-void DynGRMHDPS<EOSPolicy, ErrorPolicy>::AddCoordTermsEOS<4>( \
-      const DvceArray5D<Real> &prim, \
-      const DvceArray5D<Real> &bcc, const Real dt, DvceArray5D<Real> &rhs);
-
-INSTANTIATE_COORD_TERMS(Primitive::IdealGas, Primitive::ResetFloor);
-INSTANTIATE_COORD_TERMS(Primitive::PiecewisePolytrope, Primitive::ResetFloor);
-INSTANTIATE_COORD_TERMS(Primitive::EOSCompOSE<Primitive::NormalLogs>,
-                        Primitive::ResetFloor);
-INSTANTIATE_COORD_TERMS(Primitive::EOSCompOSE<Primitive::NQTLogs>, Primitive::ResetFloor);
-INSTANTIATE_COORD_TERMS(Primitive::EOSHybrid<Primitive::NormalLogs>,
-                        Primitive::ResetFloor);
-INSTANTIATE_COORD_TERMS(Primitive::EOSHybrid<Primitive::NQTLogs>, Primitive::ResetFloor);
-
-#undef INSTANTIATE_COORD_TERMS
 
 } // namespace dyngr

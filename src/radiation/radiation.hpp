@@ -36,6 +36,10 @@ struct RadiationTaskIDs {
   TaskID rad_flux;
   TaskID mhd_flux;
   TaskID hyd_flux;
+  TaskID mhd_prep_fofc;
+  TaskID mhd_send_fofc;
+  TaskID mhd_recv_fofc;
+  TaskID mhd_repl_fofc;
   TaskID rad_sendf;
   TaskID mhd_sendf;
   TaskID hyd_sendf;
@@ -134,6 +138,7 @@ class Radiation {
   MeshBoundaryValuesCC *pbval_i;
 
   // following only used for time-evolving flow
+  bool time_evolving = false;
   DvceArray5D<Real> i1;         // intensity at intermediate step
   DvceFaceFld5D<Real> iflx;     // spatial fluxes on zone faces
   DvceArray5D<Real> divfa;      // angular flux divergence
@@ -163,6 +168,8 @@ class Radiation {
   TaskStatus ApplyPhysicalBCs(Driver* pdrive, int stage);
   TaskStatus Prolongate(Driver* pdrive, int stage);
   TaskStatus NewTimeStep(Driver *d, int stage);
+  bool ResizeMeshBlockStorage(int nmb, bool exact = false,
+                              bool allow_shrink = false);
   // ...in "after_stagen_tl" task list
   TaskStatus ClearSend(Driver *d, int stage);
   TaskStatus ClearRecv(Driver *d, int stage);

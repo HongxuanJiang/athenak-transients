@@ -1,0 +1,109 @@
+# AthenaK input: sink-particle FOF merge algebra (battery case "merge")
+#
+# Two sinks with distinct masses, momenta and spins are placed inside the linking
+# length; after ONE cycle exactly one sink must remain, and its (m, p, L about the new
+# centre of mass) must be the exact SinkParticleData::operator+= result
+# (sink_particles_merge.cpp MergeInto).
+#
+# The harness runs this input TWICE from one file:
+#   arm "merge"    : as written, merge_link_cells = 8   -> link = 2.0 >> separation 0.53
+#   arm "nomerge"  : override sink_particles/merge_link_cells=1.0e-8 -> no link at all
+# The second arm logs the PRE-merge state of both sinks, which is bitwise identical to
+# the first arm's pre-merge state: everything ahead of MergeSinks in SinkStep is either
+# disabled (create, accrete) or a floating-point no-op (the gas->sink kick is ~6e-30
+# against momenta of order 0.1) or host-deterministic (the Bulirsch-Stoer advance).
+# The harness then re-executes MergeInto in Python on those two rows and requires a
+# BITWISE match with the merged arm, plus the order-independent conservation identities
+# to 1e-14.
+#
+# accrete = false so the logged post-step state IS the post-merge state (accretion runs
+# after the merge and would otherwise add mass/momentum/spin to it).
+# mmergemax = 0 means "no member is exempt", i.e. the group collapses unconditionally.
+# The survivor keeps the id of the most massive member, here id 1 (m = 2 > 1).
+
+<comment>
+problem   = sink particle friends-of-friends merge
+
+<job>
+basename  = sink_merge
+
+<mesh>
+nghost    = 2
+nx1       = 16
+x1min     = -2.0
+x1max     = 2.0
+ix1_bc    = periodic
+ox1_bc    = periodic
+
+nx2       = 16
+x2min     = -2.0
+x2max     = 2.0
+ix2_bc    = periodic
+ox2_bc    = periodic
+
+nx3       = 16
+x3min     = -2.0
+x3max     = 2.0
+ix3_bc    = periodic
+ox3_bc    = periodic
+
+<meshblock>
+nx1       = 8
+nx2       = 8
+nx3       = 8
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim       = 1              # one cycle: create/kick/nbody/merge run exactly once
+tlim       = 1.0e30
+ndiag      = 1
+lat        = false
+hydro_lat_levels = 1
+
+<hydro>
+eos         = ideal
+reconstruct = plm
+rsolver     = hllc
+gamma       = 1.6666666666666667
+
+<sink_particles>
+create               = false
+accrete              = false
+accrete_radius_cells = 4
+soften               = 1.0
+merge_link_cells     = 8.0        # link = 8*0.25 = 2.0 > separation 0.5303300858899106
+mmergemax            = 0.0        # 0 = merge unconditionally
+jeans_no             = 0.25
+r_angmom             = 1.0e100
+use_sink_timestep    = true
+subcell_gravity      = false
+bs_tol               = 1.0e-6
+newton_g             = 1.0
+log                  = sinks.log
+n_init               = 2
+# m, x, y, z, px, py, pz, Lx, Ly, Lz
+init0 = 1.0,  0.25, 0.0,   0.0,    0.1,  0.2,  -0.3,  0.01,  -0.02, 0.03
+init1 = 2.0, -0.25, 0.125, -0.125, -0.4, 0.05,  0.15, -0.005, 0.01, 0.002
+
+<problem>
+pgen_name  = shock_tube
+shock_dir  = 1
+xshock     = 0.0
+dl = 1.0e-30
+pl = 1.0e-30
+ul = 0.0
+vl = 0.0
+wl = 0.0
+
+dr = 1.0e-30
+pr = 1.0e-30
+ur = 0.0
+vr = 0.0
+wr = 0.0
+
+<output1>
+file_type   = hst
+data_format = %24.17e
+dcycle      = 1

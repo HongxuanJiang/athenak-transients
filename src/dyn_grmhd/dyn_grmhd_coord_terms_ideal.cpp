@@ -1,0 +1,19 @@
+//========================================================================================
+// AthenaXXX astrophysical plasma code
+// Copyright(C) 2020 James M. Stone <jmstone@ias.edu> and the Athena code team
+// Licensed under the 3-clause BSD License (the "LICENSE")
+//========================================================================================
+//! \file dyn_grmhd_coord_terms_ideal.cpp
+//! \brief Explicit instantiation of DynGRMHDPS::AddCoordTermsEOS<NGHOST> for the ideal
+//! gas, every ghost depth.
+//! One unit per EOS family (the ideal gas: its class and its coordinate sources apart),
+//! so each gets its own ptxas pass; see dyn_grmhd_ps_impl.hpp.
+
+#include "dyn_grmhd_coord_terms_impl.hpp"
+
+namespace dyngr {
+
+INSTANTIATE_COORD_TERMS(Primitive::IdealGas,
+                        Primitive::ResetFloor);
+
+} // namespace dyngr

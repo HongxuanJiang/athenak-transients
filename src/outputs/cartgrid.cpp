@@ -53,12 +53,6 @@ CartesianGridOutput::CartesianGridOutput(ParameterInput *pin, Mesh *pm,
 CartesianGridOutput::~CartesianGridOutput() { delete pcart; }
 
 void CartesianGridOutput::LoadOutputData(Mesh *pm) {
-  // If AMR is enabled we need to reset the CartesianGrid
-  if (pm->adaptive) {
-    pcart->SetInterpolationIndices();
-    pcart->SetInterpolationWeights();
-  }
-
   int nout_vars = outvars.size();
   Kokkos::realloc(outarray, nout_vars, 1, md.numpoints[0], md.numpoints[1],
                   md.numpoints[2]);
@@ -142,11 +136,6 @@ void CartesianGridOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
 
   // increment counters
   out_params.file_number++;
-  if (out_params.last_time < 0.0) {
-    out_params.last_time = pm->time;
-  } else {
-    out_params.last_time += out_params.dt;
-  }
   pin->SetInteger(out_params.block_name, "file_number", out_params.file_number);
-  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
+  AdvanceOutputTime(pm, pin);
 }

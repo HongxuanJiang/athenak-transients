@@ -6,9 +6,11 @@
 //  \brief implements BaseTypeOutput constructor, and LoadOutputData functions
 //
 
+#include <cmath>     // floor
 #include <iostream>
 #include <sstream>
 #include <string>    // std::string, to_string()
+#include <cstdlib>   // std::exit
 #include <cstdio>    // snprintf
 #include <algorithm> // min_element
 #include <utility>   // pair<>
@@ -28,11 +30,63 @@
 #include "z4c/z4c.hpp"
 #include "srcterms/srcterms.hpp"
 #include "srcterms/turb_driver.hpp"
+#include "gravity/gravity.hpp"
+#include "pgen/pgen.hpp"
 #include "outputs.hpp"
 
 #if MPI_PARALLEL_ENABLED
 #include <mpi.h>
 #endif
+
+namespace {
+
+std::string NumberedScalarName(const char *prefix, int offset) {
+  char number[3];
+  std::snprintf(number, sizeof(number), "%02d", offset % 100);
+  std::string vname(prefix);
+  vname.append(number);
+  return vname;
+}
+
+std::string MhdScalarName(mhd::MHD *pmhd, int slot, bool conserved) {
+  int offset = slot - pmhd->nmhd;
+  // The dual-energy auxiliary sits past the passive scalars.  Naming it separately is
+  // what makes the formalism diagnosable at all: without it the only evidence of what
+  // the auxiliary channel is carrying is the effect it has on everything else.
+  if (pmhd->use_dual_energy && slot == pmhd->dual_energy_idx) {
+    return conserved ? "reint_aux" : "eint_aux";
+  }
+  return NumberedScalarName(conserved ? "r_" : "s_", offset);
+}
+
+} // namespace
+
+//----------------------------------------------------------------------------------------
+//! \fn void BaseTypeOutput::AdvanceOutputTime(Mesh *pm, ParameterInput *pin)
+//! \brief Advance this stream's cadence after a dump, and record it for the next restart.
+//!
+//! The first dump of a stream (last_time still at its -1 sentinel) anchors the cadence to
+//! the GLOBAL grid floor(t/dt)*dt, not to the instant the dump happened to land on.
+//! Anchoring to pm->time made a stream's phase an accident of when its first write
+//! occurred, and `last_time += dt` then carried that accident forever.  Concretely, in a
+//! live run two <output> blocks with the identical dt = 100 came out permanently
+//! 2.1333 M apart: an <output> block added to the deck mid-run has no last_time in the
+//! restart header, so it first fired at the first LAT window boundary after the restart
+//! point, at t = 25001.884, and 1.884 M of phase was then baked in for the rest of the
+//! run.  Pairing the two dumps in analysis compares states 2.1 M apart, which is 12% of
+//! an orbit at r = 2M.  With grid anchoring both streams sit on multiples of 100 no
+//! matter when they were created; for a fresh start at t = 0 the two rules agree exactly.
+//! floor(t/dt)*dt + dt > t always, so the anchor can never make a stream immediately due
+//! again.
+void BaseTypeOutput::AdvanceOutputTime(Mesh *pm, ParameterInput *pin) {
+  if (out_params.last_time < 0.0) {
+    out_params.last_time = (out_params.dt > 0.0) ?
+        std::floor(pm->time/out_params.dt)*out_params.dt : pm->time;
+  } else {
+    out_params.last_time += out_params.dt;
+  }
+  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
+}
 
 //----------------------------------------------------------------------------------------
 // BaseTypeOutput base class constructor
@@ -73,12 +127,108 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl << "Input file is likely missing a <hydro> block" << std::endl;
     exit(EXIT_FAILURE);
   }
+  if ((out_params.variable.compare("hydro_div_v") == 0 ||
+       out_params.variable.compare("hydro_abs_div_v") == 0) &&
+      pm->pmb_pack->phydro == nullptr) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+       << "Output of Hydro derived variable requested in <output> block '"
+       << out_params.block_name << "' but no Hydro object has been constructed."
+       << std::endl << "Input file is likely missing a <hydro> block" << std::endl;
+    exit(EXIT_FAILURE);
+  }
   if ((ivar>=16) && (ivar<50) && (pm->pmb_pack->pmhd == nullptr)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
        << "Output of MHD variable requested in <output> block '"
        << out_params.block_name << "' but no MHD object has been constructed."
        << std::endl << "Input file is likely missing a <mhd> block" << std::endl;
     exit(EXIT_FAILURE);
+  }
+  if ((ivar>=154) && (ivar<163) && (pm->pmb_pack->phydro == nullptr)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+       << "Output of Hydro tabulated-EOS diagnostic requested in <output> block '"
+       << out_params.block_name << "' but no Hydro object has been constructed."
+       << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  if ((ivar>=163) && (ivar<172) && (pm->pmb_pack->pmhd == nullptr)) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+       << "Output of MHD tabulated-EOS diagnostic requested in <output> block '"
+       << out_params.block_name << "' but no MHD object has been constructed."
+       << std::endl;
+    exit(EXIT_FAILURE);
+  }
+  auto require_tabulated_lte = [&](const std::string &prefix, const EOS_Data &eos) {
+    if (!eos.UsesTabulatedLTE()) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "Output of " << prefix << " tabulated-EOS diagnostic requested in "
+                << "<output> block '" << out_params.block_name << "', but <" << prefix
+                << ">/eos is not a tabulated LTE EOS." << std::endl;
+      exit(EXIT_FAILURE);
+    }
+  };
+  auto require_lte_helium = [&](const std::string &prefix, const EOS_Data &eos,
+                                const std::string &varname) {
+    require_tabulated_lte(prefix, eos);
+    if (!eos.lte_has_helium) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "Output variable '" << varname << "' requested in <output> block '"
+                << out_params.block_name << "', but the active <" << prefix
+                << ">/eos table does not include helium ionization fractions."
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+  };
+  auto require_lte_radiation = [&](const std::string &prefix, const EOS_Data &eos,
+                                   const std::string &varname) {
+    require_tabulated_lte(prefix, eos);
+    if (!eos.lte_has_radiation) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "Output variable '" << varname << "' requested in <output> block '"
+                << out_params.block_name << "', but the active <" << prefix
+                << ">/eos table does not include radiation-pressure support."
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+  };
+  auto require_lte_h2 = [&](const std::string &prefix, const EOS_Data &eos,
+                            const std::string &varname) {
+    require_tabulated_lte(prefix, eos);
+    if (!eos.lte_has_h2) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl
+                << "Output variable '" << varname << "' requested in <output> block '"
+                << out_params.block_name << "', but the active <" << prefix
+                << ">/eos table does not include H2 chemistry."
+                << std::endl;
+      exit(EXIT_FAILURE);
+    }
+  };
+  if ((ivar>=154) && (ivar<163) && (pm->pmb_pack->phydro != nullptr)) {
+    auto &eos = pm->pmb_pack->phydro->peos->eos_data;
+    if (ivar == 155) {
+      require_lte_h2("hydro", eos, out_params.variable);
+    } else if (ivar == 157 || ivar == 158) {
+      require_lte_helium("hydro", eos, out_params.variable);
+    } else if (ivar == 162) {
+      require_lte_radiation("hydro", eos, out_params.variable);
+    } else {
+      require_tabulated_lte("hydro", eos);
+    }
+  }
+  if ((ivar>=163) && (ivar<172) && (pm->pmb_pack->pmhd != nullptr)) {
+    auto &eos = pm->pmb_pack->pmhd->peos->eos_data;
+    if (ivar == 164) {
+      require_lte_h2("mhd", eos, out_params.variable);
+    } else if (ivar == 166 || ivar == 167) {
+      require_lte_helium("mhd", eos, out_params.variable);
+    } else if (ivar == 171) {
+      require_lte_radiation("mhd", eos, out_params.variable);
+    } else {
+      require_tabulated_lte("mhd", eos);
+    }
   }
   if ((ivar==38) && (pm->pmb_pack->pdyngr == nullptr)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -111,7 +261,7 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << " constructed, or corresponding Hydro or MHD object missing" << std::endl;
     exit(EXIT_FAILURE);
   }
-  if ((ivar>=53) && (ivar<68) &&
+  if ((ivar>=54) && (ivar<68) &&
       (pm->pmb_pack->prad == nullptr || pm->pmb_pack->phydro == nullptr)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
        << "Output of Radiation Hydro variables requested in <output> block '"
@@ -159,7 +309,13 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
        << "Output of Tmunu variable requested in <output> block '"
        << out_params.block_name << "' but no Tmunu object has been constructed."
-       << std::endl << "Input file is likely missing a <adm> block" << std::endl;
+       << std::endl
+       << "Tmunu is the matter source of the Einstein equations and is allocated only "
+       << "when Z4c evolves the spacetime. With a prescribed metric nothing computes it "
+       << "past initialization, so there is no meaningful field to output." << std::endl;
+    // This branch used to fall through and then dereference the null ptmunu when
+    // building the output variable list.
+    exit(EXIT_FAILURE);
   }
   if ((ivar>=151) && (ivar<153) && (pm->pmb_pack->ppart == nullptr)) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
@@ -168,7 +324,15 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
        << std::endl << "Input file is likely missing corresponding block" << std::endl;
     exit(EXIT_FAILURE);
   }
-
+  const bool has_total_gravity_potential =
+      (pm->pmb_pack->pgrav != nullptr) || problem_runtime::HasExternalBHPotential();
+  if (ivar==153 && !has_total_gravity_potential) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+       << "Output of gravity potential requested in <output> block '"
+       << out_params.block_name << "' but neither self-gravity nor an external BH "
+       << "potential is available." << std::endl;
+    exit(EXIT_FAILURE);
+  }
   // Now load STL vector of output variables
   outvars.clear();
 
@@ -177,11 +341,13 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
 
   variables.push_back(out_params.variable);
   if (out_params.file_type == "pdf") {
-    if (out_params.nbin2 > 1) {
+    if (out_params.nbin2 > 0) {
       variables.push_back(out_params.variable_2);
     }
   }
 
+  for (const auto &variable : variables) {
+  }
 
   for (const auto& variable : variables) {
     // hydro (lab-frame) density
@@ -245,7 +411,7 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
         variable.compare("hydro_u") == 0 ||
         variable.compare("rad_hydro_u_e") == 0 ||
         variable.compare("rad_hydro_u") == 0) {
-      if (pm->pmb_pack->phydro->peos->eos_data.is_ideal) {
+      if (pm->pmb_pack->phydro->peos->eos_data.use_e) {
         outvars.emplace_back("ener",4,&(pm->pmb_pack->phydro->u0));
       }
     }
@@ -255,7 +421,7 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
         variable.compare("hydro_w") == 0 ||
         variable.compare("rad_hydro_w_e") == 0 ||
         variable.compare("rad_hydro_w") == 0) {
-      if (pm->pmb_pack->phydro->peos->eos_data.is_ideal) {
+      if (pm->pmb_pack->phydro->peos->eos_data.use_e) {
         if (pm->pmb_pack->pdyngr != nullptr) {
           outvars.emplace_back("press",4,&(pm->pmb_pack->phydro->w0));
         } else {
@@ -263,7 +429,6 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
         }
       }
     }
-
     // hydro passive scalars mass densities (s*d)
     if (variable.compare("hydro_u_s") == 0 ||
         variable.compare("hydro_u") == 0 ||
@@ -377,7 +542,7 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
         variable.compare("rad_mhd_u_e") == 0 ||
         variable.compare("rad_mhd_u") == 0 ||
         variable.compare("rad_mhd_u_bcc") == 0) {
-      if (pm->pmb_pack->pmhd->peos->eos_data.is_ideal) {
+      if (pm->pmb_pack->pmhd->peos->eos_data.use_e) {
         outvars.emplace_back("ener",4,&(pm->pmb_pack->pmhd->u0));
       }
     }
@@ -389,7 +554,7 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
         variable.compare("rad_mhd_w_e") == 0 ||
         variable.compare("rad_mhd_w") == 0 ||
         variable.compare("rad_mhd_w_bcc") == 0) {
-      if (pm->pmb_pack->pmhd->peos->eos_data.is_ideal) {
+      if (pm->pmb_pack->pmhd->peos->eos_data.use_e) {
         if (pm->pmb_pack->pdyngr != nullptr) {
           outvars.emplace_back("press",4,&(pm->pmb_pack->pmhd->w0));
         } else {
@@ -406,14 +571,10 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
         variable.compare("rad_mhd_u") == 0 ||
         variable.compare("rad_mhd_u_bcc") == 0) {
       int nmhd = pm->pmb_pack->pmhd->nmhd;
-      int nvars = nmhd + pm->pmb_pack->pmhd->nscalars;
+      int nvars = pm->pmb_pack->pmhd->nvars;
       for (int n=nmhd; n<nvars; ++n) {
-        char number[3];
-        std::snprintf(number,sizeof(number),"%02d",(n - nmhd)%100);
-        std::string vname;
-        vname.assign("r_");
-        vname.append(number);
-        outvars.emplace_back(vname,n,&(pm->pmb_pack->pmhd->u0));
+        outvars.emplace_back(MhdScalarName(pm->pmb_pack->pmhd, n, true), n,
+                             &(pm->pmb_pack->pmhd->u0));
       }
     }
 
@@ -425,14 +586,10 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
         variable.compare("rad_mhd_w") == 0 ||
         variable.compare("rad_mhd_w_bcc") == 0) {
       int nmhd = pm->pmb_pack->pmhd->nmhd;
-      int nvars = nmhd + pm->pmb_pack->pmhd->nscalars;
+      int nvars = pm->pmb_pack->pmhd->nvars;
       for (int n=nmhd; n<nvars; ++n) {
-        char number[3];
-        std::snprintf(number,sizeof(number),"%02d",(n - nmhd)%100);
-        std::string vname;
-        vname.assign("s_");
-        vname.append(number);
-        outvars.emplace_back(vname,n,&(pm->pmb_pack->pmhd->w0));
+        outvars.emplace_back(MhdScalarName(pm->pmb_pack->pmhd, n, false), n,
+                             &(pm->pmb_pack->pmhd->w0));
       }
     }
 
@@ -469,10 +626,20 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     }
 
     // MHD temperature
-    if (variable.compare("mhd_t") == 0 ||
-        ((variable.compare("mhd_w") == 0 ||
-          variable.compare("mhd_w_bcc") == 0) && pm->pmb_pack->pdyngr !=nullptr)) {
-      outvars.emplace_back("temperature",0,&(pm->pmb_pack->pdyngr->temperature));
+    const bool requested_mhd_t = variable.compare("mhd_t") == 0;
+    const bool requested_dyn_mhd_bundle =
+        (variable.compare("mhd_w") == 0 || variable.compare("mhd_w_bcc") == 0) &&
+        pm->pmb_pack->pdyngr != nullptr;
+    if ((requested_mhd_t || requested_dyn_mhd_bundle) &&
+        pm->pmb_pack->pdyngr != nullptr) {
+      if (!pm->pmb_pack->pdyngr->StoreTemperature()) {
+        if (requested_mhd_t) {
+          outvars.emplace_back("temperature", 0, &(pm->pmb_pack->pmhd->w0),
+                               false, true);
+        }
+      } else {
+        outvars.emplace_back("temperature",0,&(pm->pmb_pack->pdyngr->temperature));
+      }
     }
 
     // hydro/mhd z-component of vorticity (useful in 2D)
@@ -491,6 +658,80 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
       out_params.n_derived += 1;
       int i_derived = out_params.n_derived - 1;
       outvars.emplace_back("vor2",i_derived,&(derived_var));
+    }
+
+    if (variable.compare("hydro_div_v") == 0 ||
+        variable.compare("hydro_abs_div_v") == 0) {
+      out_params.contains_derived = true;
+      out_params.n_derived += 1;
+      int i_derived = out_params.n_derived - 1;
+      outvars.emplace_back(variable.c_str(), i_derived, &(derived_var));
+    }
+
+    if (variable.compare("hydro_temperature") == 0 ||
+        variable.compare("hydro_xh2") == 0 ||
+        variable.compare("hydro_xion") == 0 ||
+        variable.compare("hydro_xhe1") == 0 ||
+        variable.compare("hydro_xhe2") == 0 ||
+        variable.compare("hydro_gamma1") == 0 ||
+        variable.compare("hydro_gamma3m1") == 0 ||
+        variable.compare("hydro_mu") == 0 ||
+        variable.compare("hydro_beta_rad") == 0) {
+      out_params.contains_derived = true;
+      out_params.n_derived += 1;
+      int i_derived = out_params.n_derived - 1;
+      if (variable.compare("hydro_temperature") == 0) {
+        outvars.emplace_back("temperature", i_derived, &(derived_var));
+      } else if (variable.compare("hydro_xh2") == 0) {
+        outvars.emplace_back("xh2", i_derived, &(derived_var));
+      } else if (variable.compare("hydro_xion") == 0) {
+        outvars.emplace_back("xion", i_derived, &(derived_var));
+      } else if (variable.compare("hydro_xhe1") == 0) {
+        outvars.emplace_back("xhe1", i_derived, &(derived_var));
+      } else if (variable.compare("hydro_xhe2") == 0) {
+        outvars.emplace_back("xhe2", i_derived, &(derived_var));
+      } else if (variable.compare("hydro_gamma1") == 0) {
+        outvars.emplace_back("gamma1", i_derived, &(derived_var));
+      } else if (variable.compare("hydro_mu") == 0) {
+        outvars.emplace_back("mu", i_derived, &(derived_var));
+      } else if (variable.compare("hydro_beta_rad") == 0) {
+        outvars.emplace_back("beta_rad", i_derived, &(derived_var));
+      } else {
+        outvars.emplace_back("gamma3m1", i_derived, &(derived_var));
+      }
+    }
+
+    if (variable.compare("mhd_temperature") == 0 ||
+        variable.compare("mhd_xh2") == 0 ||
+        variable.compare("mhd_xion") == 0 ||
+        variable.compare("mhd_xhe1") == 0 ||
+        variable.compare("mhd_xhe2") == 0 ||
+        variable.compare("mhd_gamma1") == 0 ||
+        variable.compare("mhd_gamma3m1") == 0 ||
+        variable.compare("mhd_mu") == 0 ||
+        variable.compare("mhd_beta_rad") == 0) {
+      out_params.contains_derived = true;
+      out_params.n_derived += 1;
+      int i_derived = out_params.n_derived - 1;
+      if (variable.compare("mhd_temperature") == 0) {
+        outvars.emplace_back("temperature", i_derived, &(derived_var));
+      } else if (variable.compare("mhd_xh2") == 0) {
+        outvars.emplace_back("xh2", i_derived, &(derived_var));
+      } else if (variable.compare("mhd_xion") == 0) {
+        outvars.emplace_back("xion", i_derived, &(derived_var));
+      } else if (variable.compare("mhd_xhe1") == 0) {
+        outvars.emplace_back("xhe1", i_derived, &(derived_var));
+      } else if (variable.compare("mhd_xhe2") == 0) {
+        outvars.emplace_back("xhe2", i_derived, &(derived_var));
+      } else if (variable.compare("mhd_gamma1") == 0) {
+        outvars.emplace_back("gamma1", i_derived, &(derived_var));
+      } else if (variable.compare("mhd_mu") == 0) {
+        outvars.emplace_back("mu", i_derived, &(derived_var));
+      } else if (variable.compare("mhd_beta_rad") == 0) {
+        outvars.emplace_back("beta_rad", i_derived, &(derived_var));
+      } else {
+        outvars.emplace_back("gamma3m1", i_derived, &(derived_var));
+      }
     }
 
     // mhd z-component of current density (useful in 2D)
@@ -614,6 +855,9 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
       if (variable.compare("adm") == 0 ||
           variable.compare(adm::ADM::ADM_names[v]) == 0) {
         outvars.emplace_back(adm::ADM::ADM_names[v], v, &(pm->pmb_pack->padm->u_adm));
+        if (!pm->pmb_pack->padm->StoresMetricGrid()) {
+          outvars.back().stream_adm_metric = true;
+        }
       }
     }
 
@@ -621,8 +865,11 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
     if (nullptr == pm->pmb_pack->pz4c) {
       for (int v = adm::ADM::nadm - 4; v < adm::ADM::nadm; ++v) {
         if (variable.compare("adm") == 0 ||
-            variable.compare(adm::ADM::ADM_names[v]) == 0) {
+          variable.compare(adm::ADM::ADM_names[v]) == 0) {
           outvars.emplace_back(adm::ADM::ADM_names[v], v, &(pm->pmb_pack->padm->u_adm));
+          if (!pm->pmb_pack->padm->StoresMetricGrid()) {
+            outvars.back().stream_adm_metric = true;
+          }
         }
       }
     }
@@ -695,13 +942,61 @@ BaseTypeOutput::BaseTypeOutput(ParameterInput *pin, Mesh *pm, OutputParameters o
       outvars.emplace_back("r23_ff",moments_offset+8,&(derived_var));
       outvars.emplace_back("r33_ff",moments_offset+9,&(derived_var));
     }
+
+    const bool append_bundle_grav_phi =
+        (variable.compare("hydro_u") == 0 ||
+         variable.compare("hydro_w") == 0 ||
+         variable.compare("rad_hydro_u") == 0 ||
+         variable.compare("rad_hydro_w") == 0 ||
+         variable.compare("mhd_u") == 0 ||
+         variable.compare("mhd_w") == 0 ||
+         variable.compare("mhd_u_bcc") == 0 ||
+         variable.compare("mhd_w_bcc") == 0 ||
+         variable.compare("rad_mhd_u") == 0 ||
+         variable.compare("rad_mhd_w") == 0 ||
+         variable.compare("rad_mhd_u_bcc") == 0 ||
+         variable.compare("rad_mhd_w_bcc") == 0);
+    if ((variable.compare("grav_phi") == 0 || append_bundle_grav_phi) &&
+        has_total_gravity_potential) {
+      const bool stream_grav_phi =
+          (out_params.file_type.compare("bin") == 0 ||
+           out_params.file_type.compare("vtk") == 0);
+      if (stream_grav_phi) {
+        outvars.emplace_back("grav_phi", 0, &(derived_var), true);
+      } else {
+        out_params.contains_derived = true;
+        out_params.n_derived += 1;
+        int i_derived = out_params.n_derived - 1;
+        outvars.emplace_back("grav_phi", i_derived, &(derived_var));
+      }
+    }
+
+    // particle density binned to mesh
+    if (variable.compare("prtcl_d") == 0) {
+      out_params.contains_derived = true;
+      out_params.n_derived += 1;
+      outvars.emplace_back("pdens",0,&(derived_var));
+    }
   }
 
-  // particle density binned to mesh
-  if (out_params.variable.compare("prtcl_d") == 0) {
-    out_params.contains_derived = true;
-    out_params.n_derived += 1;
-    outvars.emplace_back("pdens",0,&(derived_var));
+  const bool streams_analytic_adm = std::any_of(
+      outvars.begin(), outvars.end(),
+      [](const OutputVariableInfo &var) { return var.stream_adm_metric; });
+  if (streams_analytic_adm &&
+      (out_params.file_type == "cbin" || out_params.file_type == "pdf" ||
+       out_params.file_type == "cart" || out_params.file_type == "sph")) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+              << std::endl
+              << "Output type '" << out_params.file_type << "' requests ADM variables, "
+              << "but <adm>/metric_backend is an on-the-fly analytical metric so there "
+              << "is no stored ADM grid to read." << std::endl
+              << "The cbin, pdf, cart and sph writers each load output variables straight "
+              << "from their backing device array; only tab, vtk and bin go through the "
+              << "streaming path that can evaluate the metric per point." << std::endl
+              << "Either dump ADM variables through a tab/vtk/bin output, or set "
+              << "<adm>/metric_backend=stored for this run (which costs "
+              << "17 x ncells x 8 bytes per MeshBlock of device memory)." << std::endl;
+    std::exit(EXIT_FAILURE);
   }
 
   // initialize vector containing number of output MBs per rank
@@ -805,40 +1100,209 @@ void BaseTypeOutput::LoadOutputData(Mesh *pm) {
   // get number of output vars and MBs, then realloc outarray (HostArray)
   int nout_vars = outvars.size();
   int nout_mbs = outmbs.size();
+  int nout1 = 0;
+  int nout2 = 0;
+  int nout3 = 0;
   // note that while ois,oie,etc. can be different on each MB, the number of cells output
   // on each MeshBlock, i.e. (ois-ois+1), etc. is the same.
   if (nout_mbs > 0) {
-    int nout1 = (outmbs[0].oie - outmbs[0].ois + 1);
-    int nout2 = (outmbs[0].oje - outmbs[0].ojs + 1);
-    int nout3 = (outmbs[0].oke - outmbs[0].oks + 1);
+    nout1 = (outmbs[0].oie - outmbs[0].ois + 1);
+    nout2 = (outmbs[0].oje - outmbs[0].ojs + 1);
+    nout3 = (outmbs[0].oke - outmbs[0].oks + 1);
     // NB: outarray stores all output data on Host
     Kokkos::realloc(outarray, nout_vars, nout_mbs, nout3, nout2, nout1);
   }
 
-  // Calculate derived variables, if required
   if (out_params.contains_derived) {
+    out_params.i_derived = 0;
     ComputeDerivedVariable(out_params.variable, pm);
+  }
+
+  // Reuse one staging allocation for all variables and MeshBlocks.  Creating and
+  // destroying a device View for every block leaves a long chain of asynchronous
+  // allocations around large multi-variable outputs and is needlessly expensive.
+  DvceArray3D<Real> d_output_var;
+  DvceArray3D<Real>::HostMirror h_output_var;
+  if (nout_mbs > 0 && nout_vars > 0) {
+    d_output_var = DvceArray3D<Real>("d_out_var", nout3, nout2, nout1);
+    h_output_var = Kokkos::create_mirror(d_output_var);
+  }
+
+  // Only the ADM components this output actually asks for need staging.  Materializing
+  // all 17 for a run that dumps, say, adm_alpha alone wasted 17x the scratch memory and
+  // 17x the device-to-host traffic per MeshBlock.
+  std::vector<int> adm_slot_component;
+  for (int n = 0; n < nout_vars; ++n) {
+    if (outvars[n].stream_adm_metric) adm_slot_component.push_back(outvars[n].data_index);
+  }
+  std::sort(adm_slot_component.begin(), adm_slot_component.end());
+  adm_slot_component.erase(
+      std::unique(adm_slot_component.begin(), adm_slot_component.end()),
+      adm_slot_component.end());
+  const int nadm_slots = static_cast<int>(adm_slot_component.size());
+  if (nadm_slots > 0) {
+    DualArray1D<int> slot_component("adm_slot_component", nadm_slots);
+    for (int s = 0; s < nadm_slots; ++s) slot_component.h_view(s) = adm_slot_component[s];
+    slot_component.template modify<HostMemSpace>();
+    slot_component.template sync<DevExeSpace>();
+    auto d_slot = slot_component.d_view;
+
+    DvceArray4D<Real> d_adm("stream_adm_metric", nadm_slots, nout3, nout2, nout1);
+    auto h_adm = Kokkos::create_mirror(d_adm);
+    const auto metric = pm->pmb_pack->padm->GetMetricView(pm->time);
+    for (int m = 0; m < nout_mbs; ++m) {
+      const int mbi = pm->FindMeshBlockIndex(outmbs[m].mb_gid);
+      if (mbi < 0 || mbi >= pm->pmb_pack->nmb_thispack) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "Output MeshBlock GID " << outmbs[m].mb_gid
+                  << " is not present in the local MeshBlockPack on rank "
+                  << global_variable::my_rank << "." << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
+      const int ois = outmbs[m].ois;
+      const int ojs = outmbs[m].ojs;
+      const int oks = outmbs[m].oks;
+      par_for("stream_analytic_adm_output", DevExeSpace(), 0, nout3 - 1,
+              0, nout2 - 1, 0, nout1 - 1,
+      KOKKOS_LAMBDA(int ko, int jo, int io) {
+        adm::ADMMetricPoint point{};
+        metric.CellMetricFull(mbi, oks + ko, ojs + jo, ois + io, point);
+        for (int s = 0; s < nadm_slots; ++s) {
+          const int v = d_slot(s);
+          Real value;
+          if (v >= adm::ADM::I_ADM_GXX && v <= adm::ADM::I_ADM_GZZ) {
+            value = point.g_dd[v - adm::ADM::I_ADM_GXX];
+          } else if (v >= adm::ADM::I_ADM_KXX && v <= adm::ADM::I_ADM_KZZ) {
+            value = point.K_dd[v - adm::ADM::I_ADM_KXX];
+          } else if (v == adm::ADM::I_ADM_ALPHA) {
+            value = point.alpha;
+          } else if (v == adm::ADM::I_ADM_PSI4) {
+            // The prescribed analytical metric carries no conformal decomposition, so the
+            // point value is left at zero on the hot path.  det(gamma)^(1/3) is the
+            // natural stand-in and matches what the M1 metric wrapper uses; computing it
+            // here costs one cbrt in a cold output kernel instead of in every solver.
+            const Real detg = adm::SpatialDet(point.g_dd[S11], point.g_dd[S12],
+                                              point.g_dd[S13], point.g_dd[S22],
+                                              point.g_dd[S23], point.g_dd[S33]);
+            value = (detg > 0.0) ? Kokkos::cbrt(detg) : 0.0;
+          } else {
+            value = point.beta_u[v - adm::ADM::I_ADM_BETAX];
+          }
+          d_adm(s, ko, jo, io) = value;
+        }
+      });
+      Kokkos::deep_copy(h_adm, d_adm);
+      for (int n = 0; n < nout_vars; ++n) {
+        if (!outvars[n].stream_adm_metric) continue;
+        const int slot = static_cast<int>(
+            std::lower_bound(adm_slot_component.begin(), adm_slot_component.end(),
+                             outvars[n].data_index) - adm_slot_component.begin());
+        auto h_src = Kokkos::subview(h_adm, slot,
+                                     Kokkos::ALL, Kokkos::ALL, Kokkos::ALL);
+        auto h_dst = Kokkos::subview(outarray, n, m, Kokkos::ALL,
+                                     Kokkos::ALL, Kokkos::ALL);
+        Kokkos::deep_copy(h_dst, h_src);
+      }
+    }
   }
 
   // Now copy data to host (outarray) over all variables and MeshBlocks
   for (int n=0; n<nout_vars; ++n) {
+    if (outvars[n].stream_adm_metric) continue;
     for (int m=0; m<nout_mbs; ++m) {
       int mbi = pm->FindMeshBlockIndex(outmbs[m].mb_gid);
+      if (mbi < 0 || mbi >= pm->pmb_pack->nmb_thispack) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "Output MeshBlock GID " << outmbs[m].mb_gid
+                  << " is not present in the local MeshBlockPack on rank "
+                  << global_variable::my_rank << "." << std::endl;
+        std::exit(EXIT_FAILURE);
+      }
       std::pair<int,int> irange = std::make_pair(outmbs[m].ois, outmbs[m].oie+1);
       std::pair<int,int> jrange = std::make_pair(outmbs[m].ojs, outmbs[m].oje+1);
       std::pair<int,int> krange = std::make_pair(outmbs[m].oks, outmbs[m].oke+1);
-      int nout1 = (outmbs[0].oie - outmbs[0].ois + 1);
-      int nout2 = (outmbs[0].oje - outmbs[0].ojs + 1);
-      int nout3 = (outmbs[0].oke - outmbs[0].oks + 1);
+      if (outvars[n].stream_ideal_dyn_temperature) {
+        auto w0 = *(outvars[n].data_ptr);
+        const Real baryon_mass = pm->pmb_pack->pdyngr->BaryonMass();
+        const int mlocal = mbi;
+        const int ois = outmbs[m].ois;
+        const int ojs = outmbs[m].ojs;
+        const int oks = outmbs[m].oks;
+        par_for("stream_ideal_dyn_temperature_output", DevExeSpace(), 0, nout3 - 1,
+                0, nout2 - 1, 0, nout1 - 1,
+        KOKKOS_LAMBDA(int ko, int jo, int io) {
+          const int i = ois + io;
+          const int j = ojs + jo;
+          const int k = oks + ko;
+          const Real rho = w0(mlocal, IDN, k, j, i);
+          const Real press = w0(mlocal, IPR, k, j, i);
+          const Real number_density =
+              (baryon_mass > 0.0 && isfinite(baryon_mass)) ? (rho / baryon_mass) : rho;
+          d_output_var(ko, jo, io) =
+              (number_density > 0.0 && press > 0.0) ?
+              (press / number_density) : 0.0;
+        });
+      } else if (outvars[n].stream_grav_phi) {
+        const bool has_self_gravity =
+            (pm->pmb_pack->pgrav != nullptr && pm->pmb_pack->pgrav->phi_valid);
+        bool has_external_bh = false;
+        Real bhx = 0.0, bhy = 0.0, bhz = 0.0;
+        Real bh_mass = 0.0, bh_softening = 0.0, newton_g = 0.0;
+        problem_runtime::GetExternalBHPotential(pm->time, has_external_bh,
+                                                bhx, bhy, bhz,
+                                                bh_mass, bh_softening, newton_g);
+        DvceArray5D<Real> phi;
+        if (has_self_gravity) phi = pm->pmb_pack->pgrav->phi;
+        auto &mb_size = pm->pmb_pack->pmb->mb_size;
+        const int mlocal = mbi;
+        const int ois = outmbs[m].ois;
+        const int ojs = outmbs[m].ojs;
+        const int oks = outmbs[m].oks;
+        const Real bh_soft2 = bh_softening*bh_softening;
+        par_for("stream_grav_phi_output", DevExeSpace(), 0, nout3 - 1,
+                0, nout2 - 1, 0, nout1 - 1,
+        KOKKOS_LAMBDA(int ko, int jo, int io) {
+          const int i = ois + io;
+          const int j = ojs + jo;
+          const int k = oks + ko;
+          Real phi_tot = has_self_gravity ? phi(mlocal, 0, k, j, i) : 0.0;
+          if (has_external_bh) {
+            const Real x = CellCenterX(i - indcs.is, indcs.nx1,
+                                       mb_size.d_view(mlocal).x1min,
+                                       mb_size.d_view(mlocal).x1max);
+            const Real y = CellCenterX(j - indcs.js, indcs.nx2,
+                                       mb_size.d_view(mlocal).x2min,
+                                       mb_size.d_view(mlocal).x2max);
+            const Real z = CellCenterX(k - indcs.ks, indcs.nx3,
+                                       mb_size.d_view(mlocal).x3min,
+                                       mb_size.d_view(mlocal).x3max);
+            const Real dx = x - bhx;
+            const Real dy = y - bhy;
+            const Real dz = z - bhz;
+            phi_tot -= newton_g*bh_mass/sqrt(dx*dx + dy*dy + dz*dz + bh_soft2);
+          }
+          d_output_var(ko, jo, io) = phi_tot;
+        });
+      } else {
+        const auto &data = *(outvars[n].data_ptr);
+        const bool invalid_index = outvars[n].data_index < 0 ||
+            outvars[n].data_index >= data.extent_int(1);
+        const bool invalid_range = outmbs[m].ois < 0 || outmbs[m].oie >= data.extent_int(4) ||
+            outmbs[m].ojs < 0 || outmbs[m].oje >= data.extent_int(3) ||
+            outmbs[m].oks < 0 || outmbs[m].oke >= data.extent_int(2);
+        if (mbi >= data.extent_int(0) || invalid_index || invalid_range) {
+          std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "Output variable '" << outvars[n].label
+                    << "' references an invalid data view on rank "
+                    << global_variable::my_rank << "." << std::endl;
+          std::exit(EXIT_FAILURE);
+        }
+        auto d_slice = Kokkos::subview(*(outvars[n].data_ptr), mbi, outvars[n].data_index,
+                                       krange,jrange,irange);
+        Kokkos::deep_copy(d_output_var,d_slice);
+      }
 
-      // copy output variable to new device View
-      DvceArray3D<Real> d_output_var("d_out_var",nout3,nout2,nout1);
-      auto d_slice = Kokkos::subview(*(outvars[n].data_ptr), mbi, outvars[n].data_index,
-                                     krange,jrange,irange);
-      Kokkos::deep_copy(d_output_var,d_slice);
-
-      // copy new device View to host mirror View
-      DvceArray3D<Real>::HostMirror h_output_var = Kokkos::create_mirror(d_output_var);
+      // copy device staging View to its reusable host mirror
       Kokkos::deep_copy(h_output_var,d_output_var);
 
       // copy host mirror to 5D host View containing all output variables

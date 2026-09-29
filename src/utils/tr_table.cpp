@@ -13,6 +13,7 @@
 
 #include "tr_table.hpp"
 #include "tr_utils.hpp"
+#include "utils/data_path.hpp"
 
 using namespace TableReader; // NOLINT
 
@@ -25,8 +26,13 @@ Table::~Table() {
   }
 }
 
-ReadResult Table::ReadTable(const std::string fname) {
+ReadResult Table::ReadTable(const std::string name) {
   ReadResult result;
+
+  // A relative name is looked for in the working directory, then in the data directory
+  // (utils/data_path.hpp).
+  std::string searched;
+  const std::string fname = ResolveDataPath(name, &searched);
 
   std::ifstream file;
   try {
@@ -46,6 +52,7 @@ ReadResult Table::ReadTable(const std::string fname) {
     result.error = ReadResult::BAD_FILENAME;
     std::stringstream ss;
     ss << "No exception occurred, but ReadTable() failed to open '" << fname << "'\n";
+    if (!searched.empty()) ss << "(looked for " << searched << ")\n";
     result.message = ss.str();
     return result;
   }

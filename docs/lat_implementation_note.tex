@@ -1,0 +1,510 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{enumitem}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\setlist[itemize]{leftmargin=1.5em}
+\setlist[enumerate]{leftmargin=1.7em}
+
+\newcommand{\dt}{\Delta t}
+\newcommand{\dtfine}{\Delta t_{\mathrm{fine}}}
+\newcommand{\fac}{f}
+
+\title{AthenaK Newtonian HD Local Adaptive Timestepping Implementation Note}
+\author{LAT branch implementation summary}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Scope}
+
+This note documents the local adaptive timestepping (LAT) implementation in the
+current \texttt{LAT} branch of this AthenaK-derived Newtonian HD code.  The
+implementation is designed for the production TDE setup with LTE table EOS,
+dual energy, self-gravity, AMR, and a Newtonian black-hole sink/excision
+source.  It is not a general all-physics AthenaK LAT implementation.
+
+LAT is enabled only for explicit Newtonian hydrodynamics.  The driver rejects
+LAT for MHD, radiation, GR/SR coordinate systems, particles, implicit/IMEX
+stages, orbital advection, shearing boxes, viscosity, conduction, generic user
+timestep constraints, generic user boundary conditions, and user source terms
+that are not explicitly marked LAT-safe by the problem generator.  This
+restriction is intentional: every operator that changes state must be aware of
+which MeshBlocks are active at the current local time.
+
+The main implementation files are:
+\begin{itemize}
+  \item \path{src/driver/driver.cpp} and \path{src/driver/driver.hpp}: LAT
+        window scheduling, active-mask lifetime, synchronized gravity/AMR/output
+        ordering, and restart/post-AMR LAT migration.
+  \item \path{src/mesh/mesh.cpp}: local-CFL metadata, factor binning,
+        same-level/AMR neighbor limiting, and cached bin counts.
+  \item \path{src/mesh/meshblock_pack.cpp} and
+        \path{src/mesh/meshblock_pack.hpp}: active MeshBlock masks,
+        boundary-provider masks, flux-correction masks, mask caches, and
+        per-block LAT time intervals.
+  \item \path{src/mesh/load_balance.cpp}: LAT factor estimates for initial
+        load balance, default LAT GID interleaving, per-timelevel partition
+        objective, and cap-aware load balancing.
+  \item \path{src/mesh/build_tree.cpp},
+        \path{src/mesh/mesh_refinement.cpp}, and
+        \path{src/mesh/mesh_refinement.hpp}: startup/restart ordering, AMR
+        candidate ordering, migration maps, and safe state transfer under
+        non-Z-order GIDs.
+  \item \path{src/pgen/pgen.cpp}: restart payload reads through the
+        current-GID to restart-file-GID map.
+  \item \path{src/hydro/hydro_tasks.cpp},
+        \path{src/hydro/hydro_update.cpp},
+        \path{src/hydro/hydro_newdt.cpp},
+        \path{src/hydro/hydro_fluxes.cpp}, and
+        \path{src/hydro/hydro_dual_energy.cpp}: active-mask-aware hydro
+        kernels, delayed refluxing, and dual-energy consistency.
+  \item \path{src/bvals/}: time-aware cell-centered boundary exchange,
+        prolongation/restriction, and AMR/same-level flux correction.
+  \item \path{src/pgen/tde_external.cpp}: LAT-safe TDE source hooks and the
+        black-hole sink/excision LAT factor cap.
+\end{itemize}
+
+\section{User Controls}
+
+The production controls are in the \texttt{<time>} and
+\texttt{<mesh\_refinement>} blocks:
+
+\begin{center}
+\begin{tabular}{p{0.34\linewidth}p{0.56\linewidth}}
+\toprule
+Parameter & Meaning \\
+\midrule
+\texttt{time/hydro\_lat} & Enable HD LAT. \\
+\texttt{time/hydro\_lat\_levels} & Number of binary local timestep levels.
+The maximum synchronization factor is \(2^{\texttt{levels}}\). \\
+\texttt{time/hydro\_lat\_same\_level} & Permit same-AMR-level neighbors to
+use different LAT factors when boundary interpolation and same-level delayed
+refluxing are enabled. \\
+\texttt{time/hydro\_lat\_same\_level\_max\_ratio} & Maximum same-level factor
+ratio after a synchronized history is available. \\
+\texttt{time/hydro\_lat\_neighbor\_limiter} & Neighbor limiter scope:
+\texttt{all}, \texttt{hybrid}, or \texttt{face}. \\
+\texttt{time/hydro\_lat\_min\_bin\_count} & Minimum useful bin population.
+\(-1\) means the default \(4N_{\mathrm{rank}}\); \(0\) disables sparse-bin
+pruning. \\
+\texttt{time/hydro\_lat\_gid\_reorder} & Enable LAT-optimized GID ordering.
+Default: \texttt{true} when LAT is enabled. \\
+\texttt{time/hydro\_lat\_post\_amr\_rebalance} & Allow the driver to perform
+a migration-only LAT rebalance after AMR when needed.  The default follows
+\texttt{hydro\_lat\_gid\_reorder}. \\
+\texttt{time/hydro\_lat\_diagnostics} & Print additional LAT bin and factor
+diagnostics. \\
+\texttt{mesh\_refinement/max\_nmb\_per\_rank} & Hard GPU memory cap on
+MeshBlocks per rank, honored by LAT startup, restart, load balance, and AMR.
+For the current H2 production input this is set to 600. \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+When \texttt{hydro\_lat=true}, the driver internally uses hydro subcycling with
+\[
+  \texttt{hydro\_subcycle\_factor} = 2^{\texttt{hydro\_lat\_levels}} .
+\]
+This is an upper bound.  Each LAT window chooses a possibly smaller
+synchronization factor from the available metadata, the remaining time to
+\texttt{tlim}, and the self-gravity cadence.
+
+\section{Basic Time Integration Algorithm}
+
+At a synchronized state all MeshBlocks are at the same physical time \(t^n\).
+The code computes the ordinary global hydro timestep \(\dtfine\), which is the
+minimum local-CFL hydro timestep over all MeshBlocks.  It then assigns each
+MeshBlock a power-of-two local factor
+\[
+  \fac_i \in \{1,2,4,\ldots,F\},
+\]
+where \(F\) is the active synchronization factor for the next LAT window.
+MeshBlock \(i\) advances with
+\[
+  \dt_i = \fac_i \dtfine .
+\]
+
+The driver then advances \(F\) fine ticks.  At fine tick phase \(q\), a block
+with factor \(\fac\) is due if
+\[
+  q \bmod \fac = 0 .
+\]
+Within each fine tick, due bins are visited from the largest factor down to
+\(\fac=1\).  This coarsest-first sweep makes slow blocks provide boundary data
+before faster bins need it at the same fine-tick time.
+
+At the end of every fine tick the mesh time and cycle advance by
+\(\dtfine\), not by the largest bin timestep.  At the end of the LAT window all
+blocks are synchronized again.  Only synchronized states are allowed to trigger
+AMR, output, after-cycle callbacks, local-CFL metadata rebuilds, or multigrid
+self-gravity source loading.
+
+\section{LAT Factor Metadata}
+
+\path{Hydro::NewTimeStep} stores local hydro timestep estimates in
+\texttt{dtnew\_eachmb}.  At synchronized states,
+\path{Mesh::UpdateHydroLATMetadata} gathers these estimates into
+\texttt{hydro\_lat\_dt\_eachmb} and builds
+\texttt{hydro\_lat\_factor\_eachmb}.  The raw factor is the largest
+power-of-two value satisfying
+\[
+  \fac_i \dtfine \leq \dt_{i,\mathrm{local}},
+\]
+clamped by the configured maximum factor.
+
+The raw factors are then made safe by several reductions:
+\begin{enumerate}
+  \item A problem-specific cap hook may lower factors when a problem generator
+        installs one.  The TDE problem generator currently does not install a
+        LAT factor cap.
+  \item If \texttt{hydro\_lat\_same\_level=false}, all blocks on an AMR level
+        collapse to the minimum factor on that level.
+  \item Sparse bins are folded downward according to
+        \texttt{hydro\_lat\_min\_bin\_count}.  The default is
+        \(4N_{\mathrm{rank}}\).
+  \item The neighbor limiter enforces a conservative staircase across AMR and
+        same-level neighbors.  The limiter is iterative and MPI-reduced: local
+        changes are detected with a small allreduce first, and the full factor
+        array is reduced only while changes still exist.
+\end{enumerate}
+
+The final factor table is versioned with
+\texttt{hydro\_lat\_metadata\_version}.  MeshBlockPack active-mask caches are
+invalidated whenever metadata or topology changes.  The mesh also stores
+\texttt{hydro\_lat\_bin\_count}, so common per-tick queries such as ``does bin
+\(\fac\) exist'' are \(O(1)\) instead of repeatedly scanning
+\texttt{nmb\_total}.
+
+\section{Active Masks and Communication Masks}
+
+LAT is implemented by masking MeshBlocks inside one ordinary MeshBlockPack.
+The main arrays live in \path{MeshBlockPack}:
+\begin{itemize}
+  \item \texttt{lat\_active\_mb} and \texttt{lat\_active\_indices}: blocks that
+        execute state-changing hydro work in the current bin.
+  \item \texttt{lat\_boundary\_send\_mb} and
+        \texttt{lat\_boundary\_send\_indices}: inactive blocks that still need
+        to provide ghost-zone data to active neighbors.
+  \item \texttt{lat\_send\_nghbr}: per-neighbor boundary send mask.
+  \item \texttt{lat\_flux\_accum\_nghbr},
+        \texttt{lat\_flux\_send\_nghbr}, and
+        \texttt{lat\_flux\_recv\_nghbr}: face-neighbor masks for delayed
+        refluxing.
+  \item \texttt{lat\_time\_start} and \texttt{lat\_time\_end}: the local time
+        interval represented by each block's current conserved state.
+\end{itemize}
+
+\path{SetActiveMeshBlocksByLATFactor} installs a single factor bin.
+\path{SetActiveMeshBlocksByLATDueFactors} installs the union of all bins due at
+a fine-tick phase.  The union mask is used for the pre-bin boundary refresh at
+the tick start.  Both routines compute and cache the boundary-need flags
+\texttt{lat\_cached\_needs\_restrict},
+\texttt{lat\_cached\_needs\_prolongate},
+\texttt{lat\_cached\_needs\_physical\_bc}, and
+\texttt{lat\_cached\_needs\_neighbor\_recv}.  Therefore
+\path{RefreshHydroLATBoundaries} does not have to rescan all neighbors for
+every refresh.
+
+It is important that ``active'' and ``communication needed'' are different.
+A rank may have no active MeshBlocks in a bin but still own boundary providers
+or flux receivers.  In that case the relevant task lists still run on that
+rank so MPI send/receive ordering remains consistent.
+
+\section{Boundary Exchange and Time Interpolation}
+
+Cell-centered boundary exchange is time-aware under LAT.  The driver sets
+\texttt{hydro\_lat\_exchange\_time} before a refresh.  Boundary packing and
+unpacking can use the block's start state, end state, and requested target time
+to provide ghost data at the correct local time.  Same-level mixed-factor
+boundaries use dense RK2 interpolation between the synchronized start state
+and the block's current/end state.
+
+The driver refresh sequence is:
+\begin{enumerate}
+  \item Optional problem hydro state fixup at the target time.
+  \item Restriction if an active or provider block has a coarser neighbor that
+        needs restricted data.
+  \item The usual \texttt{InitRecv}, \texttt{SendU}, \texttt{RecvU} boundary
+        exchange and shear exchange.
+  \item Physical BCs, prolongation, and conserved-to-primitive conversion only
+        when the cached mask says the operation is needed.
+\end{enumerate}
+
+Non-fine bins may skip their final boundary exchange when the next fine tick
+will perform a union refresh.  This avoids redundant communication without
+leaving synchronized states stale: the driver marks a boundary refresh as
+needed after each fine tick and performs the refresh at the next synchronized
+state before gravity, AMR, output, or timestep recomputation.
+
+\section{Delayed Flux Correction}
+
+Finite-volume conservation across mixed-timestep faces is handled by delayed
+refluxing.  During a LAT bin,
+\path{Hydro::AccumulateLATCoarseFluxes} accumulates the slower/coarser side's
+time-integrated face flux using the final RK flux weight and the local
+timestep.  Faster/finer-side fluxes are sent through the existing AMR
+flux-correction buffers.  When a receiver reaches the corresponding
+synchronization time, \path{Hydro::ApplyLATFluxCorrection} applies the flux
+difference.
+
+This mechanism is used for both ordinary AMR coarse/fine faces and same-level
+mixed-factor faces when \texttt{hydro\_lat\_same\_level=true}.  Edge and corner
+neighbors participate in boundary exchange, but not flux correction, because
+finite-volume fluxes pass only through faces.
+
+The reflux correction is split into independent x1, x2, and x3 directional
+kernels with fences between directions.  This avoids races in corner/edge
+cells when multiple face corrections touch the same conserved cell.  For
+dual-energy hydro, the auxiliary internal-energy/volume-fraction field receives
+a matching delayed correction.  For self-gravity total-energy runs, the reflux
+path includes a gravitational energy consistency correction using the current
+potential.
+
+\section{Hydro, EOS, and Source-Term Coverage}
+
+All state-changing hydro kernels used by this LAT mode must respect
+\texttt{lat\_active\_mask\_enabled}.  The current implementation covers RK
+updates, flux computation, dual-energy synchronization, EOS
+conserved-to-primitive conversion, physical hydro boundary work, AMR
+prolongation/restriction, FOFC-related hydro paths, excision cleanup, and the
+TDE source term.
+
+\path{Hydro::NewTimeStep} is not run inside masked LAT bins.  Local-CFL
+estimates are meaningful only at synchronized states after boundary and reflux
+corrections are complete.
+
+Generic user source terms are rejected unless the problem generator sets
+\texttt{user\_srcs\_lat\_safe=true}.  The TDE problem generator sets this only
+when \texttt{problem/use\_translating\_frame=false}.  The translating frame
+uses global mesh-state-dependent acceleration and is therefore not LAT-safe.
+The active TDE gravity source loops over \texttt{lat\_active\_indices} when LAT
+is active and evaluates BH/frame data at the driver-provided stage/source time.
+
+\section{Self-Gravity}
+
+Self-gravity is synchronized with LAT.  A LAT window reuses one synchronized
+potential; it does not run Poisson solves inside local bins, because doing so
+would load density from blocks at mixed local times.  Before a LAT window, the
+driver refreshes the potential if it is invalid or due at the window start.
+It also shortens the proposed LAT window if the configured gravity cadence
+would require a solve before the proposed synchronization point.
+
+At a synchronized LAT boundary the driver clears masks, refreshes hydro
+boundaries if delayed reflux changed any state, and then runs gravity if due.
+AMR and output see only synchronized hydro and gravity state.
+
+\section{LAT-Aware GID Ordering}
+
+The most important production load-balance change is the default LAT GID
+ordering.  Standard AthenaK assigns GIDs by Z-order traversal, and each rank
+owns a contiguous GID interval.  That contiguous interval assumption is used in
+many MPI and local-index calculations, so this branch does not assign arbitrary
+non-contiguous GIDs to ranks.
+
+Instead, when \texttt{hydro\_lat=true} and
+\texttt{hydro\_lat\_gid\_reorder=true} (the default), the code changes the GID
+ordering itself.  \path{BuildHydroLATGIDMap} groups candidate MeshBlocks by
+LAT factor, sorts each factor bin by Z-order for locality, and then emits a
+proportional interleaving of factor bins.  \path{ApplyHydroLATGIDMapToArrays}
+applies that permutation to logical locations, costs, factor lists, optional
+restart maps, and the MeshBlockTree leaf GIDs.
+
+This keeps the invariant
+\[
+  \mathrm{local\ lid} = \mathrm{gid} - \mathrm{gids\_eachrank[rank]}
+\]
+valid everywhere.  It also distributes fine-timestep factor-1 blocks across
+all ranks, instead of letting a compact BH/stream region occupy only one or two
+contiguous Z-order rank intervals.  Existing output readers continue to work
+because output carries each MeshBlock's logical metadata and data; the internal
+GID order is not the physical plotting coordinate system.
+
+\section{LAT Load Balance Objective}
+
+After GID ordering, \path{Mesh::LoadBalance} still produces contiguous GID
+cuts.  When factor metadata is available, the objective is per-timelevel rather
+than purely scalar.  It builds prefix tables for:
+\begin{itemize}
+  \item each factor bin count,
+  \item scalar cost,
+  \item work due at every tick phase in the LAT synchronization window.
+\end{itemize}
+
+The optimizer evaluates partitions by maximum per-tick work, sum of per-tick
+rank maxima, idle rank slots, factor-bin idle slots, maximum per-rank block
+count, block-count imbalance, and scalar cost.  It tries several seeds:
+ordinary scalar cost, active work, equal blocks, factor-weighted costs,
+peak-tick weights, bin-balanced cuts, and critical-tick cuts.  It then applies
+single-cut and adjacent-pair local search while enforcing
+\texttt{max\_nmb\_per\_rank}.
+
+If LAT metadata is unavailable, startup/restart load balance estimates factors
+conservatively from existing metadata, AMR containment, or AMR level.  If even
+that is unavailable, it falls back to block-count balance so the memory cap
+remains a true allocation bound.
+
+\section{AMR and State Migration}
+
+AMR is allowed only at synchronized LAT states.  The driver also suppresses a
+terminal AMR pass after the last accepted hydro update, since there is no
+following step to use the adapted mesh.
+
+\path{MeshRefinement::RedistAndRefineMeshBlocks} has been made safe for
+LAT-reordered GIDs.  For pure rebalance, it can request a new LAT GID map
+directly from the current logical-location list.  For real AMR, it first lets
+the tree produce the usual candidate mesh and new-to-old map, then applies the
+LAT interleaving to both the candidate logical-location list and the
+\texttt{newtoold} migration map before \texttt{oldtonew}, load balance, MPI
+migration, and local in-place copies are built.
+
+The AMR state-transfer routines were also adjusted for non-Z-order GIDs:
+\begin{itemize}
+  \item \texttt{oldtonew} is built by logical containment rather than by
+        assuming adjacent old/new GID arithmetic.
+  \item Refine/derefine child lookup uses explicit child maps rather than
+        relying on consecutive child GIDs.
+  \item Local copy/rebalance routines handle arbitrary same-rank source/dest
+        permutations with temporary storage for cycles.
+  \item After topology changes, the MeshBlockTree leaf GIDs are reset from the
+        final LAT-ordered logical-location array.
+\end{itemize}
+
+Hydro storage resize was changed to reduce transient GPU memory spikes during
+AMR.  Persistent state arrays may retain capacity, while scratch and
+time-evolving arrays use \texttt{Kokkos::realloc} to avoid holding both old and
+new scratch allocations longer than needed.
+
+\section{Restart Semantics}
+
+LAT restarts require a single global restart file.  Per-rank restart files are
+rejected when LAT is enabled because arbitrary GID reordering cannot safely
+read rank-local payload files without a global data map.
+
+Restart handling has two distinct maps:
+\begin{enumerate}
+  \item The restart file stores payloads by the GID order used when the file
+        was written.
+  \item The live mesh may immediately reorder GIDs for LAT load balance.
+\end{enumerate}
+Therefore \path{BuildTreeFromRestart} constructs
+\texttt{restart\_gid\_eachmb}, a current-GID to restart-file-GID map.  If the
+startup LAT GID interleaving composes another permutation, that restart map is
+composed as well.  \path{ProblemGenerator::ProblemGenerator} then reads every
+cell-centered and face-centered restart payload from
+\[
+  \texttt{headeroffset}
+  + \texttt{restart\_file\_gid}\times\texttt{data\_size}
+  + \texttt{field\_offset}.
+\]
+The mapped path uses independent \texttt{MPI\_File\_read\_at} calls, so ranks
+do not have to issue collective reads in identical GID order.  After all
+payloads are read, the restart map is deleted.
+
+On restart, the driver computes a fresh timestep and LAT metadata.  If the
+mesh is already LAT-reordered, it keeps that ordering.  If not, it may perform
+a migration-only \path{RedistAndRefineMeshBlocks(pin,0,0)} pass to move the
+live state into the LAT-optimized ordering before normal evolution.
+
+\section{TDE-Specific Sink and Source Safety}
+
+The TDE problem generator no longer installs a BH-specific LAT factor cap.
+Sink-adjacent blocks are handled by the normal LAT factor pipeline and neighbor
+limiter.
+
+The BH gravity and floor-shell cleanup source loops use the LAT active-index
+list when LAT is active.  The source time comes from the driver's stage/source
+time hook.  Translating-frame runs are marked LAT-unsafe, because the frame
+acceleration depends on global gas state and would otherwise be evaluated
+inconsistently across local times.
+
+\section{Performance Notes}
+
+The current branch includes several performance-oriented changes that are
+important to production scaling:
+\begin{itemize}
+  \item Factor-bin counts are cached in \texttt{hydro\_lat\_bin\_count},
+        avoiding repeated full-array scans during each LAT tick.
+  \item Active-mask and due-factor masks are cached by metadata version,
+        maximum factor, tick phase, and neighbor-table size.
+  \item Boundary refresh gating uses cached need flags computed during mask
+        construction rather than rescanning neighbors on every refresh.
+  \item Neighbor limiter convergence first reduces a small changed flag before
+        reducing the full factor array.
+  \item The LAT load balancer prints per-bin and per-tick efficiency diagnostics
+        when active, making fine-tick rank imbalance directly visible.
+\end{itemize}
+
+The dominant cost that remains is communication and task-list launch overhead
+for frequent boundary refreshes at large synchronization factors.  The design
+intentionally favors correctness and synchronized AMR/gravity behavior over
+fully asynchronous per-rank progress.
+
+\section{Current Production Configuration}
+
+The H2 production input currently uses:
+\begin{itemize}
+  \item \texttt{hydro\_lat=true},
+  \item \texttt{hydro\_lat\_levels=7}, giving a configured maximum factor
+        \(2^7=128\),
+  \item \texttt{hydro\_lat\_same\_level=true},
+  \item \texttt{hydro\_lat\_same\_level\_max\_ratio=8},
+  \item \texttt{hydro\_lat\_neighbor\_limiter=face},
+  \item default \texttt{hydro\_lat\_gid\_reorder=true},
+  \item \texttt{max\_nmb\_per\_rank=600}.
+\end{itemize}
+
+Observed restart/load-balance diagnostics for this configuration have shown
+LAT GID interleaving across eight factor bins with worst-tick efficiency close
+to unity in the initial restarted mesh.  The exact factor distribution is
+runtime-dependent because it follows the local-CFL table and AMR topology.
+
+\section{Limitations and Invariants}
+
+This implementation should not be treated as a full H-AMR replacement.  Its
+current limitations are:
+\begin{itemize}
+  \item Newtonian HD only.
+  \item RK1/RK2 are the validated integrators for the delayed-reflux path.
+  \item AMR, gravity, output, callbacks, and timestep metadata are synchronized
+        at LAT window boundaries, not run asynchronously in local bins.
+  \item Same-level temporal interpolation is dense RK2 between start and end
+        conserved states; very large same-level ratios remain a physics
+        validation risk.
+  \item Per-rank restart files are not supported with LAT.
+\end{itemize}
+
+Future LAT changes should preserve these invariants:
+\begin{enumerate}
+  \item Never run AMR, output, self-gravity source loading, or after-cycle
+        callbacks on a partially synchronized LAT mask.
+  \item Recompute local-CFL LAT metadata only at synchronized states.
+  \item Keep active evolution masks separate from boundary-provider and
+        flux-receiver masks.
+  \item Keep MeshBlock GID ownership contiguous per rank; use GID ordering
+        permutations rather than arbitrary non-contiguous rank assignments.
+  \item Compose restart payload maps whenever startup GIDs are permuted.
+  \item Keep the AMR \texttt{newtoold}/\texttt{oldtonew} maps consistent with
+        any LAT candidate ordering before MPI migration or local copies.
+  \item Preserve the hard \texttt{max\_nmb\_per\_rank} cap and
+        \texttt{NUM\_BITS\_LID} tag limit.
+  \item Do not mark a user source LAT-safe until every state-changing loop is
+        active-mask-aware and all time-dependent data use the driver-provided
+        stage/source time.
+  \item If same-level LAT behavior is extended, update boundary interpolation
+        and delayed refluxing together.
+\end{enumerate}
+
+\end{document}

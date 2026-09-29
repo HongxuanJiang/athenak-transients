@@ -42,8 +42,8 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
     // capture class variables for the kernels
     auto e2 = efld.x2e;
     auto e3 = efld.x3e;
-    auto e2x1_ = e2x1;
-    auto e3x1_ = e3x1;
+    auto e2x1_ = EmfBand(e2x1);
+    auto e3x1_ = EmfBand(e3x1);
     par_for("emf1", DevExeSpace(), 0, nmb1, is, ie+1,
     KOKKOS_LAMBDA(int m, int i) {
       e2(m,ks  ,js  ,i) = e2x1_(m,ks,js,i);
@@ -60,28 +60,30 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
     // Compute cell-centered E3 = -(v X B) = VyBx-VxBy
     auto w0_ = w0;
     auto bcc_ = bcc0;
-    auto e3cc_ = e3_cc;
+    auto e3cc_ = EmfBand(e3_cc);
 
     // compute cell-centered EMF in dynamical GRMHD
     if (pmy_pack->padm != nullptr) {
-      auto &adm = pmy_pack->padm->adm;
+      auto metric = pmy_pack->padm->GetMetricView();
       par_for("e_cc_2d", DevExeSpace(), 0, nmb1, js-1, je+1, is-1, ie+1,
       KOKKOS_LAMBDA(int m, int j, int i) {
         // Calculate the spatial components of the three-velocity
         const Real &ux = w0_(m,IVX,ks,j,i);
         const Real &uy = w0_(m,IVY,ks,j,i);
         const Real &uz = w0_(m,IVZ,ks,j,i);
+        adm::ADMMetricPoint metric_pt{};
+        metric.CellMetric(m, ks, j, i, metric_pt);
+        const Real *g = metric_pt.g_dd;
         Real iW = 1.0/sqrt(1.0
-                    + adm.g_dd(m,0,0,ks,j,i)*ux*ux + 2.0*adm.g_dd(m,0,1,ks,j,i)*ux*uy
-                    + 2.0*adm.g_dd(m,0,2,ks,j,i)*ux*uz + adm.g_dd(m,1,1,ks,j,i)*uy*uy
-                    + 2.0*adm.g_dd(m,1,2,ks,j,i)*uy*uz + adm.g_dd(m,2,2,ks,j,i)*uz*uz);
+                    + g[S11]*ux*ux + 2.0*g[S12]*ux*uy + 2.0*g[S13]*ux*uz
+                    + g[S22]*uy*uy + 2.0*g[S23]*uy*uz + g[S33]*uz*uz);
         Real v1 = ux*iW;
         Real v2 = uy*iW;
         //Real v3 = uz*iW;
 
-        const Real &alpha = adm.alpha(m,ks,j,i);
-        e3cc_(m,ks,j,i) = bcc_(m,IBX,ks,j,i)*(alpha*v2 - adm.beta_u(m, 1, ks, j, i))
-                        - bcc_(m,IBY,ks,j,i)*(alpha*v1 - adm.beta_u(m, 0, ks, j, i));
+        const Real alpha = metric_pt.alpha;
+        e3cc_(m,ks,j,i) = bcc_(m,IBX,ks,j,i)*(alpha*v2 - metric_pt.beta_u[1])
+                        - bcc_(m,IBY,ks,j,i)*(alpha*v1 - metric_pt.beta_u[0]);
       });
     } else if (pmy_pack->pcoord->is_general_relativistic) {
       // compute cell-centered EMF in GR MHD
@@ -100,8 +102,12 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
         Real &x3max = size.d_view(m).x3max;
         Real x3v = CellCenterX(0, indcs.nx3, x3min, x3max);
 
-        Real glower[4][4], gupper[4][4];
-        ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+        // Cartesian Kerr-Schild carries only 4 independent degrees of freedom,
+        // g = eta + f l l with l_0 = 1, so (f, l_1, l_2, l_3) replaces the 32 doubles of
+        // glower[4][4]/gupper[4][4].  No identity below assumes l.l = 1 (the r < 1e-6
+        // floor inside ComputeKSNullForm breaks it).
+        KSNullForm nf;
+        ComputeKSNullForm(x1v, x2v, x3v, flat, spin, nf);
 
         const Real &ux = w0_(m,IVX,ks,j,i);
         const Real &uy = w0_(m,IVY,ks,j,i);
@@ -110,19 +116,19 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
         const Real &by = bcc_(m,IBY,ks,j,i);
         const Real &bz = bcc_(m,IBZ,ks,j,i);
         // Calculate 4-velocity
-        Real tmp = glower[1][1]*ux*ux + 2.0*glower[1][2]*ux*uy + 2.0*glower[1][3]*ux*uz
-                 + glower[2][2]*uy*uy + 2.0*glower[2][3]*uy*uz
-                 + glower[3][3]*uz*uz;
-        Real alpha = sqrt(-1.0/gupper[0][0]);
+        // gamma_ij u^i u^j = |u|^2 + f (l.u)^2, and g^{0i} = f l_i
+        Real tmp = KSSpatialNormSq(nf, 1, 2, 3, ux, uy, uz);
+        Real alpha = KSAlpha(nf);
         Real gamma = sqrt(1.0 + tmp);
         Real u0 = gamma / alpha;
-        Real u1 = ux - alpha * gamma * gupper[0][1];
-        Real u2 = uy - alpha * gamma * gupper[0][2];
-        Real u3 = uz - alpha * gamma * gupper[0][3];
-        // lower vector indices
-        Real u_1 = glower[1][0]*u0 + glower[1][1]*u1 + glower[1][2]*u2 + glower[1][3]*u3;
-        Real u_2 = glower[2][0]*u0 + glower[2][1]*u1 + glower[2][2]*u2 + glower[2][3]*u3;
-        Real u_3 = glower[3][0]*u0 + glower[3][1]*u1 + glower[3][2]*u2 + glower[3][3]*u3;
+        Real ag_f = (alpha*gamma)*nf.f;
+        Real u1 = ux - ag_f*nf.l1;
+        Real u2 = uy - ag_f*nf.l2;
+        Real u3 = uz - ag_f*nf.l3;
+        // lower vector indices: A_mu = eta_{mu nu} A^nu + f l_mu (l.A)
+        Real u_0, u_1, u_2, u_3;
+        KSLowerVec(nf, 1, 2, 3, u0, u1, u2, u3, u_0, u_1, u_2, u_3);
+        (void) u_0;
         // calculate 4-magnetic field
         Real b0 = u_1*bx + u_2*by + u_3*bz;
         Real b1 = (bx + b0 * u1) / u0;
@@ -156,12 +162,12 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
     auto e1 = efld.x1e;
     auto e2 = efld.x2e;
     auto e3 = efld.x3e;
-    auto e2x1_ = e2x1;
-    auto e3x1_ = e3x1;
-    auto e1x2_ = e1x2;
-    auto e3x2_ = e3x2;
-    auto flx1 = uflx.x1f;
-    auto flx2 = uflx.x2f;
+    auto e2x1_ = EmfBand(e2x1);
+    auto e3x1_ = EmfBand(e3x1);
+    auto e1x2_ = EmfBand(e1x2);
+    auto e3x2_ = EmfBand(e3x2);
+    auto flx1 = FluxBand(uflx.x1f);
+    auto flx2 = FluxBand(uflx.x2f);
 
     // integrate E3 to corner using SG07
     //  Note e1[is:ie,  js:je+1,ks:ke+1]
@@ -210,14 +216,15 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
     // E3=-(v X B)=VyBx-VxBy
     auto w0_ = w0;
     auto bcc_ = bcc0;
-    auto e1cc_ = e1_cc;
-    auto e2cc_ = e2_cc;
-    auto e3cc_ = e3_cc;
+    auto e1cc_ = EmfBand(e1_cc);
+    auto e2cc_ = EmfBand(e2_cc);
+    auto e3cc_ = EmfBand(e3_cc);
 
     // compute cell-centered EMFs in dynamical GRMHD
     if (pmy_pack->padm != nullptr) {
-      auto &adm = pmy_pack->padm->adm;
-      par_for("e_cc_3d", DevExeSpace(), 0, nmb1, ks-1, ke+1, js-1, je+1, is-1, ie+1,
+      auto metric = pmy_pack->padm->GetMetricView();
+      par_for<256,2>("e_cc_3d", DevExeSpace(), 0, nmb1, ks-1, ke+1, js-1, je+1, is-1,
+          ie+1,
       KOKKOS_LAMBDA(int m, int k, int j, int i) {
         // Calculate something that resembles the spatial components of the four-velocity
         // normalized by W.
@@ -227,14 +234,16 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
         const Real &bx = bcc_(m,IBX,k,j,i);
         const Real &by = bcc_(m,IBY,k,j,i);
         const Real &bz = bcc_(m,IBZ,k,j,i);
+        adm::ADMMetricPoint metric_pt{};
+        metric.CellMetric(m, k, j, i, metric_pt);
+        const Real *g = metric_pt.g_dd;
         Real iW = 1.0/sqrt(1.0
-                         + adm.g_dd(m,0,0,k,j,i)*ux*ux + 2.0*adm.g_dd(m,0,1,k,j,i)*ux*uy
-                         + 2.0*adm.g_dd(m,0,2,k,j,i)*ux*uz + adm.g_dd(m,1,1,k,j,i)*uy*uy
-                         + 2.0*adm.g_dd(m,1,2,k,j,i)*uy*uz + adm.g_dd(m,2,2,k,j,i)*uz*uz);
-        const Real &alpha = adm.alpha(m, k, j, i);
-        Real v1c = alpha*ux*iW - adm.beta_u(m, 0, k, j, i);
-        Real v2c = alpha*uy*iW - adm.beta_u(m, 1, k, j, i);
-        Real v3c = alpha*uz*iW - adm.beta_u(m, 2, k, j, i);
+                         + g[S11]*ux*ux + 2.0*g[S12]*ux*uy + 2.0*g[S13]*ux*uz
+                         + g[S22]*uy*uy + 2.0*g[S23]*uy*uz + g[S33]*uz*uz);
+        const Real alpha = metric_pt.alpha;
+        Real v1c = alpha*ux*iW - metric_pt.beta_u[0];
+        Real v2c = alpha*uy*iW - metric_pt.beta_u[1];
+        Real v3c = alpha*uz*iW - metric_pt.beta_u[2];
 
         e1cc_(m,k,j,i) = by * v3c - bz * v2c;
         e2cc_(m,k,j,i) = bz * v1c - bx * v3c;
@@ -257,8 +266,12 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
         Real &x3max = size.d_view(m).x3max;
         Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
-        Real glower[4][4], gupper[4][4];
-        ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+        // Cartesian Kerr-Schild carries only 4 independent degrees of freedom,
+        // g = eta + f l l with l_0 = 1, so (f, l_1, l_2, l_3) replaces the 32 doubles of
+        // glower[4][4]/gupper[4][4].  No identity below assumes l.l = 1 (the r < 1e-6
+        // floor inside ComputeKSNullForm breaks it).
+        KSNullForm nf;
+        ComputeKSNullForm(x1v, x2v, x3v, flat, spin, nf);
 
         const Real &ux = w0_(m,IVX,k,j,i);
         const Real &uy = w0_(m,IVY,k,j,i);
@@ -267,19 +280,19 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
         const Real &by = bcc_(m,IBY,k,j,i);
         const Real &bz = bcc_(m,IBZ,k,j,i);
         // Calculate 4-velocity
-        Real tmp = glower[1][1]*ux*ux + 2.0*glower[1][2]*ux*uy + 2.0*glower[1][3]*ux*uz
-                 + glower[2][2]*uy*uy + 2.0*glower[2][3]*uy*uz
-                 + glower[3][3]*uz*uz;
-        Real alpha = sqrt(-1.0/gupper[0][0]);
+        // gamma_ij u^i u^j = |u|^2 + f (l.u)^2, and g^{0i} = f l_i
+        Real tmp = KSSpatialNormSq(nf, 1, 2, 3, ux, uy, uz);
+        Real alpha = KSAlpha(nf);
         Real gamma = sqrt(1.0 + tmp);
         Real u0 = gamma / alpha;
-        Real u1 = ux - alpha * gamma * gupper[0][1];
-        Real u2 = uy - alpha * gamma * gupper[0][2];
-        Real u3 = uz - alpha * gamma * gupper[0][3];
-        // lower vector indices
-        Real u_1 = glower[1][0]*u0 + glower[1][1]*u1 + glower[1][2]*u2 + glower[1][3]*u3;
-        Real u_2 = glower[2][0]*u0 + glower[2][1]*u1 + glower[2][2]*u2 + glower[2][3]*u3;
-        Real u_3 = glower[3][0]*u0 + glower[3][1]*u1 + glower[3][2]*u2 + glower[3][3]*u3;
+        Real ag_f = (alpha*gamma)*nf.f;
+        Real u1 = ux - ag_f*nf.l1;
+        Real u2 = uy - ag_f*nf.l2;
+        Real u3 = uz - ag_f*nf.l3;
+        // lower vector indices: A_mu = eta_{mu nu} A^nu + f l_mu (l.A)
+        Real u_0, u_1, u_2, u_3;
+        KSLowerVec(nf, 1, 2, 3, u0, u1, u2, u3, u_0, u_1, u_2, u_3);
+        (void) u_0;
         // calculate 4-magnetic field
         Real b0 = u_1*bx + u_2*by + u_3*bz;
         Real b1 = (bx + b0 * u1) / u0;
@@ -321,15 +334,15 @@ TaskStatus MHD::CornerE(Driver *pdriver, int stage) {
     auto e1 = efld.x1e;
     auto e2 = efld.x2e;
     auto e3 = efld.x3e;
-    auto e2x1_ = e2x1;
-    auto e3x1_ = e3x1;
-    auto e1x2_ = e1x2;
-    auto e3x2_ = e3x2;
-    auto e1x3_ = e1x3;
-    auto e2x3_ = e2x3;
-    auto flx1 = uflx.x1f;
-    auto flx2 = uflx.x2f;
-    auto flx3 = uflx.x3f;
+    auto e2x1_ = EmfBand(e2x1);
+    auto e3x1_ = EmfBand(e3x1);
+    auto e1x2_ = EmfBand(e1x2);
+    auto e3x2_ = EmfBand(e3x2);
+    auto e1x3_ = EmfBand(e1x3);
+    auto e2x3_ = EmfBand(e2x3);
+    auto flx1 = FluxBand(uflx.x1f);
+    auto flx2 = FluxBand(uflx.x2f);
+    auto flx3 = FluxBand(uflx.x3f);
 
     // Integrate E1, E2, E3 to corners
     //  Note e1[is:ie,  js:je+1,ks:ke+1]

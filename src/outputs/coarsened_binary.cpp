@@ -380,6 +380,15 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   }
   header_offset += sbuf.size()*sizeof(char);
   header_offset += msg.str().size();}
+#if MPI_PARALLEL_ENABLED
+  if (!single_file_per_rank) {
+    // In shared-file mode only rank 0 writes the header, so every rank must use
+    // rank 0's header length when computing its data offsets.
+    std::uint64_t header_offset_u64 = static_cast<std::uint64_t>(header_offset);
+    MPI_Bcast(&header_offset_u64, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    header_offset = static_cast<std::size_t>(header_offset_u64);
+  }
+#endif
 
   //  5. Data.  An arbitrary number of scalars and vectors can be written (every node
   //  in the OutputData doubly linked lists), all in binary floats format
@@ -389,10 +398,16 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     nout_vars *= 4;
   }
   int nout_mbs = outmbs.size();
-  int nout1 = ((outmbs[0].oie - outmbs[0].ois + 1)/out_params.coarsen_factor);
-  int nout2 = ((outmbs[0].oje - outmbs[0].ojs + 1)/out_params.coarsen_factor);
-  int nout3 = ((outmbs[0].oke - outmbs[0].oks + 1)/out_params.coarsen_factor);
-  int cells = nout1*nout2*nout3;
+  int nout1 = 0;
+  int nout2 = 0;
+  int nout3 = 0;
+  int cells = 0;
+  if (nout_mbs > 0) {
+    nout1 = ((outmbs[0].oie - outmbs[0].ois + 1)/out_params.coarsen_factor);
+    nout2 = ((outmbs[0].oje - outmbs[0].ojs + 1)/out_params.coarsen_factor);
+    nout3 = ((outmbs[0].oke - outmbs[0].oks + 1)/out_params.coarsen_factor);
+    cells = nout1*nout2*nout3;
+  }
 
 
   // ois, oie, ojs, oje, oks, oke + il1, il2, il3, level +
@@ -400,8 +415,11 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   std::size_t data_size = 10*sizeof(int32_t) + 6*sizeof(Real)
                         + (cells*nout_vars)*sizeof(float);
 
-  int ns_mbs = pm->gids_eachrank[global_variable::my_rank];
-  int nb_mbs = pm->nmb_eachrank[global_variable::my_rank];
+  int ns_mbs = 0;
+  for (int r = 0; r < global_variable::my_rank; ++r) {
+    ns_mbs += noutmbs[r];
+  }
+  int nb_mbs = nout_mbs;
 
   // allocate 1D vector of floats used to convert and output data
   char *data = new char[nb_mbs*data_size];
@@ -520,12 +538,6 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
     } else {
       // write data over each MeshBlock sequentially and in parallel
       // calculate max/min number of MeshBlocks across all ranks
-      noutmbs_max = pm->nmb_eachrank[0];
-      noutmbs_min = pm->nmb_eachrank[0];
-      for (int i=0; i<(global_variable::nranks); ++i) {
-        noutmbs_max = std::max(noutmbs_max,pm->nmb_eachrank[i]);
-        noutmbs_min = std::min(noutmbs_min,pm->nmb_eachrank[i]);
-      }
       for (int m=0;  m<noutmbs_max; ++m) {
         char *pdata=&(data[m*data_size]);
         std::size_t myoffset=header_offset + data_size*m;
@@ -542,7 +554,7 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
             exit(EXIT_FAILURE);
           }
         // some ranks are finished writing, so use non-collective write
-        } else if (m < pm->nmb_thisrank) {
+        } else if (m < nout_mbs) {
           if (cbinfile.Write_any_type_at(pdata,(data_size),myoffset,"byte",
                                           single_file_per_rank) != data_size) {
             std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -562,13 +574,8 @@ void CoarsenedBinaryOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
 
   // increment counters
   out_params.file_number++;
-  if (out_params.last_time < 0.0) {
-    out_params.last_time = pm->time;
-  } else {
-    out_params.last_time += out_params.dt;
-  }
   pin->SetInteger(out_params.block_name, "file_number", out_params.file_number);
-  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
+  AdvanceOutputTime(pm, pin);
 
   return;
 }

@@ -91,7 +91,7 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
     wl.vx = pin->GetReal("problem","ul");
     wl.vy = pin->GetReal("problem","vl");
     wl.vz = pin->GetReal("problem","wl");
-    wl.e  = (pin->GetReal("problem","pl"))/(eos.gamma - 1.0);
+    wl.e  = eos.HostInternalEnergyDensityFromRhoP(wl.d, pin->GetReal("problem","pl"));
     // compute Lorentz factor (needed for SR/GR)
     Real u0l = 1.0;
     if (pmbp->pcoord->is_special_relativistic || pmbp->pcoord->is_general_relativistic ||
@@ -108,7 +108,7 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
     wr.vx = pin->GetReal("problem","ur");
     wr.vy = pin->GetReal("problem","vr");
     wr.vz = pin->GetReal("problem","wr");
-    wr.e  = (pin->GetReal("problem","pr"))/(eos.gamma - 1.0);
+    wr.e  = eos.HostInternalEnergyDensityFromRhoP(wr.d, pin->GetReal("problem","pr"));
     // compute Lorentz factor (needed for SR/GR)
     Real u0r = 1.0;
     if (pmbp->pcoord->is_special_relativistic || pmbp->pcoord->is_general_relativistic ||

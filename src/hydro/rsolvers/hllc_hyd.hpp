@@ -6,138 +6,122 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 //! \file hllc_hyd.hpp
-//! \brief The HLLC Riemann solver for hydrodynamics, an extension of the HLLE fluxes to
-//! include the contact wave.  Only works for ideal gas EOS in hydrodynamics.
-//!
-//! REFERENCES:
-//! - E.F. Toro, "Riemann Solvers and numerical methods for fluid dynamics", 2nd ed.,
-//!   Springer-Verlag, Berlin, (1999) chpt. 10.
-//!
-//! - P. Batten, N. Clarke, C. Lambert, and D. M. Causon, "On the Choice of Wavespeeds
-//!   for the HLLC Riemann Solver", SIAM J. Sci. & Stat. Comp. 18, 6, 1553-1570, (1997).
+//! \brief HLLC Riemann solver for hydrodynamics.  Reads L/R primitives from the global
+//! per-face buffers and writes a single flux entry.  Supports any non-relativistic hydro
+//! EOS that evolves internal energy and supplies pressure and sound speed.
 
-#include <algorithm>  // max(), min()
-#include <cmath>      // sqrt()
+#include <cmath>
 
 namespace hydro {
+
 //----------------------------------------------------------------------------------------
-//! \fn void HLLC
-//! \brief The HLLC Riemann solver for ideal gas hydrodynamics (use HLLE for isothermal)
-
+//! \fn HLLC<ivx>()
+//! \brief Compute the HLLC flux at face (m,k,j,i) for direction ivx and return the
+//! interface-normal velocity used by the dual-energy pressure-work update.
+template <int ivx>
 KOKKOS_INLINE_FUNCTION
-void HLLC(TeamMember_t const &member, const EOS_Data &eos,
-     const RegionIndcs &indcs,const DualArray1D<RegionSize> &size,const CoordData &coord,
-     const int m, const int k, const int j, const int il, const int iu, const int ivx,
-     const ScrArray2D<Real> &wl, const ScrArray2D<Real> &wr, DvceArray5D<Real> flx) {
-  int ivy = IVX + ((ivx-IVX)+1)%3;
-  int ivz = IVX + ((ivx-IVX)+2)%3;
+Real HLLC(const EOS_Data &eos,
+          const int m, const int mb, const int k, const int j, const int i,
+          const int is, const int js, const int ks,
+          const DvceArray5D<Real> &wl,
+          const DvceArray5D<Real> &wr,
+          const DvceArray5D<Real> &flx) {
+  constexpr int ivy = IVX + ((ivx - IVX) + 1) % 3;
+  constexpr int ivz = IVX + ((ivx - IVX) + 2) % 3;
 
-  Real gm1 = eos.gamma - 1.0;
-  Real igm1 = 1.0/gm1;
-  Real alpha = ((eos.gamma) + 1.0)/(2.0*(eos.gamma));
+  // L/R primitives at face
+  const Real wl_idn = wl(mb, IDN, k, j, i);
+  const Real wl_ivx = wl(mb, ivx, k, j, i);
+  const Real wl_ivy = wl(mb, ivy, k, j, i);
+  const Real wl_ivz = wl(mb, ivz, k, j, i);
+  const Real wr_idn = wr(mb, IDN, k, j, i);
+  const Real wr_ivx = wr(mb, ivx, k, j, i);
+  const Real wr_ivy = wr(mb, ivy, k, j, i);
+  const Real wr_ivz = wr(mb, ivz, k, j, i);
 
-  par_for_inner(member, il, iu, [&](const int i) {
-    //--- Step 1.  Create local references for L/R states (helps compiler vectorize)
+  Real wl_ipr, wl_cs2, wr_ipr, wr_cs2;
+  eos.EvalPressureCs2FromRhoEint(
+      wl_idn, wl(mb, IEN, k, j, i), wl_ipr, wl_cs2);
+  eos.EvalPressureCs2FromRhoEint(
+      wr_idn, wr(mb, IEN, k, j, i), wr_ipr, wr_cs2);
+  const Real cl = sqrt(fmax(wl_cs2, 0.0));
+  const Real cr = sqrt(fmax(wr_cs2, 0.0));
 
-    Real &wl_idn = wl(IDN,i);
-    Real &wl_ivx = wl(ivx,i);
-    Real &wl_ivy = wl(ivy,i);
-    Real &wl_ivz = wl(ivz,i);
+  const Real sl = fmin(wl_ivx - cl, wr_ivx - cr);
+  const Real sr = fmax(wl_ivx + cl, wr_ivx + cr);
+  // Keep the HLLC star-state denominators finite for degenerate zero-sound-speed
+  // states while preserving the physical sign of each outer wave.
+  const Real sl_safe = (sl < 0.0) ? sl : -1.0e-20;
+  const Real sr_safe = (sr > 0.0) ? sr : 1.0e-20;
 
-    Real &wr_idn = wr(IDN,i);
-    Real &wr_ivx = wr(ivx,i);
-    Real &wr_ivy = wr(ivy,i);
-    Real &wr_ivz = wr(ivz,i);
+  HydCons1D ul, ur, fl, fr;
+  ul.d = wl_idn;
+  ul.mx = wl_idn*wl_ivx;
+  ul.my = wl_idn*wl_ivy;
+  ul.mz = wl_idn*wl_ivz;
+  ul.e = wl(mb, IEN, k, j, i) +
+         0.5*wl_idn*(SQR(wl_ivx) + SQR(wl_ivy) + SQR(wl_ivz));
+  ur.d = wr_idn;
+  ur.mx = wr_idn*wr_ivx;
+  ur.my = wr_idn*wr_ivy;
+  ur.mz = wr_idn*wr_ivz;
+  ur.e = wr(mb, IEN, k, j, i) +
+         0.5*wr_idn*(SQR(wr_ivx) + SQR(wr_ivy) + SQR(wr_ivz));
 
-    Real wl_ipr, wr_ipr;
-    wl_ipr = eos.IdealGasPressure(wl(IEN,i));
-    wr_ipr = eos.IdealGasPressure(wr(IEN,i));
+  fl.d = ul.mx;
+  fl.mx = ul.mx*wl_ivx + wl_ipr;
+  fl.my = ul.mx*wl_ivy;
+  fl.mz = ul.mx*wl_ivz;
+  fl.e = (ul.e + wl_ipr)*wl_ivx;
+  fr.d = ur.mx;
+  fr.mx = ur.mx*wr_ivx + wr_ipr;
+  fr.my = ur.mx*wr_ivy;
+  fr.mz = ur.mx*wr_ivz;
+  fr.e = (ur.e + wr_ipr)*wr_ivx;
 
-    //--- Step 2.  Compute middle state estimates with PVRS (Toro 10.5.2)
+  if (sl >= 0.0) {
+    flx(m, IDN, k, j, i) = fl.d;
+    flx(m, ivx, k, j, i) = fl.mx;
+    flx(m, ivy, k, j, i) = fl.my;
+    flx(m, ivz, k, j, i) = fl.mz;
+    flx(m, IEN, k, j, i) = fl.e;
+    return wl_ivx;
+  }
+  if (sr <= 0.0) {
+    flx(m, IDN, k, j, i) = fr.d;
+    flx(m, ivx, k, j, i) = fr.mx;
+    flx(m, ivy, k, j, i) = fr.my;
+    flx(m, ivz, k, j, i) = fr.mz;
+    flx(m, IEN, k, j, i) = fr.e;
+    return wr_ivx;
+  }
 
-    // define 6 registers used below
-    Real qa,qb,qc,qd,qe,qf;
-    qa = eos.IdealHydroSoundSpeed(wl_idn, wl_ipr);
-    qb = eos.IdealHydroSoundSpeed(wr_idn, wr_ipr);
-    Real el = wl_ipr*igm1 + 0.5*wl_idn*(SQR(wl_ivx) + SQR(wl_ivy) + SQR(wl_ivz));
-    Real er = wr_ipr*igm1 + 0.5*wr_idn*(SQR(wr_ivx) + SQR(wr_ivy) + SQR(wr_ivz));
-    qc = 0.25*(wl_idn + wr_idn)*(qa + qb);  // average density * average sound speed
-    qd = 0.5 * (wl_ipr + wr_ipr + (wl_ivx - wr_ivx) * qc);  // P_mid
+  const Real denom = wl_idn*(sl_safe - wl_ivx) - wr_idn*(sr_safe - wr_ivx);
+  const Real sm = ((wr_ipr - wl_ipr) + wl_idn*wl_ivx*(sl_safe - wl_ivx) -
+                   wr_idn*wr_ivx*(sr_safe - wr_ivx))/denom;
+  const Real pstar_l = wl_ipr + wl_idn*(sl_safe - wl_ivx)*(sm - wl_ivx);
+  const Real pstar_r = wr_ipr + wr_idn*(sr_safe - wr_ivx)*(sm - wr_ivx);
+  const Real pstar = 0.5*(pstar_l + pstar_r);
 
-    //--- Step 3.  Compute sound speed in L,R
-
-    qe = (qd <= wl_ipr) ? 1.0 : sqrt(1.0 + alpha * ((qd / wl_ipr) - 1.0));  // ql
-    qf = (qd <= wr_ipr) ? 1.0 : sqrt(1.0 + alpha * ((qd / wr_ipr) - 1.0));  // qr
-
-    //--- Step 4.  Compute the max/min wave speeds based on L/R
-
-    qc = wl_ivx - qa*qe;  // al
-    qd = wr_ivx + qb*qf;  // ar
-
-    // following min/max set to TINY_NUMBER to fix bug found in converging supersonic flow
-    qa = qd > 0.0 ? qd : 1.0e-20;   // bp
-    qb = qc < 0.0 ? qc : -1.0e-20;  // bm
-
-    //--- Step 5. Compute the contact wave speed and pressure
-
-    qe = wl_ivx - qc; // vxl
-    qf = wr_ivx - qd; // vxr
-
-    qc = wl_ipr + qe*wl_idn*wl_ivx;  // tl
-    qd = wr_ipr + qf*wr_idn*wr_ivx;  // tr
-
-    Real ml =   wl_idn*qe;
-    Real mr = -(wr_idn*qf);
-
-    // Determine the contact wave speed...
-    Real am = (qc - qd)/(ml + mr);
-    // ...and the pressure at the contact surface
-    Real cp = (ml*qd + mr*qc)/(ml + mr);
-    cp = cp > 0.0 ? cp : 0.0;
-
-    //--- Step 6. Compute L/R fluxes along the line bm (qb), bp (qa)
-
-    qe = wl_idn*(wl_ivx - qb);
-    qf = wr_idn*(wr_ivx - qa);
-
-    HydCons1D fl, fr;
-    fl.d  = qe;
-    fr.d  = qf;
-
-    fl.mx = qe*wl_ivx + wl_ipr;
-    fr.mx = qf*wr_ivx + wr_ipr;
-
-    fl.my = qe*wl_ivy;
-    fr.my = qf*wr_ivy;
-
-    fl.mz = qe*wl_ivz;
-    fr.mz = qf*wr_ivz;
-
-    fl.e  = el*(wl_ivx - qb) + wl_ipr*wl_ivx;
-    fr.e  = er*(wr_ivx - qa) + wr_ipr*wr_ivx;
-
-    //--- Step 8. Compute flux weights or scales
-
-    if (am >= 0.0) {
-      qc =  am/(am - qb);
-      qd = 0.0;
-      qe = -qb/(am - qb);
-    } else {
-      qc =  0.0;
-      qd = -am/(qa - am);
-      qe =  qa/(qa - am);
-    }
-
-    //--- Step 9. Compute the HLLC flux at interface, including weighted contribution
-    // of the flux along the contact
-
-    flx(m,IDN,k,j,i) = qc*fl.d  + qd*fr.d;
-    flx(m,ivx,k,j,i) = qc*fl.mx + qd*fr.mx + qe*cp;
-    flx(m,ivy,k,j,i) = qc*fl.my + qd*fr.my;
-    flx(m,ivz,k,j,i) = qc*fl.mz + qd*fr.mz;
-    flx(m,IEN,k,j,i) = qc*fl.e  + qd*fr.e  + qe*cp*am;
-  });
-  return;
+  if (sm >= 0.0) {
+    const Real rho_star = wl_idn*(sl_safe - wl_ivx)/(sl_safe - sm);
+    const Real e_star = ((sl_safe - wl_ivx)*ul.e - wl_ipr*wl_ivx + pstar*sm)/(sl_safe - sm);
+    flx(m, IDN, k, j, i) = fl.d + sl_safe*(rho_star - ul.d);
+    flx(m, ivx, k, j, i) = fl.mx + sl_safe*(rho_star*sm - ul.mx);
+    flx(m, ivy, k, j, i) = fl.my + sl_safe*(rho_star*wl_ivy - ul.my);
+    flx(m, ivz, k, j, i) = fl.mz + sl_safe*(rho_star*wl_ivz - ul.mz);
+    flx(m, IEN, k, j, i) = fl.e + sl_safe*(e_star - ul.e);
+  } else {
+    const Real rho_star = wr_idn*(sr_safe - wr_ivx)/(sr_safe - sm);
+    const Real e_star = ((sr_safe - wr_ivx)*ur.e - wr_ipr*wr_ivx + pstar*sm)/(sr_safe - sm);
+    flx(m, IDN, k, j, i) = fr.d + sr_safe*(rho_star - ur.d);
+    flx(m, ivx, k, j, i) = fr.mx + sr_safe*(rho_star*sm - ur.mx);
+    flx(m, ivy, k, j, i) = fr.my + sr_safe*(rho_star*wr_ivy - ur.my);
+    flx(m, ivz, k, j, i) = fr.mz + sr_safe*(rho_star*wr_ivz - ur.mz);
+    flx(m, IEN, k, j, i) = fr.e + sr_safe*(e_star - ur.e);
+  }
+  return sm;
 }
+
 } // namespace hydro
 #endif // HYDRO_RSOLVERS_HLLC_HYD_HPP_

@@ -167,7 +167,7 @@ def read_binary(filename):
             if line.startswith("<"):
                 block = line
                 continue
-            key, value = line.split("=")
+            key, value = line.split("=", 1)
             if block == blockname and key.strip() == keyname:
                 return value
         raise KeyError(f"no parameter called {blockname}/{keyname}")
@@ -337,7 +337,7 @@ def read_coarsened_binary(filename):
             if line.startswith("<"):
                 block = line
                 continue
-            key, value = line.split("=")
+            key, value = line.split("=", 1)
             if block == blockname and key.strip() == keyname:
                 return value
         raise KeyError(f"no parameter called {blockname}/{keyname}")

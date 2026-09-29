@@ -11,6 +11,9 @@
 //!   - magnitude of vorticity Curl(v)^2  [non-relativistic]
 //!   - z-component of current density Jz  [non-relativistic]
 //!   - magnitude of current density J^2  [non-relativistic]
+//!   - tabulated LTE EOS thermodynamics hydro_|mhd_{temperature, xh2, xion, xhe1, xhe2,
+//!     gamma1, gamma3m1, mu, beta_rad}: one ThermoState field of the <hydro>/<mhd> table
+//!     at the cell's (rho, e_int)  [tabulated LTE EOS only]
 
 #include <algorithm>
 #include <iostream>
@@ -19,6 +22,7 @@
 
 #include "athena.hpp"
 #include "parameter_input.hpp"
+#include "coordinates/adm.hpp"
 #include "coordinates/cartesian_ks.hpp"
 #include "coordinates/cell_locations.hpp"
 #include "geodesic-grid/geodesic_grid.hpp"
@@ -94,6 +98,23 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
   int &i_dv = out_params.i_derived;
   int &n_dv = out_params.n_derived;
 
+  auto ensure_derived_capacity = [&]() {
+    if (n_dv <= 0) return;
+    const bool need_alloc =
+        (derived_var.extent(0) != static_cast<std::size_t>(nmb_alloc)) ||
+        (derived_var.extent(1) < static_cast<std::size_t>(n_dv)) ||
+        (derived_var.extent(2) != static_cast<std::size_t>(n3)) ||
+        (derived_var.extent(3) != static_cast<std::size_t>(n2)) ||
+        (derived_var.extent(4) != static_cast<std::size_t>(n1));
+    if (need_alloc) {
+      // A PDF can compute multiple derived fields in sequence. Preserve fields already
+      // populated when AMR changes the pack capacity or when a later field grows the
+      // view.
+      Kokkos::resize(derived_var, nmb_alloc, n_dv, n3, n2, n1);
+    }
+  };
+  ensure_derived_capacity();
+
   // temperature = pressure / density
   if (name.compare("temperature") == 0) {
     if (derived_var.extent(4) <= 1)
@@ -106,6 +127,49 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
       dv(m,i_dv,k,j,i) = (w0_(m,IPR,k,j,i) / w0_(m,IDN,k,j,i));
     });
     i_dv += 1; // increment derived variable index
+  }
+
+  // Tabulated LTE EOS diagnostics: one ThermoState field of the table evaluated at the
+  // cell's (density, internal energy density) primitives.  The output constructor admits
+  // these names only when the corresponding <hydro>/<mhd> EOS is a tabulated LTE table.
+  if (name.compare(0, 6, "hydro_") == 0 || name.compare(0, 4, "mhd_") == 0) {
+    const bool use_hydro = (name.compare(0, 6, "hydro_") == 0);
+    const std::string field = name.substr(use_hydro ? 6 : 4);
+    int ifield = -1;
+    if (field.compare("temperature") == 0) {ifield = 0;}
+    else if (field.compare("xh2") == 0) {ifield = 1;}
+    else if (field.compare("xion") == 0) {ifield = 2;}
+    else if (field.compare("xhe1") == 0) {ifield = 3;}
+    else if (field.compare("xhe2") == 0) {ifield = 4;}
+    else if (field.compare("gamma1") == 0) {ifield = 5;}
+    else if (field.compare("gamma3m1") == 0) {ifield = 6;}
+    else if (field.compare("mu") == 0) {ifield = 7;}
+    else if (field.compare("beta_rad") == 0) {ifield = 8;}
+    if (ifield >= 0) {
+      auto dv = derived_var;
+      auto &w0_ = use_hydro ? pm->pmb_pack->phydro->w0 : pm->pmb_pack->pmhd->w0;
+      const EOS_Data eos = use_hydro ? pm->pmb_pack->phydro->peos->eos_data
+                                     : pm->pmb_pack->pmhd->peos->eos_data;
+      par_for("lte_thermo_diag", DevExeSpace(), 0, (nmb-1), ks, ke, js, je, is, ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        const auto state =
+            eos.EvalThermoStateFromRhoEint(w0_(m,IDN,k,j,i), w0_(m,IEN,k,j,i));
+        Real value;
+        switch (ifield) {
+          case 0: value = state.temperature; break;
+          case 1: value = state.xh2; break;
+          case 2: value = state.xion; break;
+          case 3: value = state.xhe1; break;
+          case 4: value = state.xhe2; break;
+          case 5: value = state.gamma1; break;
+          case 6: value = state.gamma3m1; break;
+          case 7: value = state.mu; break;
+          default: value = state.beta_rad; break;
+        }
+        dv(m,i_dv,k,j,i) = value;
+      });
+      i_dv += 1; // increment derived variable index
+    }
   }
 
   // z-component of vorticity.
@@ -366,12 +430,13 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
     bool &flat = coord.is_minkowski;
     auto &spin = coord.bh_spin;
 
-    const Real dt_last = pm->dt_last_completed;
-    const bool have_prior = (pm->pmb_pack->pmhd->wbcc_saved && dt_last > 0.);
+    const bool have_saved_state = pm->pmb_pack->pmhd->wbcc_saved &&
+        static_cast<int>(pm->pmb_pack->pmhd->wbcc_saved_dt.extent(0)) >= nmb;
     auto w0_ = pm->pmb_pack->pmhd->w0;
     auto bcc_ = pm->pmb_pack->pmhd->bcc0;
     auto wsaved_ = pm->pmb_pack->pmhd->wsaved;
     auto bccsaved_ = pm->pmb_pack->pmhd->bccsaved;
+    auto saved_dt_ = pm->pmb_pack->pmhd->wbcc_saved_dt.d_view;
 
     if (!pm->pmb_pack->pmhd->wbcc_saved) {
       std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
@@ -381,7 +446,8 @@ void BaseTypeOutput::ComputeDerivedVariable(std::string name, Mesh *pm) {
 
     par_for("jcon", DevExeSpace(), 0, (nmb-1), ks, ke, js, je, is, ie,
     KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      if (!have_prior) {
+      const Real dt_last = have_saved_state ? saved_dt_(m) : 0.0;
+      if (!(dt_last > 0.0)) {
         for (int mu=0; mu<4; ++mu) {
           jcon(m,mu,k,j,i) = 0.;
         }

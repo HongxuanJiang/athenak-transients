@@ -121,11 +121,6 @@ void EventLogOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
   pm->ecounter.nfofc = 0;
 
   // increment output time, clean up
-  if (out_params.last_time < 0.0) {
-    out_params.last_time = pm->time;
-  } else {
-    out_params.last_time += out_params.dt;
-  }
-  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
+  AdvanceOutputTime(pm, pin);
   return;
 }

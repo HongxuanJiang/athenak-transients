@@ -9,6 +9,8 @@
 //! \file cart_grid.hpp
 //  \brief definitions for SphericalGrid class
 
+#include <cstdint>
+
 #include "athena.hpp"
 
 // Forward declarations
@@ -46,6 +48,9 @@ class CartesianGrid {
   MeshBlockPack* pmy_pack;  // ptr to MeshBlockPack containing this Hydro
   DualArray4D<int> interp_indcs;   // indices of MeshBlock and zones therein for interp
   DualArray5D<Real> interp_wghts;  // weights for interpolation
+  // Mesh::topology_version the cached indices/weights were built against; every AMR
+  // regrid or LAT load-balance transaction invalidates them.
+  std::uint64_t interp_topology_version_;
 };
 
 #endif // UTILS_CART_GRID_HPP_

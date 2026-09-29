@@ -21,7 +21,8 @@ namespace dyngr {
 
 template<int ivx, class EOSPolicy, class ErrorPolicy>
 KOKKOS_INLINE_FUNCTION
-void SingleStateFlux(const PrimitiveSolverHydro<EOSPolicy, ErrorPolicy>& eos,
+void SingleStateFlux(const PrimitiveSolverHydro<EOSPolicy, ErrorPolicy>& eos_l,
+    const PrimitiveSolverHydro<EOSPolicy, ErrorPolicy>& eos_r,
     Real prim_l[NPRIM], Real prim_r[NPRIM], Real Bu_l[NPRIM], Real Bu_r[NPRIM],
     const int nmhd, const int nscal,
     Real g3d[NSPMETRIC], Real beta_u[3], Real alpha,
@@ -41,8 +42,8 @@ void SingleStateFlux(const PrimitiveSolverHydro<EOSPolicy, ErrorPolicy>& eos,
   const Real ialpha = 1.0/alpha;
 
   // Calculate conserved variables
-  eos.ps.PrimToCon(prim_l, cons_l, Bu_l, g3d);
-  eos.ps.PrimToCon(prim_r, cons_r, Bu_r, g3d);
+  eos_l.ps.PrimToCon(prim_l, cons_l, Bu_l, g3d);
+  eos_r.ps.PrimToCon(prim_r, cons_r, Bu_r, g3d);
 
   // Calculate W for the left state.
   Real uul[3] = {prim_l[IVX], prim_l[IVY], prim_l[IVZ]};
@@ -63,18 +64,21 @@ void SingleStateFlux(const PrimitiveSolverHydro<EOSPolicy, ErrorPolicy>& eos,
 
   // Calculate fluxes for the left state.
   flux_l[CDN] = cons_l[CDN]*vcl;
-  flux_l[CSX] = (cons_l[CSX]*vcl - bdl[0]*Bu_l[ibx]*iWl);
-  flux_l[CSY] = (cons_l[CSY]*vcl - bdl[1]*Bu_l[ibx]*iWl);
-  flux_l[CSZ] = (cons_l[CSZ]*vcl - bdl[2]*Bu_l[ibx]*iWl);
+  flux_l[CSX] = fma(cons_l[CSX], vcl, -(bdl[0]*Bu_l[ibx]*iWl));
+  // The five `fma` calls in this block pin the contraction nvcc picks on its own when
+  // flux_l/bflux_l are forced to local memory.  Keeping those arrays in registers
+  // otherwise costs exactly these five fusions (one rounding becomes two).
+  flux_l[CSY] = fma(cons_l[CSY], vcl, -(bdl[1]*Bu_l[ibx]*iWl));
+  flux_l[CSZ] = fma(cons_l[CSZ], vcl, -(bdl[2]*Bu_l[ibx]*iWl));
   flux_l[csx] += (prim_l[PPR] + 0.5*bsql);
   flux_l[CTA] = (cons_l[CTA]*vcl - alpha*bul0*Bu_l[ibx]*iWl
           + (prim_l[PPR] + 0.5*bsql)*prim_l[ivx]*iWl);
 
   bflux_l[ibx] = 0.0;
-  bflux_l[iby] = (Bu_l[iby]*vcl -
-                    Bu_l[ibx]*(prim_l[pvy]*iWl - beta_u[pvy - PVX]*ialpha));
-  bflux_l[ibz] = (Bu_l[ibz]*vcl -
-                    Bu_l[ibx]*(prim_l[pvz]*iWl - beta_u[pvz - PVX]*ialpha));
+  bflux_l[iby] = fma(Bu_l[iby], vcl,
+                    -(Bu_l[ibx]*(prim_l[pvy]*iWl - beta_u[pvy - PVX]*ialpha)));
+  bflux_l[ibz] = fma(Bu_l[ibz], vcl,
+                    -(Bu_l[ibx]*(prim_l[pvz]*iWl - beta_u[pvz - PVX]*ialpha)));
 
   // Calculate W for the right state.
   Real uur[3] = {prim_r[IVX], prim_r[IVY], prim_r[IVZ]};

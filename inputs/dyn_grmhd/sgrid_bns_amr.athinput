@@ -76,8 +76,7 @@ m           = 0.0
 a           = 0.0
 
 <mhd>
-eos         = ideal          # UNUSED but needed
-gamma       = 2.0            # UNUSED but needed
+eos         = ideal          # selects the DynGRMHD no-op EOS; dyn_eos is the real one
 
 dyn_eos     = piecewise_poly # PrimitiveSolver EOSPolicy
 dyn_error   = reset_floor    # PrimitiveSolver ErrorPolicy
@@ -100,7 +99,7 @@ pwp_gamma_pieces_0 = 1.356920000000000e+00
 pwp_gamma_pieces_1 = 3.456000000000000e+00
 pwp_gamma_pieces_2 = 3.011000000000000e+00
 pwp_gamma_pieces_3 = 1.425000000000000e+00
-pwp_gamma_thermal = 1.7
+gamma_thermal     = 1.7
 
 <adm>
 

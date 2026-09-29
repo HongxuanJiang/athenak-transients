@@ -33,6 +33,7 @@
 #include <algorithm>    // max()
 
 #include "athena.hpp"
+#include "reconstruct/thermal_floors.hpp"
 
 //----------------------------------------------------------------------------------------
 //! \fn PPM4()
@@ -194,8 +195,6 @@ void PiecewiseParabolicX1(TeamMember_t const &member,
      const DvceArray5D<Real> &q, ScrArray2D<Real> &ql, ScrArray2D<Real> &qr) {
   int nvar = q.extent_int(1);
   const Real &dfloor_ = eos.dfloor;
-  // TODO(jmstone): ideal gas only for now
-  Real efloor_ = eos.pfloor/(eos.gamma - 1.0);
   for (int n=0; n<nvar; ++n) {
     if (extremum_preserving) {
       par_for_inner(member, il, iu, [&](const int i) {
@@ -209,10 +208,9 @@ void PiecewiseParabolicX1(TeamMember_t const &member,
           if (n==IDN) {
             ql(IDN,i+1) = fmax(ql(IDN,i+1), dfloor_);
             qr(IDN,i  ) = fmax(qr(IDN,i  ), dfloor_);
-          }
-          if (n==IEN) {
-            ql(IEN,i+1) = fmax(ql(IEN,i+1), efloor_);
-            qr(IEN,i  ) = fmax(qr(IEN,i  ), efloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql(IEN,i+1), qr(IEN,i),
+                                                 ql(IDN,i+1), qr(IDN,i));
           }
         }
       });
@@ -224,6 +222,15 @@ void PiecewiseParabolicX1(TeamMember_t const &member,
         Real &qip1 = q(m,n,k,j,i+1);
         Real &qip2 = q(m,n,k,j,i+2);
         PPM4(qim2, qim1, qi, qip1, qip2, ql(n,i+1), qr(n,i));
+        if (apply_floors) {
+          if (n==IDN) {
+            ql(IDN,i+1) = fmax(ql(IDN,i+1), dfloor_);
+            qr(IDN,i  ) = fmax(qr(IDN,i  ), dfloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql(IEN,i+1), qr(IEN,i),
+                                                 ql(IDN,i+1), qr(IDN,i));
+          }
+        }
       });
     }
   }
@@ -242,8 +249,6 @@ void PiecewiseParabolicX2(TeamMember_t const &member,
      const DvceArray5D<Real> &q, ScrArray2D<Real> &ql_jp1, ScrArray2D<Real> &qr_j) {
   int nvar = q.extent_int(1);
   const Real &dfloor_ = eos.dfloor;
-  // TODO(jmstone): ideal gas only for now
-  Real efloor_ = eos.pfloor/(eos.gamma - 1.0);
   for (int n=0; n<nvar; ++n) {
     if (extremum_preserving) {
       par_for_inner(member, il, iu, [&](const int i) {
@@ -257,10 +262,9 @@ void PiecewiseParabolicX2(TeamMember_t const &member,
           if (n==IDN) {
             ql_jp1(IDN,i) = fmax(ql_jp1(IDN,i), dfloor_);
             qr_j  (IDN,i) = fmax(qr_j  (IDN,i), dfloor_);
-          }
-          if (n==IEN) {
-            ql_jp1(IEN,i) = fmax(ql_jp1(IEN,i), efloor_);
-            qr_j  (IEN,i) = fmax(qr_j  (IEN,i), efloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql_jp1(IEN,i), qr_j(IEN,i),
+                                                 ql_jp1(IDN,i), qr_j(IDN,i));
           }
         }
       });
@@ -272,6 +276,15 @@ void PiecewiseParabolicX2(TeamMember_t const &member,
         Real &qjp1 = q(m,n,k,j+1,i);
         Real &qjp2 = q(m,n,k,j+2,i);
         PPM4(qjm2, qjm1, qj, qjp1, qjp2, ql_jp1(n,i), qr_j(n,i));
+        if (apply_floors) {
+          if (n==IDN) {
+            ql_jp1(IDN,i) = fmax(ql_jp1(IDN,i), dfloor_);
+            qr_j  (IDN,i) = fmax(qr_j  (IDN,i), dfloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql_jp1(IEN,i), qr_j(IEN,i),
+                                                 ql_jp1(IDN,i), qr_j(IDN,i));
+          }
+        }
       });
     }
   }
@@ -290,8 +303,6 @@ void PiecewiseParabolicX3(TeamMember_t const &member,
      const DvceArray5D<Real> &q, ScrArray2D<Real> &ql_kp1, ScrArray2D<Real> &qr_k) {
   int nvar = q.extent_int(1);
   const Real &dfloor_ = eos.dfloor;
-  // TODO(jmstone): ideal gas only for now
-  Real efloor_ = eos.pfloor/(eos.gamma - 1.0);
   for (int n=0; n<nvar; ++n) {
     if (extremum_preserving) {
       par_for_inner(member, il, iu, [&](const int i) {
@@ -305,10 +316,9 @@ void PiecewiseParabolicX3(TeamMember_t const &member,
           if (n==IDN) {
             ql_kp1(IDN,i) = fmax(ql_kp1(IDN,i), dfloor_);
             qr_k  (IDN,i) = fmax(qr_k  (IDN,i), dfloor_);
-          }
-          if (n==IEN) {
-            ql_kp1(IEN,i) = fmax(ql_kp1(IEN,i), efloor_);
-            qr_k  (IEN,i) = fmax(qr_k  (IEN,i), efloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql_kp1(IEN,i), qr_k(IEN,i),
+                                                 ql_kp1(IDN,i), qr_k(IDN,i));
           }
         }
       });
@@ -320,6 +330,15 @@ void PiecewiseParabolicX3(TeamMember_t const &member,
         Real &qkp1 = q(m,n,k+1,j,i);
         Real &qkp2 = q(m,n,k+2,j,i);
         PPM4(qkm2, qkm1, qk, qkp1, qkp2, ql_kp1(n,i), qr_k(n,i));
+        if (apply_floors) {
+          if (n==IDN) {
+            ql_kp1(IDN,i) = fmax(ql_kp1(IDN,i), dfloor_);
+            qr_k  (IDN,i) = fmax(qr_k  (IDN,i), dfloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql_kp1(IEN,i), qr_k(IEN,i),
+                                                 ql_kp1(IDN,i), qr_k(IDN,i));
+          }
+        }
       });
     }
   }

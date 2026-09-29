@@ -18,7 +18,7 @@ import athena_read
 import numpy as np
 
 _recon = ["plm", "ppm4", "ppmx", "wenoz"]  # do not change order
-_flux = ["llf", "hlle"]
+_flux = ["llf", "hlle", "hlld"]
 _res = [256, 512]  # resolutions to test
 _soe = ["hydro", "mhd"]  # system of equations to test
 name = {"hydro": "mb2", "mhd": "mub1"}  # names of the tests
@@ -61,6 +61,8 @@ results = {}
 @pytest.mark.parametrize("soe", _soe)
 def test_run(fv, rv, soe):
     """Run a single test with given parameters, store density in results[]."""
+    if fv == "hlld" and soe == "hydro":
+        pytest.skip("GR HLLD is only available for MHD tests.")
     iv = "rk2" if rv == "plm" else "rk3"
     try:
         for res in _res:
@@ -74,6 +76,8 @@ def test_run(fv, rv, soe):
 @pytest.mark.parametrize("fv", _flux)
 @pytest.mark.parametrize("soe", _soe)
 def test_convergence(fv, rv, soe):
+    if fv == "hlld" and soe == "hydro":
+        pytest.skip("GR HLLD is only available for MHD tests.")
     if ref_key[soe] == (fv, rv):
         pytest.skip("Can't compare reference against reference")
 

@@ -8,6 +8,7 @@
 //! Variables are only calculated over active zones (ghost zones excluded).
 
 #include <iostream>
+#include <cmath>
 #include <sstream>
 #include <string>   // std::string, to_string()
 
@@ -43,6 +44,30 @@ void ComputeDerivedVariable(std::string name, int index, MeshBlockPack* pmbp,
   int &js = indcs.js;  int &je  = indcs.je;
   int &ks = indcs.ks;  int &ke  = indcs.ke;
   auto &size = pmbp->pmb->mb_size;
+  auto &multi_d = pmbp->pmesh->multi_d;
+  auto &three_d = pmbp->pmesh->three_d;
+
+  // Hydro cell-centered velocity divergence, using primitive velocities.
+  if ((name.compare("hydro_div_v") == 0) ||
+      (name.compare("hydro_abs_div_v") == 0)) {
+    auto &w0 = pmbp->phydro->w0;
+    const bool use_abs = (name.compare("hydro_abs_div_v") == 0);
+
+    par_for("hydro_div_v",DevExeSpace(),0,(nmb-1),ks,ke,js,je,is,ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      Real divv = static_cast<Real>(0.5) *
+          (w0(m,IVX,k,j,i+1) - w0(m,IVX,k,j,i-1)) / size.d_view(m).dx1;
+      if (multi_d) {
+        divv += static_cast<Real>(0.5) *
+            (w0(m,IVY,k,j+1,i) - w0(m,IVY,k,j-1,i)) / size.d_view(m).dx2;
+      }
+      if (three_d) {
+        divv += static_cast<Real>(0.5) *
+            (w0(m,IVZ,k+1,j,i) - w0(m,IVZ,k-1,j,i)) / size.d_view(m).dx3;
+      }
+      dvars(m,index,k,j,i) = use_abs ? fabs(divv) : divv;
+    });
+  }
 
   // radiation coordinate frame energy density R^0^0
   if (name.compare("rad_coord_e") == 0) {

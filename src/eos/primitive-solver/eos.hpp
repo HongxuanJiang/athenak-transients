@@ -125,6 +125,7 @@ class EOS : public EOSPolicy, public ErrorPolicy {
   using ErrorPolicy::max_bsq;
 
   static constexpr bool supports_entropy = std::is_base_of_v<SupportsEntropy, EOSPolicy>;
+  static constexpr bool supports_adiabat = std::is_base_of_v<SupportsAdiabat, EOSPolicy>;
   static constexpr bool supports_potentials =
     std::is_base_of_v<SupportsChemicalPotentials, EOSPolicy>;
 
@@ -205,6 +206,49 @@ class EOS : public EOSPolicy, public ErrorPolicy {
   //  \param[in] T  The temperature
   //  \param[in] Y  An array of size n_species of the particle fractions.
   //  \return The entropy per baryon for this EOS.
+  //! \fn Real GetAdiabat(Real n, Real T, Real *Y)
+  //  \brief The adiabatic invariant kappa = p/rho^Gamma in CODE units.
+  //
+  //  Built from the code-unit wrappers alone, so it carries no unit bookkeeping of its
+  //  own: the policy supplies only the exponent.  This is the quantity the GR
+  //  dual-energy formalism advects, and it is the same definition the fixed-metric
+  //  path uses (eos.sfloor is its floor there), so both GR solvers carry one variable
+  //  with one meaning.
+  //
+  //  \param[in] n  The number density
+  //  \param[in] T  The temperature
+  //  \param[in] Y  An array of size n_species of the particle fractions.
+  //  \return kappa, or NaN for a policy without an adiabatic invariant.
+  //! \fn bool HasAdiabat()
+  //  \brief Whether this EOS carries an adiabatic invariant, i.e. whether the
+  //         dual-energy auxiliary channel is available at all.
+  KOKKOS_INLINE_FUNCTION constexpr bool HasAdiabat() const {
+    return supports_adiabat;
+  }
+
+  KOKKOS_INLINE_FUNCTION Real GetAdiabat(Real n, Real T, Real *Y) const {
+    if constexpr (supports_adiabat) {
+      return GetPressure(n, T, Y)*pow(n*mb, -EOSPolicy::AdiabatGamma());
+    } else {
+      return std::numeric_limits<Real>::quiet_NaN();
+    }
+  }
+
+  //! \fn Real GetTemperatureFromAdiabat(Real n, Real kappa, Real *Y)
+  //  \brief Invert kappa back to a temperature at fixed number density.
+  //
+  //  The inverse of GetAdiabat, and the step that makes the auxiliary channel
+  //  well-conditioned: the pressure comes from a power of the density rather than from
+  //  a difference of two magnetic-scale energies.
+  KOKKOS_INLINE_FUNCTION Real GetTemperatureFromAdiabat(Real n, Real kappa,
+                                                        Real *Y) const {
+    if constexpr (supports_adiabat) {
+      return GetTemperatureFromP(n, kappa*pow(n*mb, EOSPolicy::AdiabatGamma()), Y);
+    } else {
+      return std::numeric_limits<Real>::quiet_NaN();
+    }
+  }
+
   KOKKOS_INLINE_FUNCTION Real GetEntropy(Real n, Real T, Real *Y) const {
     if constexpr (supports_entropy) {
       return EOSPolicy::Entropy(n, T*code_units.TemperatureConversion(eos_units), Y)/mb *
@@ -633,11 +677,19 @@ class EOS : public EOSPolicy, public ErrorPolicy {
     code_units = units;
   }
 
-  KOKKOS_INLINE_FUNCTION UnitSystem& GetCodeUnitSystem() const {
+  KOKKOS_INLINE_FUNCTION UnitSystem& GetCodeUnitSystem() {
     return code_units;
   }
 
-  KOKKOS_INLINE_FUNCTION UnitSystem& GetEOSUnitSystem() const {
+  KOKKOS_INLINE_FUNCTION const UnitSystem& GetCodeUnitSystem() const {
+    return code_units;
+  }
+
+  KOKKOS_INLINE_FUNCTION UnitSystem& GetEOSUnitSystem() {
+    return eos_units;
+  }
+
+  KOKKOS_INLINE_FUNCTION const UnitSystem& GetEOSUnitSystem() const {
     return eos_units;
   }
 };

@@ -11,24 +11,26 @@ import athena_read
 import numpy as np
 
 
-def arguments():
+def arguments(rsolver):
     """Assemble arguments for run command"""
     return [
         "job/basename=monopole",
         "time/tlim=10.0",
         "time/integrator=rk2",
         "mhd/reconstruct=plm",
+        f"mhd/rsolver={rsolver}",
     ]
 
 
 input_file = "inputs/gr_monopole.athinput"
 
 
-def test_run():
+@pytest.mark.parametrize("rsolver", ["hlle", "hlld"])
+def test_run(rsolver):
     """Run a single test with given arguments."""
     try:
-        results = testutils.run(input_file, arguments())
-        assert results, "GR Monopole test run failed."
+        results = testutils.run(input_file, arguments(rsolver))
+        assert results, f"GR Monopole test run failed for rsolver={rsolver}."
         # Check the errors in the output
         data = athena_read.error_dat("monopole-diag.dat")
         omega = list(zip(*data))[2]

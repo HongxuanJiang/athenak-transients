@@ -18,7 +18,7 @@ import athena_read
 import numpy as np
 
 _recon = ["plm", "ppm4", "ppmx", "wenoz"]  # do not change order
-_flux = ["llf", "hlle"]
+_flux = ["llf", "hlle", "hlld"]
 _res = [256, 512]  # resolutions to test
 _soe = ["mhd"]  # system of equations to test
 name = {"mhd": "mub1_dyngrmhd"}  # names of the tests

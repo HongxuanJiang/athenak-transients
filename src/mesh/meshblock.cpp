@@ -146,12 +146,18 @@ void MeshBlock::SetNeighbors(std::unique_ptr<MeshBlockTree> &ptree, int *ranklis
   if (pmy_pack->pmesh->two_d) {nnghbr = 24;}
   if (pmy_pack->pmesh->three_d) {nnghbr = 56;}
 
-  // allocate size of DualArrays
+  // The neighbor array always spans the full 56-slot index space of NeighborIndex()
+  // (nghbr_index.hpp), not just the nnghbr slots this dimensionality can populate.
+  // Callers index it by geometric position -- a problem generator tests the x3-face
+  // slots [24-31] in 2D, the x2-face slots [8-15] in 1D -- and must find lev=-1 there.
+  // Sizing it to nnghbr made those reads alias the next MeshBlock's row and, on the
+  // last local block, run past the allocation: the initial field then depended on the
+  // rank partition and on heap contents.
   int nmb = pmy_pack->nmb_thispack;
-  Kokkos::realloc(nghbr, nmb, nnghbr);
+  Kokkos::realloc(nghbr, nmb, 56);
 
   // Initialize host view elements of DualViews
-  for (int n=0; n<nnghbr; ++n) {
+  for (int n=0; n<56; ++n) {
     for (int m=0; m<nmb; ++m) {
       nghbr.h_view(m,n).gid   = -1;
       nghbr.h_view(m,n).lev   = -1;
@@ -425,6 +431,7 @@ void MeshBlock::SetNeighbors(std::unique_ptr<MeshBlockTree> &ptree, int *ranklis
   // For each DualArray: mark host views as modified, and then sync to device array
   nghbr.template modify<HostMemSpace>();
   nghbr.template sync<DevExeSpace>();
+  pmy_pack->InvalidateLATFactorCache();
 
   return;
 }

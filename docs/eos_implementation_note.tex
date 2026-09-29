@@ -1,0 +1,722 @@
+\documentclass[11pt]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{hyperref}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue,
+  urlcolor=blue,
+  citecolor=blue
+}
+
+\newcommand{\dd}{\mathrm d}
+\newcommand{\kb}{k_{\mathrm B}}
+\newcommand{\arad}{a_{\mathrm rad}}
+\newcommand{\me}{m_e}
+\newcommand{\mh}{m_{\mathrm H}}
+\newcommand{\mhe}{m_{\mathrm{He}}}
+\newcommand{\clight}{c}
+\newcommand{\rhoCGS}{\rho_{\mathrm{cgs}}}
+\newcommand{\TCGS}{T_{\mathrm K}}
+\newcommand{\eps}{\epsilon}
+\newcommand{\gammathree}{\Gamma_3-1}
+
+\title{AthenaK EOS Implementation Note}
+\author{Local code summary}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{Scope and Maintained Products}
+
+This note documents the maintained EOS table generators and dense-EOS helper
+modules in the current tree:
+\begin{itemize}
+  \item \texttt{scripts/generate\_saha\_table.py},
+  \item \texttt{scripts/generate\_lte\_table.py},
+  \item \texttt{scripts/scvh95\_eos.py},
+  \item \texttt{scripts/chabrier2021\_eos.py}.
+\end{itemize}
+The public H/He LTE models exposed by the table generator are
+\begin{enumerate}
+  \item \texttt{t13},
+  \item \texttt{scvh\_t13\_cp\_helm\_union},
+  \item \texttt{chabrier2021\_t13\_helm\_union}.
+\end{enumerate}
+The separate pure-H Saha table is intentionally kept as an independent,
+analytic reference EOS.  Older experimental dispatch modes have been removed
+from the generator and from this note; private helper routines remain only
+where a maintained union still needs them.
+
+\section{Native Table Layout and Thermodynamic Closure}
+
+AthenaK-native EOS tables are sampled on natural-log axes
+\begin{equation}
+  x \equiv \ln \rhoCGS, \qquad y \equiv \ln \TCGS,
+\end{equation}
+with temperature as the fastest-varying table index and
+\texttt{log\_axis\_base = e}.  The runtime fields are
+\begin{equation}
+  \ln P,\quad \ln \eps,\quad \ln c_s^2,\quad
+  \Gamma_1,\quad \gammathree,
+\end{equation}
+plus model-dependent composition and diagnostic fields.
+
+For the finite-difference closures used by T13 and by dense fallback products,
+the code first builds completed surfaces $P(\rho,T)$ and
+$\eps_{\mathrm{phys}}(\rho,T)$ and then evaluates
+\begin{align}
+  \chi_\rho &= \left(\frac{\partial \ln P}{\partial \ln \rho}\right)_T,
+&
+  \chi_T &= \left(\frac{\partial \ln P}{\partial \ln T}\right)_\rho,
+\\
+  c_v &= \frac{1}{T}
+        \left(\frac{\partial \eps_{\mathrm{phys}}}{\partial \ln T}\right)_\rho,
+&
+  \gammathree &= \frac{P\chi_T}{\rho T c_v},
+\\
+  \Gamma_1 &= \chi_\rho + \chi_T(\Gamma_3-1),
+&
+  c_s^2 &= \Gamma_1\frac{P}{\rho}.
+\end{align}
+The exported auxiliary heat capacity and adiabatic gradient are
+\begin{equation}
+  c_p = c_v\frac{\Gamma_1}{\chi_\rho},
+  \qquad
+  \nabla_{\mathrm{ad}} = \frac{\Gamma_3-1}{\Gamma_1}.
+\end{equation}
+At the two ends of a grid direction the finite differences use second-order
+one-sided stencils; in the interior they use centered differences.
+
+When photon radiation is enabled, it is added as an independent blackbody
+component,
+\begin{equation}
+  P_{\mathrm rad} = \frac{\arad T^4}{3}, \qquad
+  \eps_{\mathrm rad} = \frac{\arad T^4}{\rho}, \qquad
+  s_{\mathrm rad} = \frac{4\arad T^3}{3\rho},
+\end{equation}
+and the diagnostic radiation pressure fraction is
+\begin{equation}
+  \beta_{\mathrm rad} =
+  \frac{P_{\mathrm rad}}{P_{\mathrm gas}+P_{\mathrm rad}}.
+\end{equation}
+
+\section{Pure-H Saha Reference EOS}
+
+\texttt{generate\_saha\_table.py} solves
+\begin{equation}
+  \mathrm H \rightleftharpoons \mathrm{H^+}+e^-
+\end{equation}
+for a ground-state pure-H gas.  The partition convention cancels the electron
+spin degeneracy against the neutral-H ground-state degeneracy, giving
+\begin{equation}
+  C_{\mathrm Saha} =
+  \mh\left(\frac{2\pi\me\kb}{h^2}\right)^{3/2},
+  \qquad
+  y =
+  \frac{C_{\mathrm Saha}T^{3/2}\exp(-T_{\mathrm ion}/T)}{\rho},
+\end{equation}
+where $T_{\mathrm ion}=\chi_{\mathrm H}/\kb$.  The ionization fraction
+$x=n_{\mathrm{H^+}}/(n_{\mathrm H}+n_{\mathrm{H^+}})$ satisfies
+\begin{equation}
+  \frac{x^2}{1-x}=y,
+  \qquad
+  x = \frac{2y}{\sqrt{y^2+4y}+y},
+\end{equation}
+with asymptotic low- and high-$y$ branches for numerical stability.
+
+The pressure and specific internal energy are
+\begin{equation}
+  P = \rho R_{\mathrm H}T(1+x),
+  \qquad
+  \eps = \frac{3}{2}R_{\mathrm H}T(1+x)
+       + x\frac{\chi_{\mathrm H}}{\mh},
+  \qquad
+  R_{\mathrm H}=\frac{\kb}{\mh}.
+\end{equation}
+The table closure is analytic.  Defining
+\begin{equation}
+  g=\frac{x(1-x)}{2-x}, \qquad u_{\mathrm H}=\frac{T_{\mathrm ion}}{T},
+\end{equation}
+the derivatives used by the generator are
+\begin{align}
+  \left(\frac{\partial \eps}{\partial \rho}\right)_T
+    &= -\frac{g}{\rho}
+       \left(\frac{3}{2}R_{\mathrm H}T+\frac{\chi_{\mathrm H}}{\mh}\right),
+\\
+  \left(\frac{\partial \eps}{\partial T}\right)_\rho
+    &= \frac{3}{2}R_{\mathrm H}(1+x)
+       +\left(\frac{3}{2}R_{\mathrm H}T+\frac{\chi_{\mathrm H}}{\mh}\right)
+        \frac{g(3/2+u_{\mathrm H})}{T},
+\\
+  \left(\frac{\partial P}{\partial \rho}\right)_T
+    &= R_{\mathrm H}T\left[(1+x)-g\right],
+\\
+  \left(\frac{\partial P}{\partial T}\right)_\rho
+    &= \rho R_{\mathrm H}\left[(1+x)+g(3/2+u_{\mathrm H})\right].
+\end{align}
+The adiabatic temperature derivative follows the first law,
+\begin{equation}
+  \left(\frac{\partial T}{\partial \rho}\right)_s =
+  \frac{P/\rho^2-(\partial\eps/\partial\rho)_T}
+       {(\partial\eps/\partial T)_\rho},
+\end{equation}
+and the stored sound speed and adiabatic exponents are
+\begin{align}
+  c_s^2 &=
+  \left(\frac{\partial P}{\partial \rho}\right)_T
+  +\left(\frac{\partial P}{\partial T}\right)_\rho
+   \left(\frac{\partial T}{\partial \rho}\right)_s,
+&
+  \Gamma_1 &= \frac{\rho c_s^2}{P},
+&
+  \gammathree &= \frac{\rho}{T}
+   \left(\frac{\partial T}{\partial \rho}\right)_s.
+\end{align}
+This H-only EOS is not merged into the H/He union tables; its generated table is
+kept byte-for-byte stable when the LTE H/He products are updated.
+
+\section{T13 H/He Chemical-Equilibrium EOS}
+
+\texttt{t13} implements the Tomida et al. Appendix-1 ideal
+chemical-equilibrium H/He EOS with molecular hydrogen.  The species order is
+\begin{equation}
+  \mathrm{H_2},\ \mathrm H,\ \mathrm{H^+},\
+  \mathrm{He},\ \mathrm{He^+},\ \mathrm{He^{2+}},\ e^-.
+\end{equation}
+The translational single-particle partition function is stored as
+\begin{equation}
+  \ln z_{\mathrm{tr}}(m,T) =
+  \frac{3}{2}\ln(2\pi m\kb T)-3\ln h.
+\end{equation}
+For H$_2$, the rotational partition function uses a fixed 3:1 ortho/para
+ratio.  With
+\begin{align}
+  Z_{\mathrm{even}} &=
+    \sum_{J\ {\rm even}}(2J+1)
+    \exp\left[-\frac{J(J+1)\theta_{\mathrm{rot}}}{2T}\right],
+\\
+  Z_{\mathrm{odd,shift}} &=
+    \sum_{J\ {\rm odd}}3(2J+1)
+    \exp\left[-\left(\frac{J(J+1)}{2}-1\right)
+    \frac{\theta_{\mathrm{rot}}}{T}\right],
+\end{align}
+the code uses
+\begin{equation}
+  \ln Z_{\mathrm{rot}} =
+  \frac{1}{4}\ln Z_{\mathrm{even}}
+  +\frac{3}{4}\ln Z_{\mathrm{odd,shift}},
+\end{equation}
+with the same weights for $\partial\ln Z_{\mathrm{rot}}/\partial\ln T$.
+The vibrational partition function is
+\begin{equation}
+  a=\frac{\theta_{\mathrm{vib}}}{2T}, \qquad
+  \ln Z_{\mathrm{vib}} =
+  -a-\ln\left(1-\exp[-2a]\right),
+  \qquad
+  \frac{\partial\ln Z_{\mathrm{vib}}}{\partial\ln T} =
+  \frac{a}{\tanh a}.
+\end{equation}
+At large $a$ the generator uses the limiting branch
+$\ln Z_{\mathrm{vib}}\simeq -a$.
+
+The implemented species partition offsets are
+\begin{align}
+  \ln z_{\mathrm{H_2}} &=
+    \ln z_{\mathrm{tr}}(m_{\mathrm{H_2}},T)
+    +\ln Z_{\mathrm{rot}}+\ln Z_{\mathrm{vib}}+\ln4+\ln2,
+\\
+  \ln z_{\mathrm H} &=
+    \ln z_{\mathrm{tr}}(\mh,T)+\ln2+\ln2
+    -\frac{\chi_{\mathrm{dis}}}{2\kb T},
+\\
+  \ln z_{\mathrm{H^+}} &=
+    \ln z_{\mathrm{tr}}(\mh,T)+\ln2+\ln2
+    -\frac{\chi_{\mathrm{dis}}+2\chi_{\mathrm{ion,H}}}{2\kb T},
+\\
+  \ln z_{\mathrm{He}} &= \ln z_{\mathrm{tr}}(\mhe,T),
+\\
+  \ln z_{\mathrm{He^+}} &=
+    \ln z_{\mathrm{tr}}(\mhe,T)-\frac{\chi_{\mathrm{ion,He1}}}{\kb T},
+\\
+  \ln z_{\mathrm{He^{2+}}} &=
+    \ln z_{\mathrm{tr}}(\mhe,T)
+    -\frac{\chi_{\mathrm{ion,He1}}+\chi_{\mathrm{ion,He2}}}{\kb T},
+\\
+  \ln z_e &= \ln z_{\mathrm{tr}}(\me,T)+\ln2.
+\end{align}
+The equilibrium constants are then
+\begin{equation}
+  \ln K_{\mathrm{dis}}=2\ln z_{\mathrm H}-\ln z_{\mathrm{H_2}},
+  \quad
+  \ln K_{\mathrm{ion,H}}=\ln z_{\mathrm{H^+}}+\ln z_e-\ln z_{\mathrm H},
+\end{equation}
+with analogous first and second helium ionization constants.
+
+For each density row the generator solves the electron density by charge
+neutrality.  The hydrogen atomic density is written in a stable quadratic form,
+\begin{equation}
+  n_{\mathrm H} =
+  \frac{2n_{\mathrm{H,tot}}n_e}
+  {\sqrt{(n_e+K_{\mathrm{ion,H}})^2+
+  8n_{\mathrm{H,tot}}n_e^2/K_{\mathrm{dis}}}
+  +n_e+K_{\mathrm{ion,H}}},
+\end{equation}
+followed by
+\begin{equation}
+  n_{\mathrm{H^+}} = n_{\mathrm H}\frac{K_{\mathrm{ion,H}}}{n_e},
+  \qquad
+  n_{\mathrm{H_2}} = \frac{n_{\mathrm H}^2}{K_{\mathrm{dis}}}.
+\end{equation}
+For helium, the normalized weights are
+\begin{equation}
+  w_0=1,\qquad
+  w_1=\frac{K_{\mathrm{He1}}}{n_e},\qquad
+  w_2=\frac{K_{\mathrm{He1}}K_{\mathrm{He2}}}{n_e^2},
+\end{equation}
+so that $n_{\mathrm{He}^q}=n_{\mathrm{He,tot}}w_q/(w_0+w_1+w_2)$.
+The bisection root is
+\begin{equation}
+  n_{\mathrm{H^+}}+n_{\mathrm{He^+}}+2n_{\mathrm{He^{2+}}}-n_e=0.
+\end{equation}
+
+The ideal partition entropy per unit mass is
+\begin{equation}
+  s_i=\frac{\kb n_i}{\rho}
+  \left[1+\frac{\partial\ln z_i}{\partial\ln T}
+  -\left(\ln n_i-\ln z_i\right)\right].
+\end{equation}
+Before pair replacement the partition internal-energy density is
+\begin{equation}
+  u_{\mathrm{part}} =
+  \kb T\sum_i n_i\frac{\partial\ln z_i}{\partial\ln T}.
+\end{equation}
+The diagnostic energy components are assembled as
+\begin{align}
+  u_{\mathrm{trans}} &= \frac{3}{2}(n_{\mathrm{tot}}-n_e)\kb T
+                       + u_{e^\pm,\mathrm{kin}},
+\\
+  u_{\mathrm{rot}} &= n_{\mathrm{H_2}}\kb T
+    \frac{\partial\ln Z_{\mathrm{rot}}}{\partial\ln T},
+&
+  u_{\mathrm{vib}} &= n_{\mathrm{H_2}}\kb T
+    \frac{\partial\ln Z_{\mathrm{vib}}}{\partial\ln T},
+\\
+  u_{\mathrm{zpe}} &= n_{\mathrm{H_2}}E_{\mathrm{zpe}},
+&
+  u_{\mathrm{diss}} &= \frac{1}{2}\chi_{\mathrm{dis}}
+    (n_{\mathrm H}+n_{\mathrm{H^+}}),
+\\
+  u_{\mathrm{ion,H}} &= \chi_{\mathrm{ion,H}}n_{\mathrm{H^+}},
+&
+  u_{\mathrm{ion,He1}} &=
+    \chi_{\mathrm{ion,He1}}(n_{\mathrm{He^+}}+n_{\mathrm{He^{2+}}}),
+\\
+  u_{\mathrm{ion,He2}} &= \chi_{\mathrm{ion,He2}}n_{\mathrm{He^{2+}}}.
+\end{align}
+The gas pressure is
+\begin{equation}
+  P_{\mathrm{gas}}=(n_{\mathrm{tot}}-n_e)\kb T+P_{e^\pm}.
+\end{equation}
+For the standalone \texttt{t13} runtime table, the optional zero-point-energy
+convention is
+\begin{equation}
+  \eps_{\mathrm{runtime}} =
+  \eps_{\mathrm{physical}} -
+  X\frac{E_{\mathrm{zpe}}}{2\mh},
+\end{equation}
+while \texttt{eps\_physical} remains exported.  In the union tables this
+subtraction is disabled so all branches use the same physical energy zero.
+
+\section{Relativistic Electron-Positron Pair Gas}
+
+The H/He LTE generator includes an ideal relativistic $e^-/e^+$ gas following
+the HELM/MESA convention.  It enforces
+\begin{equation}
+  n_{e^-}-n_{e^+}=n_{\mathrm{charge}},
+\end{equation}
+where $n_{\mathrm{charge}}$ is fixed by the baryonic ion charge.  The electron
+degeneracy parameter $\eta$ excludes rest mass, and the positron relation uses
+$-\eta-2/\theta$ with
+\begin{equation}
+  \theta=\frac{\kb T}{\me\clight^2}, \qquad
+  \lambda_e=\frac{\hbar}{\me\clight}.
+\end{equation}
+Using generalized Laguerre nodes $y_j$ and weights $w_j$ with index
+$\alpha=1/2$, the code evaluates
+\begin{equation}
+  \gamma_j = 1+\theta y_j,\qquad
+  r_j=\sqrt{2+\theta y_j},
+\end{equation}
+and stable Fermi factors equivalent to
+\begin{equation}
+  f^-_j = \frac{1}{\exp(y_j-\eta)+1},
+  \qquad
+  f^+_j = \frac{1}{\exp(y_j+\eta+2/\theta)+1}.
+\end{equation}
+The densities are
+\begin{equation}
+  n_\mp =
+  \frac{\theta^{3/2}}{\pi^2\lambda_e^3}
+  \sum_j w_j r_j\gamma_j f^\mp_j .
+\end{equation}
+The pressure and kinetic-energy densities are
+\begin{align}
+  P_\mp &=
+  \frac{\me\clight^2\theta^{5/2}}{3\pi^2\lambda_e^3}
+  \sum_j w_j y_j r_j^3 f^\mp_j,
+\\
+  u_{\mathrm{kin},\mp} &=
+  \frac{\me\clight^2\theta^{5/2}}{\pi^2\lambda_e^3}
+  \sum_j w_j y_j r_j\gamma_j f^\mp_j.
+\end{align}
+The created-pair rest-mass convention used in the table is
+\begin{equation}
+  u_{\mathrm{rest,pair}} = 2\me\clight^2 n_{e^+}.
+\end{equation}
+This includes the rest mass of newly created pairs only, not the rest mass of
+the charge-balancing electrons already tied to the baryonic composition.  The
+lepton entropy density is evaluated from
+\begin{equation}
+  s_{e^\pm} =
+  \frac{u_{e^\pm}+P_{e^\pm}-\eta\kb T n_{\mathrm{charge}}}{T},
+\end{equation}
+and clipped non-negative.
+
+The pair diagnostics written to H/He tables are
+\begin{equation}
+  P_{\mathrm{pair,diag}}=2P_{e^+}, \qquad
+  f_{\mathrm{pair}}=\frac{P_{\mathrm{pair,diag}}}{P_{\mathrm{tot}}},
+\end{equation}
+stored as \texttt{ppair} and \texttt{pair\_pressure\_fraction}, plus pair
+energy, $n_{e^-}$, $n_{e^+}$, and $\eta$ diagnostics.  In \texttt{t13}, the
+pair gas replaces the classical ideal electron contribution only for
+$\log_{10}(T/{\rm K})\ge 7$.  In the fully ionized HELM and Coulomb fallback
+branches, pairs are part of the thermodynamics throughout the branch.  In
+native SCvH and Chabrier dense cells, the imported dense-fluid thermodynamics
+are not rewritten by pair production; the same HELM-style pair calculation is
+overlaid only as a diagnostic map.
+
+\section{Fully Ionized HELM Fallback}
+
+The full local HELM dense fallback assumes fully ionized H/He,
+\begin{equation}
+  n_{\mathrm H}=\frac{X\rho}{\mh},\qquad
+  n_{\mathrm{He}}=\frac{Y\rho}{\mhe},\qquad
+  n_{\mathrm{charge}}=n_{\mathrm H}+2n_{\mathrm{He}},
+\end{equation}
+and $n_{\mathrm{ions}}=n_{\mathrm H}+n_{\mathrm{He}}$.  It includes ideal
+ions, the arbitrary-relativity/arbitrary-degeneracy electron--positron gas,
+photons, and the Potekhin--Chabrier liquid ion--ion Coulomb free energy below.
+The gas pressure is
+\begin{equation}
+  P_{\mathrm{gas}}=n_{\mathrm{ions}}\kb T+P_{e^\pm}+P_C.
+\end{equation}
+The specific gas energy is
+\begin{equation}
+  \eps_{\mathrm{gas}} =
+  \frac{(3/2)n_{\mathrm{ions}}\kb T+u_{e^\pm}+u_C}{\rho}
+  + \eps_{\mathrm{offset}},
+\end{equation}
+with an energy-zero offset matched to the fully ionized T13 limit,
+\begin{equation}
+  \eps_{\mathrm{offset}} =
+  X\frac{\chi_{\mathrm{dis}}/2+\chi_{\mathrm{ion,H}}}{\mh}
+  +Y\frac{\chi_{\mathrm{ion,He1}}+\chi_{\mathrm{ion,He2}}}{\mhe}.
+\end{equation}
+Ion entropies use the ideal translational form
+\begin{equation}
+  s_i=\frac{\kb n_i}{\rho}
+  \left[\frac{5}{2}-\left(\ln n_i-\ln z_{\mathrm{tr},i}\right)\right],
+\end{equation}
+and pair entropy is added separately.  The branch is accepted only where the
+simple LTE ionization proxy gives
+\begin{equation}
+  x_{\mathrm{H^+}}\ge 0.99,\qquad x_{\mathrm{He^{2+}}}\ge 0.90.
+\end{equation}
+
+The Coulomb term uses a Potekhin--Chabrier liquid fit.
+With electron-sphere radius
+\begin{equation}
+  a_e=\left(\frac{3}{4\pi n_e}\right)^{1/3},
+\end{equation}
+the ion coupling parameters are
+\begin{equation}
+  \Gamma_{\mathrm H}=\frac{e^2}{a_e\kb T},\qquad
+  \Gamma_{\mathrm{He}}=\frac{2^{5/3}e^2}{a_e\kb T}.
+\end{equation}
+The reduced liquid free-energy fit implemented in the generator is
+\begin{align}
+  f_{ii}(\Gamma) &=
+  a_1\left[
+  \sqrt{\Gamma(a_2+\Gamma)}
+  -a_2\ln\left(\sqrt{\Gamma/a_2}+\sqrt{1+\Gamma/a_2}\right)
+  \right]
+\\
+  &\quad
+  +2a_3\left(\sqrt{\Gamma}-\tan^{-1}\sqrt{\Gamma}\right)
+  +b_1\left[\Gamma-b_2\ln(1+\Gamma/b_2)\right]
+  +\frac{b_3}{2}\ln(1+\Gamma^2/b_4),
+\end{align}
+where
+\begin{equation}
+  a_1=-0.907347,\quad a_2=0.62849,\quad
+  a_3=-\frac{\sqrt3}{2}-\frac{a_1}{\sqrt{a_2}},
+\end{equation}
+and
+\begin{equation}
+  b_1=0.00456,\quad b_2=211.6,\quad
+  b_3=-10^{-4},\quad b_4=0.00462.
+\end{equation}
+The code computes
+$u_{ii}=\partial f_{ii}/\partial\ln\Gamma$ analytically, avoiding the
+weak-coupling cancellation of a centered finite difference.
+The Coulomb thermodynamic additions are
+\begin{align}
+  P_C &= \frac{\kb T}{3}\sum_i n_i u_{ii,i},
+&
+  \eps_C &= \frac{\kb T}{\rho}\sum_i n_i u_{ii,i},
+&
+  s_C &= \frac{\kb}{\rho}\sum_i n_i(u_{ii,i}-f_{ii,i}).
+\end{align}
+The gap-filling HELM corner is gated by full ionization.  In the Chabrier
+union, HELM is instead preferred for $\rho\ge0.1\,\mathrm{g\,cm^{-3}}$ and
+$T\ge10^8\,\mathrm K$, where the high-temperature switch supersedes the
+low-density Saha ionization proxy.  Both paths require
+$\Gamma_{\mathrm{He}}\le175$,
+and
+\begin{equation}
+  T \ge 3\max(T_{p,\mathrm H},T_{p,\mathrm{He}}),
+  \qquad
+  T_{p,i}=\frac{\hbar}{\kb}
+  \left(\frac{4\pi n_i Z_i^2e^2}{m_i}\right)^{1/2}.
+\end{equation}
+
+\section{SCvH 1995 Union}
+
+\texttt{scvh\_t13\_cp\_helm\_union} combines T13, SCvH, the Coulomb corner,
+and the HELM fallback.  The SCvH helper reads the original hydrogen and helium
+tables in native $(\log_{10}T,\log_{10}P)$ coordinates, including the hydrogen
+plasma phase-transition branches.  For a target isotherm it builds a composite
+pressure grid, inserts the low- and high-density PPT branches where applicable,
+mixes H and He, and then resamples to the AthenaK $\log\rho$ grid with PCHIP.
+
+The H/He volume mixing is the additive-volume law
+\begin{equation}
+  \frac{1}{\rho}=\frac{X}{\rho_{\mathrm H}}+\frac{Y}{\rho_{\mathrm{He}}},
+\end{equation}
+and the internal energy is
+\begin{equation}
+  \eps_{\mathrm{gas}}=X\eps_{\mathrm H}+Y\eps_{\mathrm{He}}.
+\end{equation}
+The entropy is
+\begin{equation}
+  s_{\mathrm{gas}}=Xs_{\mathrm H}+Ys_{\mathrm{He}}+s_{\mathrm{mix}},
+\end{equation}
+where $s_{\mathrm{mix}}$ is the SCvH composition-dependent ideal mixing
+correction evaluated from the tabulated H$_2$/H/H$^+$ and
+He/He$^+$/He$^{2+}$ fractions and their local derivatives in $T$ and $P$.
+The code keeps the full SCvH algebra for this correction rather than replacing
+it with a composition-independent ideal-gas approximation.
+
+For the gas-only SCvH mixture, the helper computes
+\begin{equation}
+  \alpha =
+  \rho\left[
+  \frac{X}{\rho_{\mathrm H}}
+  \left(\frac{\partial\ln\rho_{\mathrm H}}{\partial\ln T}\right)_P
+  +\frac{Y}{\rho_{\mathrm{He}}}
+  \left(\frac{\partial\ln\rho_{\mathrm{He}}}{\partial\ln T}\right)_P
+  \right],
+\end{equation}
+\begin{equation}
+  \beta =
+  \rho\left[
+  \frac{X}{\rho_{\mathrm H}}
+  \left(\frac{\partial\ln\rho_{\mathrm H}}{\partial\ln P}\right)_T
+  +\frac{Y}{\rho_{\mathrm{He}}}
+  \left(\frac{\partial\ln\rho_{\mathrm{He}}}{\partial\ln P}\right)_T
+  \right],
+\end{equation}
+then
+\begin{equation}
+  \chi_{\rho,\mathrm{gas}}=\frac{1}{\beta},\qquad
+  \chi_{T,\mathrm{gas}}=-\frac{\alpha}{\beta}.
+\end{equation}
+The gas adiabatic gradient follows the mixed entropy derivatives,
+\begin{equation}
+  \nabla_{\mathrm{ad,gas}} =
+  -\frac{(\partial\ln s/\partial\ln P)_T}
+        {(\partial\ln s/\partial\ln T)_P},
+\end{equation}
+and the gas exponents are
+\begin{equation}
+  \Gamma_{1,\mathrm{gas}}=
+  \frac{\chi_{\rho,\mathrm{gas}}}
+       {1-\chi_{T,\mathrm{gas}}\nabla_{\mathrm{ad,gas}}},
+  \qquad
+  (\Gamma_3-1)_{\mathrm{gas}}=
+  \frac{\chi_{\rho,\mathrm{gas}}\nabla_{\mathrm{ad,gas}}}
+       {1-\chi_{T,\mathrm{gas}}\nabla_{\mathrm{ad,gas}}}.
+\end{equation}
+Radiation is then added through the same additive formulas as above.  The
+helper rejects cells whose imported thermodynamic derivatives disagree too
+strongly with finite differences on the resampled table.
+
+The union ownership rule is
+\begin{enumerate}
+  \item use valid SCvH cells wherever available,
+  \item otherwise use the fully ionized Coulomb corner where its gates pass,
+  \item otherwise use the HELM fully ionized pair fallback in hot dense cells,
+  \item otherwise use T13 on the low-density side,
+  \item fill remaining rectangular holes from T13 or HELM and enforce a
+        strictly increasing $\ln\eps$ envelope along each temperature row.
+\end{enumerate}
+The source-map fields are \texttt{source\_t13}, \texttt{source\_scvh},
+\texttt{source\_corner\_cp}, \texttt{source\_corner\_helm},
+\texttt{source\_corner}, \texttt{source\_filler}, and
+\texttt{eps\_envelope\_correction}.
+
+\section{Chabrier 2021 Dense-Fluid Union}
+
+\texttt{chabrier2021\_t13\_helm\_union} is the current default dense H/He EOS
+product.  It covers
+\begin{equation}
+  -20 \le \log_{10}\rho_{\mathrm{cgs}} \le 3,\qquad
+  0 \le \log_{10}(T/{\rm K}) \le 10
+\end{equation}
+in the hardcoded 640 by 640 job.  The dense-fluid input tables are available
+at helium mass fractions $Y=0.275,0.292,0.297$; the helper linearly
+interpolates or, for the local default $Y=0.30$, mildly extrapolates in $Y$.
+
+The native Chabrier rows are in $(\log_{10}T,\log_{10}P_{\mathrm{GPa}})$.
+They contain $\log_{10}\rho$, $\log_{10}u$, $\log_{10}s$,
+the two density derivatives at constant $P$ and $T$, and
+$\nabla_{\mathrm{ad}}$.  Unit conversion is
+\begin{equation}
+  P_{\mathrm{gas}}=10^{\log_{10}P_{\mathrm{GPa}}+10},
+  \qquad
+  \eps_{\mathrm{gas}}=10^{\log_{10}u_{\mathrm{MJ\,kg^{-1}}}}10^{10},
+  \qquad
+  s_{\mathrm{gas}}=10^{\log_{10}s_{\mathrm{MJ\,kg^{-1}\,K^{-1}}}}10^{10}.
+\end{equation}
+For each target isotherm, valid native cells are filtered, forced monotonic in
+$\log\rho$, and linearly interpolated to the target $\log\rho$ grid.
+
+The gas derivatives are
+\begin{equation}
+  \chi_{\rho,\mathrm{gas}} =
+  \left[
+  \left(\frac{\partial\ln\rho}{\partial\ln P}\right)_T
+  \right]^{-1},
+  \qquad
+  \chi_{T,\mathrm{gas}} =
+  -\frac{(\partial\ln\rho/\partial\ln T)_P}
+        {(\partial\ln\rho/\partial\ln P)_T},
+\end{equation}
+and
+\begin{equation}
+  \delta_{\mathrm{gas}} =
+  -\left(\frac{\partial\ln\rho}{\partial\ln T}\right)_P.
+\end{equation}
+The heat capacities are reconstructed as
+\begin{equation}
+  c_{p,\mathrm{gas}} =
+  \frac{P_{\mathrm{gas}}\delta_{\mathrm{gas}}}
+       {\rho T\nabla_{\mathrm{ad,gas}}},
+  \qquad
+  c_{v,\mathrm{gas}} =
+  c_{p,\mathrm{gas}} -
+  \frac{P_{\mathrm{gas}}\chi_{T,\mathrm{gas}}^2}
+       {\rho T\chi_{\rho,\mathrm{gas}}}.
+\end{equation}
+After adding radiation, the closure is
+\begin{align}
+  \chi_\rho &=
+  \frac{P_{\mathrm{gas}}\chi_{\rho,\mathrm{gas}}}{P_{\mathrm{tot}}},
+&
+  \chi_T &=
+  \frac{P_{\mathrm{gas}}\chi_{T,\mathrm{gas}}+4P_{\mathrm{rad}}}
+       {P_{\mathrm{tot}}},
+\\
+  c_v &= c_{v,\mathrm{gas}}+\frac{4\arad T^3}{\rho},
+&
+  \gammathree &= \frac{P_{\mathrm{tot}}\chi_T}{\rho T c_v},
+\\
+  \Gamma_1 &= \chi_\rho+\chi_T(\Gamma_3-1),
+&
+  c_s^2 &= \Gamma_1\frac{P_{\mathrm{tot}}}{\rho}.
+\end{align}
+
+The union rule is:
+\begin{enumerate}
+  \item build T13 everywhere as the low-density chemical EOS,
+  \item import and resample the Chabrier dense-fluid EOS,
+  \item fill tiny dense Chabrier holes row-by-row with monotone PCHIP or
+        nearest valid edge values,
+  \item overlay HELM pair diagnostics on valid Chabrier cells without changing
+        their pressure, energy, or adiabatic indices,
+  \item blend T13 and Chabrier over
+        $10^{-3}\le\rho_{\mathrm{cgs}}<10^{-2}$ with smootherstep weights,
+  \item additionally blend the first few dense Chabrier onset cells in
+        temperature to reduce a visible $\Gamma_1$ boundary,
+  \item use pure Chabrier cells at higher density wherever valid,
+  \item use the HELM fully ionized gap fallback above
+        $\log_{10}(T/{\rm K})\ge 7$ where Chabrier is not valid,
+  \item prefer full HELM for $\rho\ge0.1\,\mathrm{g\,cm^{-3}}$ above
+        $\log_{10}(T/{\rm K})\ge 8$, even if a Chabrier row remains available.
+\end{enumerate}
+The smootherstep weight is
+\begin{equation}
+  S(q)=6q^5-15q^4+10q^3,\qquad 0<q<1,
+\end{equation}
+with $S=0$ below the interval and $S=1$ above it.  Linear physical fields are
+blended as $(1-S)A+SB$; logarithmic runtime fields are then rebuilt from the
+blended pressure, energy, and sound speed.  On pure Chabrier dense cells,
+species fractions and $\mu$ are diagnostic proxies from the simple atomic H/He
+Saha solver and do not feed back into the Chabrier thermodynamics.
+
+\section{Validation and Generated Artifacts}
+
+Before writing, each table must have finite positive runtime fields, positive
+$c_s^2$, positive $\Gamma_1$ and $\Gamma_3-1$, positive $\mu$, bounded species
+fractions, bounded $\beta_{\mathrm rad}$, and non-negative pair-pressure
+diagnostics.  Union tables additionally validate binary non-overlapping source
+masks, finite pair diagnostics, and strictly increasing $\ln\eps$ along every
+temperature row after any rectangular filling.
+
+The maintained generated tables live under \texttt{eos\_tables/}.  The
+Chabrier 640 by 640 diagnostic table can exceed GitHub's normal 100 MB object
+limit and should be handled through Git LFS or an external artifact store if it
+needs to be versioned.
+
+The maintained summary figures under
+\texttt{eos\_validation\_test/plots/} are:
+\begin{itemize}
+  \item \texttt{saha\_hydrogen\_summary.png},
+  \item \texttt{lte\_t13\_prad\_eos\_summary.png},
+  \item \texttt{scvh\_t13\_cp\_helm\_union\_prad\_640\_summary.png},
+  \item \texttt{chabrier2021\_t13\_helm\_union\_prad\_640\_summary.png}.
+\end{itemize}
+These are one current summary per maintained EOS table.  The older pair/no-pair
+comparison PNGs were diagnostic snapshots and are not part of the maintained
+summary set.
+
+\section{Source Literature Encoded by the Implementation}
+
+The H/He low-density chemistry follows the Tomida et al. Appendix-1
+partition-function EOS as used by the local Andalman-style workflow.  Dense
+low-temperature H/He fluid physics comes either from Saumon, Chabrier, and Van
+Horn 1995 or from the Chabrier et al. 2021 H/He tables.  The fully ionized
+fallback pair thermodynamics follow the ideal relativistic HELM/MESA
+electron-positron gas convention associated with Timmes and Swesty/Timmes and
+Arnett.  The optional Coulomb corner uses a Potekhin-Chabrier-style liquid
+free-energy fit for fully ionized ions.  The table metadata records the exact
+source URLs and scalar constants used for a generated table.
+
+\end{document}

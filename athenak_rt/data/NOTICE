@@ -1,0 +1,12 @@
+Opacity tables in this directory are MESA (Modules for Experiments in Stellar
+Astrophysics, Paxton et al. 2011) kap data files, X = 0.7, Z = 0.02, Grevesse &
+Sauval (1998) metal mixture:
+
+  gs98_z0.02_x0.7.data            OPAL Type 1 Rosseland mean opacities
+                                  (Iglesias & Rogers 1996), log T = 3.75 .. 8.7
+  lowT_fa05_gs98_z0.02_x0.7.data  low-temperature opacities of Ferguson,
+                                  Alexander et al. (2005), log T = 2.7 .. 4.5
+
+Both give log10 kappa [cm^2/g] on a (log T, log R) grid, R = rho / (T/1e6 K)^3.
+They are redistributed unchanged under the MESA/OPAL data terms; credit MESA,
+OPAL and Ferguson et al. (2005) when using results derived from them.

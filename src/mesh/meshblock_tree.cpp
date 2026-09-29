@@ -34,6 +34,10 @@ MeshBlockTree::MeshBlockTree(Mesh *pmesh) :
   lloc_.level = 0;
 }
 
+void MeshBlockTree::ActivateRoot() {
+  proot_ = this;
+}
+
 //----------------------------------------------------------------------------------------
 //! \fn MeshBlockTree::MeshBlockTree(int gid, int ox1, int ox2, int ox3)
 //! \brief constructor for a leaf
@@ -476,4 +480,11 @@ MeshBlockTree* MeshBlockTree::FindMeshBlock(LogicalLocation tloc) {
     return nullptr;
   }
   return pleaf_[n]->FindMeshBlock(tloc);
+}
+
+void MeshBlockTree::SetLeafGID(LogicalLocation tloc, int gid) {
+  MeshBlockTree *bt = FindMeshBlock(tloc);
+  if (bt != nullptr) {
+    bt->gid_ = gid;
+  }
 }

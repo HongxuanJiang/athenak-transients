@@ -1,0 +1,83 @@
+<job>
+basename = dyngr_floor_drift
+
+<mesh>
+nghost = 4
+nx1 = 64
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 1
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 64
+nx2 = 1
+nx3 = 1
+
+<coord>
+special_rel = true
+general_rel = false
+minkowski = true
+
+<adm>
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.4
+nlim = 1
+tlim = 1.0
+ndiag = 1
+
+<mhd>
+eos = ideal
+dyn_eos = ideal
+dyn_error = reset_floor
+reconstruct = plm
+rsolver = hlle
+gamma = 1.6666666666666667
+dfloor = 1e-10
+pfloor = 1e-18
+tfloor = 1e-8
+gamma_max = 20
+
+<problem>
+pgen_name = shock_tube
+shock_dir = 1
+xshock = 0.0
+dl = 5e-11
+pl = 5e-9
+ul = 0.99
+vl = 0.0
+wl = 0.0
+bxl = 1e-4
+byl = 0.0
+bzl = 0.0
+dr = 5e-11
+pr = 5e-9
+ur = 0.99
+vr = 0.0
+wr = 0.0
+bxr = 1e-4
+byr = 0.0
+bzr = 0.0
+
+<output1>
+file_type = bin
+variable = mhd_w
+variable_precision = float64
+dt = 1.0
+
+<output2>
+file_type = rst
+dcycle    = 1000000

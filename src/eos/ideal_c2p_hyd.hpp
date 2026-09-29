@@ -11,6 +11,59 @@
 //! with an ideal gas EOS. Versions for both non-relativistic and relativistic fluids are
 //! provided.
 
+#include "coordinates/cartesian_ks.hpp"
+
+//----------------------------------------------------------------------------------------
+//! \fn Real IdealHydroEintFloor()
+//! \brief Returns the larger of the pressure and entropy floors in internal-energy form.
+
+KOKKOS_INLINE_FUNCTION
+Real IdealHydroEintFloor(const EOS_Data &eos, const Real dens) {
+  const Real gm1 = eos.gamma - 1.0;
+  const Real eint_floor = eos.pfloor/gm1;
+  const Real entropy_floor = (eos.sfloor > 0.0) ?
+      (eos.sfloor*pow(dens, eos.gamma)/gm1) : 0.0;
+  return fmax(eint_floor, entropy_floor);
+}
+
+KOKKOS_INLINE_FUNCTION
+Real IdealHydroAtmosphereInternalEnergy(const EOS_Data &eos) {
+  const Real gm1 = eos.gamma - 1.0;
+  Real eint = IdealHydroEintFloor(eos, eos.dfloor);
+  if ((eos.tfloor > 0.0) && (gm1*eint/eos.dfloor < eos.tfloor)) {
+    eint = eos.dfloor*eos.tfloor/gm1;
+  }
+  const Real eceil = eos.HydroInternalEnergyDensityCeiling(eos.dfloor);
+  if (eint > eceil) {
+    eint = eceil;
+  }
+  return eint;
+}
+
+KOKKOS_INLINE_FUNCTION
+bool NeedsIdealHydroAtmosphereReset(const EOS_Data &eos, const HydCons1D &u) {
+  return (u.d < eos.dfloor) ||
+         ((u.d == eos.dfloor) &&
+          ((u.mx != 0.0) || (u.my != 0.0) || (u.mz != 0.0)));
+}
+
+KOKKOS_INLINE_FUNCTION
+void ResetIdealHydroAtmosphereState(const EOS_Data &eos, HydCons1D &u, HydPrim1D &w,
+                                    bool &dfloor_used) {
+  const Real atmosphere_eint = IdealHydroAtmosphereInternalEnergy(eos);
+  u.d = eos.dfloor;
+  u.mx = 0.0;
+  u.my = 0.0;
+  u.mz = 0.0;
+  u.e = atmosphere_eint;
+  w.d = u.d;
+  w.vx = 0.0;
+  w.vy = 0.0;
+  w.vz = 0.0;
+  w.e = atmosphere_eint;
+  dfloor_used = true;
+}
+
 //----------------------------------------------------------------------------------------
 //! \fn void SingleC2P_IdealHyd()
 //! \brief Converts single state of conserved variables into primitive variables for
@@ -21,17 +74,14 @@
 KOKKOS_INLINE_FUNCTION
 void SingleC2P_IdealHyd(HydCons1D &u, const EOS_Data &eos,
                         HydPrim1D &w,
-                        bool &dfloor_used, bool &efloor_used, bool &tfloor_used) {
-  const Real &dfloor_ = eos.dfloor;
-  Real efloor = eos.pfloor/(eos.gamma - 1.0);
+                        bool &dfloor_used, bool &efloor_used, bool &tfloor_used,
+                        bool &vceil_used) {
   Real tfloor = eos.tfloor;
-  Real sfloor = eos.sfloor;
   Real gm1 = eos.gamma - 1.0;
 
-  // apply density floor, without changing momentum or energy
-  if (u.d < dfloor_) {
-    u.d = dfloor_;
-    dfloor_used = true;
+  if (NeedsIdealHydroAtmosphereReset(eos, u)) {
+    ResetIdealHydroAtmosphereState(eos, u, w, dfloor_used);
+    return;
   }
   w.d = u.d;
 
@@ -44,6 +94,7 @@ void SingleC2P_IdealHyd(HydCons1D &u, const EOS_Data &eos,
   // set internal energy, apply floor, correct total energy (if needed)
   Real e_k = 0.5*di*(SQR(u.mx) + SQR(u.my) + SQR(u.mz));
   w.e = (u.e - e_k);
+  Real efloor = IdealHydroEintFloor(eos, w.d);
   if (w.e < efloor) {
     w.e = efloor;
     u.e = efloor + e_k;
@@ -55,13 +106,31 @@ void SingleC2P_IdealHyd(HydCons1D &u, const EOS_Data &eos,
     u.e = w.e + e_k;
     tfloor_used = true;
   }
-  // apply entropy floor
-  Real spe_over_eps = gm1/pow(w.d, gm1);
-  Real spe = spe_over_eps*w.e*di;
-  if (spe <= sfloor) {
-    w.e = w.d*sfloor/spe_over_eps;
+  const Real eceil = eos.HydroInternalEnergyDensityCeiling(w.d);
+  if (w.e > eceil) {
+    w.e = eceil;
+    u.e = w.e + e_k;
     efloor_used = true;
   }
+
+  // Apply optional velocity ceiling on |v|.
+  Real v2 = SQR(w.vx) + SQR(w.vy) + SQR(w.vz);
+  Real vmag = sqrt(v2);
+  if ((eos.vceil > 0.0) && (vmag > eos.vceil)) {
+    Real fac = eos.vceil/vmag;
+    w.vx *= fac;
+    w.vy *= fac;
+    w.vz *= fac;
+    vmag = eos.vceil;
+    v2 = vmag*vmag;
+    vceil_used = true;
+  }
+
+  // Keep conserved variables consistent with any floor-limited primitive state.
+  u.mx = w.d*w.vx;
+  u.my = w.d*w.vy;
+  u.mz = w.d*w.vz;
+  u.e = w.e + 0.5*w.d*v2;
   return;
 }
 
@@ -83,18 +152,44 @@ void SingleP2C_IdealHyd(const HydPrim1D &w, HydCons1D &u) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn Real IdealHydroEntropyFloorDensityThreshold()
+//! \brief Returns the density above which the entropy floor exceeds the pressure floor,
+//! i.e. the density where sfloor*d^gamma == pfloor.  Computed once per cell so that the
+//! root-find inner loop can branch on it instead of evaluating a double precision pow()
+//! on every iteration.  The threshold is nudged down by a relative 1.0e-12 so that
+//! round-off in this expression can only take the fmax() branch early (where fmax()
+//! returns the same value the original expression did), never late.
+
+KOKKOS_INLINE_FUNCTION
+Real IdealHydroEntropyFloorDensityThreshold(const EOS_Data &eos) {
+  if (!(eos.sfloor > 0.0)) {
+    return static_cast<Real>(1.0e300);
+  }
+  return pow(eos.pfloor/eos.sfloor, 1.0/eos.gamma)*(1.0 - 1.0e-12);
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn Real EquationC22()
 //! \brief Inline function to compute function f(z) defined in eq. C22 of Galeazzi et al.
 //! used to convert conserved to primitive variables for relativistic hydrodynamics
 //! The ConsToPrim algorithm finds the root of this function f(z)=0
+//! `sfloor_dthresh` is the entropy-floor density threshold returned by
+//! IdealHydroEntropyFloorDensityThreshold(), computed once per cell by the caller.
 
 KOKKOS_INLINE_FUNCTION
-Real EquationC22(Real z, Real &u_d, Real q, Real r, EOS_Data eos) {
+Real EquationC22(const Real z, const Real u_d, const Real q, const Real r,
+                 const EOS_Data &eos, const Real sfloor_dthresh) {
   Real const gm1 = eos.gamma - 1.0;
   Real const w = sqrt(1.0 + z*z);         // (C15)
   Real const wd = u_d/w;                  // (C15)
   Real eps = w*q - z*r + (z*z)/(1.0 + w); // (C16)
-  Real epsmin = fmax(eos.pfloor/(wd*gm1), eos.sfloor*pow(wd, gm1)/gm1);
+  // The entropy floor can only exceed the pressure floor above wd=(pfloor/sfloor)^(1/g);
+  // below that threshold fmax() returns the pressure term anyway, so the returned value
+  // is unchanged while a double precision pow() leaves every root-find iteration.
+  Real epsmin = eos.pfloor/(wd*gm1);
+  if (wd > sfloor_dthresh) {
+    epsmin = fmax(epsmin, eos.sfloor*pow(wd, gm1)/gm1);
+  }
   eps = fmax(eps, epsmin);                // (C18)
   Real const h = 1.0 + eos.gamma*eps;     // (C1) & (C21)
   return (z - r/h); // (C22)
@@ -115,6 +210,9 @@ void SingleC2P_IdealSRHyd(HydCons1D &u, const EOS_Data &eos, const Real s2, HydP
   const Real v_max = 0.9999999999995;  // NOTE(@pdmullen): SQR(v_max) = 1.0 - tol;
   const Real kmax = 2.0*v_max/(1.0 + v_max*v_max);
   const Real gm1 = eos.gamma - 1.0;
+  // Density above which the entropy floor can exceed the pressure floor.  Evaluated once
+  // here so that EquationC22() does not evaluate a pow() on every iteration.
+  const Real sfloor_dthresh = IdealHydroEntropyFloorDensityThreshold(eos);
 
   // apply density floor, without changing momentum or energy
   if (u.d < eos.dfloor) {
@@ -142,8 +240,8 @@ void SingleC2P_IdealSRHyd(HydCons1D &u, const EOS_Data &eos, const Real s2, HydP
   Real zp = kk/sqrt(1.0 - kk*kk);
 
   // Evaluate master function (eq C22) at bracket values
-  Real fm = EquationC22(zm, u.d, q, r, eos);
-  Real fp = EquationC22(zp, u.d, q, r, eos);
+  Real fm = EquationC22(zm, u.d, q, r, eos, sfloor_dthresh);
+  Real fp = EquationC22(zp, u.d, q, r, eos, sfloor_dthresh);
 
   // For simplicity on the GPU, find roots using the false position method
   int iterations = max_iterations;
@@ -155,7 +253,7 @@ void SingleC2P_IdealSRHyd(HydCons1D &u, const EOS_Data &eos, const Real s2, HydP
 
   for (iter_used=0; iter_used < iterations; ++iter_used) {
     z =  (zm*fp - zp*fm)/(fp-fm);  // linear interpolation to point f(z)=0
-    Real f = EquationC22(z, u.d, q, r, eos);
+    Real f = EquationC22(z, u.d, q, r, eos, sfloor_dthresh);
 
     // Quit if convergence reached
     // NOTE: both z and f are of order unity
@@ -202,7 +300,12 @@ void SingleC2P_IdealSRHyd(HydCons1D &u, const EOS_Data &eos, const Real s2, HydP
 
   // compute specific internal energy density then apply floor
   Real eps = lor*q - z*r + (z*z)/(1.0 + lor);   // (C16)
-  Real epsmin = fmax(eos.pfloor/(dens*gm1), eos.sfloor*pow(dens, gm1)/gm1);
+  // Same guarded entropy floor as in EquationC22(): below the threshold density the
+  // pressure term is the larger of the two, so the value is unchanged.
+  Real epsmin = eos.pfloor/(dens*gm1);
+  if (dens > sfloor_dthresh) {
+    epsmin = fmax(epsmin, eos.sfloor*pow(dens, gm1)/gm1);
+  }
   if (eps <= epsmin) {
     eps = epsmin;
     efloor_used = true;
@@ -213,6 +316,133 @@ void SingleC2P_IdealSRHyd(HydCons1D &u, const EOS_Data &eos, const Real s2, HydP
   Real const conv = 1.0/h;             // (C26)
 
   // set primitive variables
+  w.d  = dens;
+  w.vx = conv*(u.mx/u.d);  // (C26)
+  w.vy = conv*(u.my/u.d);  // (C26)
+  w.vz = conv*(u.mz/u.d);  // (C26)
+  w.e  = dens*eps;
+
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn Real EquationC22Adiabat()
+//! \brief Eq. C22 with the specific internal energy taken from the advected adiabat
+//! kappa = p/rho^gamma instead of from the conserved energy.  eps is a power of the
+//! density, so the conserved energy q never enters: this branch discards the energy
+//! equation, which is the point of the auxiliary channel.
+
+KOKKOS_INLINE_FUNCTION
+Real EquationC22Adiabat(const Real z, const Real u_d, const Real r, const Real kappa,
+                        const Real epsmax, const EOS_Data &eos,
+                        const Real sfloor_dthresh) {
+  Real const gm1 = eos.gamma - 1.0;
+  Real const w = sqrt(1.0 + z*z);         // (C15)
+  Real const wd = u_d/w;                  // (C15)
+  Real eps = kappa*pow(wd, gm1)/gm1;
+  Real epsmin = eos.pfloor/(wd*gm1);
+  if (wd > sfloor_dthresh) {
+    epsmin = fmax(epsmin, eos.sfloor*pow(wd, gm1)/gm1);
+  }
+  eps = fmax(eps, epsmin);
+  // An adiabat implying more internal energy than the cell owns is not a fluid state.
+  eps = fmin(eps, epsmax);
+  Real const h = 1.0 + eos.gamma*eps;     // (C21)
+  return (z - r/h);                       // (C22)
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void SingleC2P_IdealSRHyd_Adiabat()
+//! \brief The auxiliary-channel inversion: same conserved momentum and density, pressure
+//! from the advected adiabat.  z = W v lies in [0, r] because h >= 1, and on that
+//! bracket f(0) = -r/h(0) <= 0 <= r(1 - 1/h(r)) = f(r), so it always holds.  The
+//! velocity and the floors follow the same expressions as the energy solve, so a cell
+//! that switches channels does not also change floor behaviour.
+
+KOKKOS_INLINE_FUNCTION
+void SingleC2P_IdealSRHyd_Adiabat(HydCons1D &u, const EOS_Data &eos, const Real s2,
+                                  const Real kappa, HydPrim1D &w, bool &dfloor_used,
+                                  bool &efloor_used, bool &c2p_failure,
+                                  int &iter_used) {
+  const int max_iterations = 25;
+  const Real tol = 1.0e-12;
+  const Real gm1 = eos.gamma - 1.0;
+  const Real sfloor_dthresh = IdealHydroEntropyFloorDensityThreshold(eos);
+
+  if (!((kappa > 0.0) && isfinite(kappa))) {
+    c2p_failure = true;
+    return;
+  }
+
+  if (u.d < eos.dfloor) {
+    u.d = eos.dfloor;
+    dfloor_used = true;
+  }
+
+  // The specific energy the conserved state can pay for: u.e is tau, so tau/D bounds
+  // the specific internal energy from above however large the advected adiabat has
+  // become.  A non-positive tau, the state the energy channel has just failed on and
+  // the one this solve exists to rescue, has no budget to apply and gets no cap.
+  const Real epsmax = (u.e > 0.0 && isfinite(u.e/u.d)) ? u.e/u.d
+                                                       : static_cast<Real>(1.0e300);
+  Real r = sqrt(s2)/u.d;
+
+  Real zm = 0.0;
+  Real zp = r;
+  Real fm = EquationC22Adiabat(zm, u.d, r, kappa, epsmax, eos, sfloor_dthresh);
+  Real fp = EquationC22Adiabat(zp, u.d, r, kappa, epsmax, eos, sfloor_dthresh);
+
+  int iterations = max_iterations;
+  if ((fabs(zm-zp) < tol) || ((fabs(fm) + fabs(fp)) < 2.0*tol)) {
+    iterations = -1;
+  }
+  Real z = 0.5*(zm + zp);
+
+  for (iter_used=0; iter_used < iterations; ++iter_used) {
+    z = (zm*fp - zp*fm)/(fp-fm);
+    Real f = EquationC22Adiabat(z, u.d, r, kappa, epsmax, eos, sfloor_dthresh);
+    if ((fabs(zm-zp) < tol) || (fabs(f) < tol)) {
+      break;
+    }
+    if (f*fp < 0.0) {
+      zm = zp;
+      fm = fp;
+      zp = z;
+      fp = f;
+    } else {
+      fm = 0.5*fm;
+      zp = z;
+      fp = f;
+    }
+  }
+
+  if (iter_used == max_iterations) {
+    c2p_failure = true;
+    return;
+  }
+
+  Real const lor = sqrt(1.0 + z*z);  // (C15)
+
+  Real dens = u.d/lor;
+  if (dens < eos.dfloor) {
+    dens = eos.dfloor;
+    dfloor_used = true;
+  }
+
+  Real eps = kappa*pow(dens, gm1)/gm1;
+  Real epsmin = eos.pfloor/(dens*gm1);
+  if (dens > sfloor_dthresh) {
+    epsmin = fmax(epsmin, eos.sfloor*pow(dens, gm1)/gm1);
+  }
+  if (eps <= epsmin) {
+    eps = epsmin;
+    efloor_used = true;
+  }
+  eps = fmin(eps, epsmax);
+
+  Real const h = 1.0 + eos.gamma*eps;  // (C21)
+  Real const conv = 1.0/h;             // (C26)
+
   w.d  = dens;
   w.vx = conv*(u.mx/u.d);  // (C26)
   w.vy = conv*(u.my/u.d);  // (C26)
@@ -324,6 +554,67 @@ void SingleP2C_IdealGRHyd(const Real glower[][4], const Real gupper[][4],
   Real wgas_u0 = (w.d + gam * w.e) * u0;
 
   // set conserved quantities
+  u.d  = w.d * u0;
+  u.e  = wgas_u0 * u_0 + (gam-1.0)*w.e + u.d;  // evolve T^t_t + D
+  u.mx = wgas_u0 * u_1;
+  u.my = wgas_u0 * u_2;
+  u.mz = wgas_u0 * u_3;
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void TransformToSRHyd()  [Kerr-Schild null-form overload]
+//! \brief GR->SR conserved transform from the four-number CKS null form.  Raising the
+//! momentum index uses gamma^{ij} = delta^{ij} - [f/(1+f)] l_i l_j, algebraically
+//! identical to g^{ij} - g^{0i}g^{0j}/g^{00} but without the two O(f) terms that route
+//! forms and then cancels near the horizon.
+
+KOKKOS_INLINE_FUNCTION
+void TransformToSRHyd(const HydCons1D &u, const KSNullForm &nf,
+                      Real &s2, HydCons1D &u_sr) {
+  const Real inv_alpha_sq = KSInvLapseSq(nf);   // = -g^{00} = 1 + f
+  const Real alpha = KSAlpha(nf);
+  u_sr.d = u.d*alpha;
+
+  const Real ldm = nf.l1*u.mx + nf.l2*u.my + nf.l3*u.mz;
+  u_sr.e = -inv_alpha_sq*(u.e - u.d) + nf.f*ldm;
+  u_sr.e *= (1.0/inv_alpha_sq);   // multiply by alpha^2 (only true if sqrt(-g)=1)
+  u_sr.e -= u_sr.d;
+
+  const Real m1l = u.mx*alpha;
+  const Real m2l = u.my*alpha;
+  const Real m3l = u.mz*alpha;
+
+  const Real c = KSGammaUpperFactor(nf);
+  const Real cldm = c*(nf.l1*m1l + nf.l2*m2l + nf.l3*m3l);
+  u_sr.mx = m1l - nf.l1*cldm;    // (C26)
+  u_sr.my = m2l - nf.l2*cldm;    // (C26)
+  u_sr.mz = m3l - nf.l3*cldm;    // (C26)
+
+  s2 = ((m1l*u_sr.mx) + (m2l*u_sr.my) + (m3l*u_sr.mz));   // (C2)
+  return;
+}
+
+//--------------------------------------------------------------------------------------
+//! \fn void SingleP2C_IdealGRHyd()  [Kerr-Schild null-form overload]
+
+KOKKOS_INLINE_FUNCTION
+void SingleP2C_IdealGRHyd(const KSNullForm &nf, const HydPrim1D &w, const Real &gam,
+                          HydCons1D &u) {
+  Real q = KSSpatialNormSq(nf, 1, 2, 3, w.vx, w.vy, w.vz);
+  Real alpha = KSAlpha(nf);
+  Real gamma = sqrt(1.0 + q);
+  Real u0 = gamma / alpha;
+  Real ag_f = (alpha*gamma)*nf.f;    // alpha*gamma*g^{0i} = ag_f * l_i
+  Real u1 = w.vx - ag_f*nf.l1;
+  Real u2 = w.vy - ag_f*nf.l2;
+  Real u3 = w.vz - ag_f*nf.l3;
+
+  // lower vector indices: A_mu = eta_{mu nu} A^nu + f l_mu (l.A)
+  Real u_0, u_1, u_2, u_3;
+  KSLowerVec(nf, 1, 2, 3, u0, u1, u2, u3, u_0, u_1, u_2, u_3);
+  Real wgas_u0 = (w.d + gam * w.e) * u0;
+
   u.d  = w.d * u0;
   u.e  = wgas_u0 * u_0 + (gam-1.0)*w.e + u.d;  // evolve T^t_t + D
   u.mx = wgas_u0 * u_1;

@@ -38,9 +38,12 @@ void SingleStateLLF_Hyd(const HydPrim1D &wl, const HydPrim1D &wr, const EOS_Data
   fsum.mz = qa*wl.vz + qb*wr.vz;
 
   Real el,er,pl,pr;
-  if (eos.is_ideal) {
-    pl = eos.IdealGasPressure(wl.e);
-    pr = eos.IdealGasPressure(wr.e);
+  EOS_Data::ThermoState wl_thermo, wr_thermo;
+  if (eos.use_e) {
+    wl_thermo = eos.EvalThermoStateFromRhoEint(wl.d, wl.e);
+    wr_thermo = eos.EvalThermoStateFromRhoEint(wr.d, wr.e);
+    pl = wl_thermo.pressure;
+    pr = wr_thermo.pressure;
     el = wl.e + 0.5*wl.d*(SQR(wl.vx) + SQR(wl.vy) + SQR(wl.vz));
     er = wr.e + 0.5*wr.d*(SQR(wr.vx) + SQR(wr.vy) + SQR(wr.vz));
     fsum.mx += (pl + pr);
@@ -50,9 +53,9 @@ void SingleStateLLF_Hyd(const HydPrim1D &wl, const HydPrim1D &wr, const EOS_Data
   }
 
   // Compute max wave speed in L,R states (see Toro eq. 10.43)
-  if (eos.is_ideal) {
-    qa = eos.IdealHydroSoundSpeed(wl.d, pl);
-    qb = eos.IdealHydroSoundSpeed(wr.d, pr);
+  if (eos.use_e) {
+    qa = sqrt(fmax(wl_thermo.cs2, 0.0));
+    qb = sqrt(fmax(wr_thermo.cs2, 0.0));
   } else {
     qa = eos.iso_cs;
     qb = eos.iso_cs;
@@ -65,14 +68,14 @@ void SingleStateLLF_Hyd(const HydPrim1D &wl, const HydPrim1D &wr, const EOS_Data
   du.mx = a*(wr.d*wr.vx - wl.d*wl.vx);
   du.my = a*(wr.d*wr.vy - wl.d*wl.vy);
   du.mz = a*(wr.d*wr.vz - wl.d*wl.vz);
-  if (eos.is_ideal) du.e = a*(er - el);
+  if (eos.use_e) du.e = a*(er - el);
 
   // Compute the LLF flux at interface (see Toro eq. 10.42).
   flux.d  = 0.5*(fsum.d  - du.d );
   flux.mx = 0.5*(fsum.mx - du.mx);
   flux.my = 0.5*(fsum.my - du.my);
   flux.mz = 0.5*(fsum.mz - du.mz);
-  if (eos.is_ideal) {flux.e = 0.5*(fsum.e - du.e);}
+  if (eos.use_e) {flux.e = 0.5*(fsum.e - du.e);}
 
   return;
 }

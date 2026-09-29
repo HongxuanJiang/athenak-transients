@@ -31,8 +31,8 @@ void ExtractPrimitives(Real prim_pt[NPRIM], const DvceArray5D<Real>& prim,
     prim_pt[PYF + s] = prim(m, nhyd + s, k, j, i);
   }
   prim_pt[PPR] = prim(m, IPR, k, j, i);
-  prim_pt[PTM] = eos.ps.GetEOS().GetTemperatureFromP(prim_pt[PRH], prim_pt[PPR],
-                                                     &prim_pt[PYF]);
+  prim_pt[PTM] = eos.ps.GetEOS().GetTemperatureFromP(
+      prim_pt[PRH], prim_pt[PPR], &prim_pt[PYF]);
 }
 
 KOKKOS_INLINE_FUNCTION
@@ -44,7 +44,7 @@ void ExtractBField(Real bu_pt[NMAG], const DvceArray5D<Real> bcc,
 }
 
 KOKKOS_INLINE_FUNCTION
-void InsertFluxes(const Real flux_pt[NCONS], const DvceArray5D<Real>& flx,
+void InsertFluxes(const Real flux_pt[NCONS], const BandView5D<Real>& flx,
                   const int m, const int k, const int j, const int i) {
   flx(m, IDN, k, j, i) = flux_pt[CDN];
   flx(m, IM1, k, j, i) = flux_pt[CSX];

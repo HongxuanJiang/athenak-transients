@@ -37,6 +37,10 @@ struct InputLine {
   std::string param_name;
   std::string param_value;   // value of the parameter is stored as a string!
   std::string param_comment;
+  // true when this line's current value was read out of a restart file's parameter dump
+  // and nothing has overwritten it since.  A key that is no longer read is history in a
+  // checkpoint and an error in a deck; RetireDeadParameter tells the two apart.
+  bool from_restart_header = false;
 };
 
 //----------------------------------------------------------------------------------------
@@ -90,12 +94,18 @@ class ParameterInput {
   bool GetBoolean(std::string block, std::string name);
   bool GetOrAddBoolean(std::string block, std::string name, bool value);
   bool SetBoolean(std::string block, std::string name, bool value);
+  bool IsLATEnabled();
+  bool RetireDeadParameter(const std::string &block, const std::string &name);
+  bool IsFromRestartHeader(const std::string &block, const std::string &name);
   std::string GetString(std::string block, std::string name);
   std::string GetOrAddString(std::string block, std::string name, std::string value);
   std::string SetString(std::string block, std::string name, std::string value);
 
  private:
   std::string last_filename;  // last input file opened, to prevent duplicate reads
+  // set only while LoadFromFile is parsing a restart file's parameter dump, so that every
+  // line it adds is marked as coming from a checkpoint rather than from a deck
+  bool loading_restart_header_ = false;
 
   InputBlock* FindOrAddBlock(std::string name);
   InputBlock* GetPtrToBlock(std::string name);

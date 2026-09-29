@@ -152,8 +152,13 @@ def test_run(iv, rv, soe):
             left_wave="0",
             right_wave="4" if soe == "hydro" else "6",
         )
-        # test that errors in L/R-going waves are the same
-        if l1_rms_l != l1_rms_r and rv == "plm":
+        # test that errors in L/R-going waves are the same.  Hydro is mirror-exact.  The
+        # MHD initial field is differenced from a vector potential with a large linear
+        # term (pgen/tests/linear_wave.cpp), which loses ~2 digits differently at
+        # mirrored positions, so the two MHD waves start ~1e-14 apart and their printed
+        # RMS errors may differ in the last digit (hlld+rk3: 2.127298e-08 vs -297e-08).
+        tolerance = 0.0 if soe == "hydro" else 1.0e-6*abs(l1_rms_l)
+        if abs(l1_rms_l - l1_rms_r) > tolerance and rv == "plm":
             pytest.fail(
                 f"Errors in L/R-going waves not equal for {soe}+{iv}+{rv}+{fv}, "
                 f"L: {l1_rms_l:g} R: {l1_rms_r:g}"

@@ -18,7 +18,7 @@
 
 namespace Primitive {
 
-class IdealGas : public EOSPolicyInterface {
+class IdealGas : public EOSPolicyInterface, public SupportsAdiabat {
  protected:
   /// Adiabatic index
   Real gamma;
@@ -76,6 +76,13 @@ class IdealGas : public EOSPolicyInterface {
   /// Get the minimum enthalpy per baryon according to the ideal gas law.
   KOKKOS_INLINE_FUNCTION Real MinimumEnthalpy() const {
     return mb;
+  }
+
+  /// The exponent of the adiabatic invariant kappa = p/rho^Gamma.  For a gamma-law gas
+  /// this is the adiabatic index itself, and kappa is then an exact function of the
+  /// entropy, so advecting it is advecting the entropy.
+  KOKKOS_INLINE_FUNCTION Real AdiabatGamma() const {
+    return gamma;
   }
 
   /// Calculate the sound speed for an ideal gas.

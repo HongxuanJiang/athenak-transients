@@ -38,12 +38,6 @@ SphericalSurfaceOutput::SphericalSurfaceOutput(ParameterInput *pin, Mesh *pm,
 SphericalSurfaceOutput::~SphericalSurfaceOutput() { delete psurf; }
 
 void SphericalSurfaceOutput::LoadOutputData(Mesh *pm) {
-  // If AMR is enabled we need to reset the CartesianGrid
-  if (pm->adaptive) {
-    psurf->SetInterpolationIndices();
-    psurf->SetInterpolationWeights();
-  }
-
   int nout_vars = outvars.size();
   Kokkos::realloc(outarray, nout_vars, 1, 1, 1, psurf->nangles);
 
@@ -155,11 +149,6 @@ void SphericalSurfaceOutput::WriteOutputFile(Mesh *pm, ParameterInput *pin) {
 
   // increment counters
   out_params.file_number++;
-  if (out_params.last_time < 0.0) {
-    out_params.last_time = pm->time;
-  } else {
-    out_params.last_time += out_params.dt;
-  }
   pin->SetInteger(out_params.block_name, "file_number", out_params.file_number);
-  pin->SetReal(out_params.block_name, "last_time", out_params.last_time);
+  AdvanceOutputTime(pm, pin);
 }

@@ -9,6 +9,7 @@
 //  \brief contains Athena++ general purpose types, structures, enums, etc.
 
 #include <string>
+#include <cstdint>
 
 #include <Kokkos_Core.hpp>
 #include <Kokkos_DualView.hpp>
@@ -34,6 +35,8 @@ using Real = double;
 
 #endif // SINGLE_PRECISION_ENABLED
 
+class Coordinates;
+
 //----------------------------------------------------------------------------------------
 // general purpose macros (never modified)
 
@@ -50,6 +53,10 @@ using Real = double;
 #define ONE_3RD  0.3333333333333333
 #define TWO_3RDS 0.6666666666666667
 #define FOUR_3RDS 1.333333333333333
+// include self gravity? default=0 (false)
+#define SELF_GRAVITY_ENABLED 0
+
+
 
 // data types only used in physics modules (defined here to avoid recursive dependencies)
 
@@ -71,8 +78,10 @@ enum ReconstructionMethod {dc, plm, ppm4, ppmx, wenoz};
 enum TimeEvolution {tstatic, kinematic, dynamic};
 
 // constants that enumerate Physics Modules implemented in code
+// Keep every upstream value stable: opt-in diagnostic modules are append-only.
 enum PhysicsModule {HydroDynamics, MagnetoHydroDynamics,
-                    SpaceTimeDynamics, UserDefined}; //SpaceTimeDynamics = Z4c
+                    SpaceTimeDynamics, UserDefined};
+                    // SpaceTimeDynamics = Z4c
 
 // structs to store primitive/conserved variables in one-dimension
 // (density, velocity/momentum, internal/total energy, [transverse magnetic field])
@@ -89,10 +98,15 @@ struct MHDCons1D {
   Real d, mx, my, mz, e, bx, by, bz;
 };
 
+inline std::int64_t rotl(std::int64_t i, int s) {
+  return (i << s) | (i >> (64 - s));
+}
+
 //----------------------------------------------------------------------------------------
 // define default Kokkos execution and memory spaces
 
 using DevExeSpace = Kokkos::DefaultExecutionSpace;
+using HostExeSpace = Kokkos::DefaultHostExecutionSpace;
 using DevMemSpace = Kokkos::DefaultExecutionSpace::memory_space;
 using HostMemSpace = Kokkos::HostSpace;
 using ScratchMemSpace = DevExeSpace::scratch_memory_space;
@@ -194,6 +208,48 @@ struct HostFaceFld4D {
 };
 
 //----------------------------------------------------------------------------------------
+// Offset accessors for work arrays stored on a sub-block index band.  A register that
+// is only ever filled and read on a known band of cells or faces (a flux register, a
+// CornerE scratch field) need not carry the full ghost-extended block: the module
+// allocates the band, records its origin, and its kernels keep indexing with the global
+// (m[,n],k,j,i) they always used -- the accessor resolves that to
+// data(m[,n],k-ko,j-jo,i-io).  A pure storage-layout device: every access lands on the
+// element the ghost-extended array held at the same global index.
+
+template <typename T>
+struct BandView5D {
+  DvceArray5D<T> data{};
+  int ko{};
+  int jo{};
+  int io{};
+
+  KOKKOS_INLINE_FUNCTION
+  T &operator()(const int m, const int n, const int k, const int j, const int i) const {
+    return data(m, n, k - ko, j - jo, i - io);
+  }
+};
+
+template <typename T>
+struct BandView4D {
+  DvceArray4D<T> data{};
+  int ko{};
+  int jo{};
+  int io{};
+
+  KOKKOS_INLINE_FUNCTION
+  T &operator()(const int m, const int k, const int j, const int i) const {
+    return data(m, k - ko, j - jo, i - io);
+  }
+};
+
+// The three face registers of a DvceFaceFld5D on one shared band origin (the
+// flux-correction exchange likewise takes a single FaceFldOrigin for all three faces).
+template <typename T>
+struct BandFaceFld5D {
+  BandView5D<T> x1f, x2f, x3f;
+};
+
+//----------------------------------------------------------------------------------------
 // struct for storing edge-centered (line-averaged) variables, e.g. EMF
 /* [using old C-style comments to prevent multi-line-comment warning with -Wall]
 //             _____________
@@ -219,6 +275,17 @@ struct DvceEdgeFld4D {
 };
 
 //----------------------------------------------------------------------------------------
+// Asynchronous launch hint: with HintLightWeight Kokkos passes functors < 4 KB as kernel
+// arguments and larger ones through a stream-ordered global-memory copy, instead of the
+// constant-memory path that blocks the host (cudaEventSynchronize) until the previous
+// kernel has finished.  Launch mechanism only; the kernel code and its results are
+// unchanged.  Use on every policy that is launched on the per-step hot path.
+template <typename Policy>
+inline auto athenak_lw(Policy &&policy) {
+  return Kokkos::Experimental::require(
+      std::forward<Policy>(policy), Kokkos::Experimental::WorkItemProperty::HintLightWeight);
+}
+
 // wrappers for Kokkos::parallel_for
 // These wrappers implement a variety of parallel execution strategies, including
 // 1D-range, and thread teams for use with inner vector threads. Experiments in K-Athena
@@ -226,12 +293,14 @@ struct DvceEdgeFld4D {
 // MD-range policy, so the latter is not used.
 //------------------------------
 // 1D loop using Kokkos 1D Range
-template <typename Function>
-inline void par_for(const std::string &name, DevExeSpace exec_space,
+template <typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
                     const int &il, const int &iu, const Function &function) {
   // compute total number of elements and call Kokkos::parallel_for()
   const int ni = iu - il + 1;
-  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, ni),
+  Kokkos::parallel_for(name,
+      Kokkos::Experimental::require(Kokkos::RangePolicy<ExeSpace>(exec_space, 0, ni),
+          Kokkos::Experimental::WorkItemProperty::HintLightWeight),
   KOKKOS_LAMBDA(const int &idx) {
     // compute i indices of thread and call function
     int i = (idx) + il;
@@ -241,15 +310,17 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
 
 //------------------------------
 // 2D loop using Kokkos 1D Range
-template <typename Function>
-inline void par_for(const std::string &name, DevExeSpace exec_space,
+template <typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
                     const int &jl, const int &ju,
                     const int &il, const int &iu, const Function &function) {
   // compute total number of elements and call Kokkos::parallel_for()
   const int nj = ju - jl + 1;
   const int ni = iu - il + 1;
   const int nji  = nj * ni;
-  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nji),
+  Kokkos::parallel_for(name,
+      Kokkos::Experimental::require(Kokkos::RangePolicy<ExeSpace>(exec_space, 0, nji),
+          Kokkos::Experimental::WorkItemProperty::HintLightWeight),
   KOKKOS_LAMBDA(const int &idx) {
     // compute j,i indices of thread and call function
     int j = (idx)/ni;
@@ -261,8 +332,8 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
 
 //------------------------------
 // 3D loop using Kokkos 1D Range
-template <typename Function>
-inline void par_for(const std::string &name, DevExeSpace exec_space,
+template <typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
                     const int &kl, const int &ku, const int &jl, const int &ju,
                     const int &il, const int &iu, const Function &function) {
   // compute total number of elements and call Kokkos::parallel_for()
@@ -271,7 +342,9 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
   const int ni = iu - il + 1;
   const int nkji = nk * nj * ni;
   const int nji  = nj * ni;
-  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nkji),
+  Kokkos::parallel_for(name,
+      Kokkos::Experimental::require(Kokkos::RangePolicy<ExeSpace>(exec_space, 0, nkji),
+          Kokkos::Experimental::WorkItemProperty::HintLightWeight),
   KOKKOS_LAMBDA(const int &idx) {
     // compute k,j,i indices of thread and call function
     int k = (idx)/nji;
@@ -285,8 +358,8 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
 
 //------------------------------
 // 4D loop using Kokkos 1D Range
-template <typename Function>
-inline void par_for(const std::string &name, DevExeSpace exec_space,
+template <typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
                     const int &nl, const int &nu, const int &kl, const int &ku,
                     const int &jl, const int &ju, const int &il, const int &iu,
                     const Function &function) {
@@ -298,7 +371,55 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
   const int nnkji = nn * nk * nj * ni;
   const int nkji  = nk * nj * ni;
   const int nji   = nj * ni;
-  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nnkji),
+  Kokkos::parallel_for(name,
+      Kokkos::Experimental::require(Kokkos::RangePolicy<ExeSpace>(exec_space, 0, nnkji),
+          Kokkos::Experimental::WorkItemProperty::HintLightWeight),
+  KOKKOS_LAMBDA(const int &idx) {
+    // compute n,k,j,i indices of thread and call function
+    int n = (idx)/nkji;
+    int k = (idx - n*nkji)/nji;
+    int j = (idx - n*nkji - k*nji)/ni;
+    int i = (idx - n*nkji - k*nji - j*ni) + il;
+    n += nl;
+    k += kl;
+    j += jl;
+    function(n, k, j, i);
+  });
+}
+
+//------------------------------
+// 4D loop using Kokkos 1D Range with an explicit ptxas occupancy cap.
+//
+// `par_for<MaxThreads, MinBlocksPerSM>(name, ...)` forwards Kokkos::LaunchBounds to the
+// CUDA launch so ptxas is told the occupancy it must reach.  Without it ptxas maximizes
+// registers per thread, and the heavy GRMHD flux/FOFC kernels land at the 255-register
+// ceiling, i.e. 12.5% of 64 warps/SM on Volta.  Capping trades a small local-memory spill
+// frame for roughly double the occupancy.  Register allocation does not change floating
+// point semantics, so a capped kernel is bit-identical to the uncapped one.
+//
+// The spill frame is reserved per resident thread, so a cap that spills heavily costs
+// device memory (hundreds of MB).  Check `nvidia-smi --query-gpu=memory.free` before
+// raising MinBlocksPerSM on a memory-tight run.
+//
+// Template arguments cannot be deduced from the call, so an ordinary `par_for(...)` with
+// no explicit template arguments keeps resolving to the uncapped overload above.
+template <int MaxThreads, int MinBlocksPerSM, typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
+                    const int &nl, const int &nu, const int &kl, const int &ku,
+                    const int &jl, const int &ju, const int &il, const int &iu,
+                    const Function &function) {
+  // compute total number of elements and call Kokkos::parallel_for()
+  const int nn = nu - nl + 1;
+  const int nk = ku - kl + 1;
+  const int nj = ju - jl + 1;
+  const int ni = iu - il + 1;
+  const int nnkji = nn * nk * nj * ni;
+  const int nkji  = nk * nj * ni;
+  const int nji   = nj * ni;
+  Kokkos::parallel_for(name,
+      Kokkos::Experimental::require(Kokkos::RangePolicy<ExeSpace,
+          Kokkos::LaunchBounds<MaxThreads, MinBlocksPerSM>>(
+          exec_space, 0, nnkji), Kokkos::Experimental::WorkItemProperty::HintLightWeight),
   KOKKOS_LAMBDA(const int &idx) {
     // compute n,k,j,i indices of thread and call function
     int n = (idx)/nkji;
@@ -314,8 +435,8 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
 
 //------------------------------
 // 5D loop using Kokkos 1D Range
-template <typename Function>
-inline void par_for(const std::string &name, DevExeSpace exec_space,
+template <typename ExeSpace, typename Function>
+inline void par_for(const std::string &name, ExeSpace exec_space,
                     const int &ml, const int &mu,
                     const int &nl, const int &nu, const int &kl, const int &ku,
                     const int &jl, const int &ju, const int &il, const int &iu,
@@ -330,7 +451,9 @@ inline void par_for(const std::string &name, DevExeSpace exec_space,
   const int nnkji  = nn * nk * nj * ni;
   const int nkji   = nk * nj * ni;
   const int nji    = nj * ni;
-  Kokkos::parallel_for(name, Kokkos::RangePolicy<>(exec_space, 0, nmnkji),
+  Kokkos::parallel_for(name,
+      Kokkos::Experimental::require(Kokkos::RangePolicy<ExeSpace>(exec_space, 0, nmnkji),
+          Kokkos::Experimental::WorkItemProperty::HintLightWeight),
   KOKKOS_LAMBDA(const int &idx) {
     // compute m,n,k,j,i indices of thread and call function
     int m = (idx)/nnkji;
@@ -354,7 +477,7 @@ inline void par_for_outer(const std::string &name, DevExeSpace exec_space,
                           const int kl, const int ku, const Function &function) {
   const int nk = ku - kl + 1;
   Kokkos::TeamPolicy<> policy(exec_space, nk, Kokkos::AUTO);
-  Kokkos::parallel_for(name, policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)),
+  Kokkos::parallel_for(name, Kokkos::Experimental::require(policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)), Kokkos::Experimental::WorkItemProperty::HintLightWeight),
   KOKKOS_LAMBDA(TeamMember_t tmember) {
     const int k = tmember.league_rank() + kl;
     function(tmember, k);
@@ -372,7 +495,7 @@ inline void par_for_outer(const std::string &name, DevExeSpace exec_space,
   const int nj = ju - jl + 1;
   const int nkj = nk*nj;
   Kokkos::TeamPolicy<> policy(exec_space, nkj, Kokkos::AUTO);
-  Kokkos::parallel_for(name, policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)),
+  Kokkos::parallel_for(name, Kokkos::Experimental::require(policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)), Kokkos::Experimental::WorkItemProperty::HintLightWeight),
   KOKKOS_LAMBDA(TeamMember_t tmember) {
     const int k = tmember.league_rank()/nj + kl;
     const int j = tmember.league_rank()%nj + jl;
@@ -393,7 +516,7 @@ inline void par_for_outer(const std::string &name, DevExeSpace exec_space,
   const int nkj  = nk*nj;
   const int nnkj = nn*nk*nj;
   Kokkos::TeamPolicy<> policy(exec_space, nnkj, Kokkos::AUTO);
-  Kokkos::parallel_for(name, policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)),
+  Kokkos::parallel_for(name, Kokkos::Experimental::require(policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)), Kokkos::Experimental::WorkItemProperty::HintLightWeight),
   KOKKOS_LAMBDA(TeamMember_t tmember) {
     int n = (tmember.league_rank())/nkj;
     int k = (tmember.league_rank() - n*nkj)/nj;
@@ -420,7 +543,7 @@ inline void par_for_outer(const std::string &name, DevExeSpace exec_space,
   const int nnkj  = nn*nk*nj;
   const int nmnkj = nm*nn*nk*nj;
   Kokkos::TeamPolicy<> policy(exec_space, nmnkj, Kokkos::AUTO);
-  Kokkos::parallel_for(name, policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)),
+  Kokkos::parallel_for(name, Kokkos::Experimental::require(policy.set_scratch_size(scr_level,Kokkos::PerTeam(scr_size)), Kokkos::Experimental::WorkItemProperty::HintLightWeight),
   KOKKOS_LAMBDA(TeamMember_t tmember) {
     int m = (tmember.league_rank())/nnkj;
     int n = (tmember.league_rank() - m*nnkj)/nkj;
@@ -442,7 +565,7 @@ KOKKOS_INLINE_FUNCTION void par_for_inner(TeamMember_t tmember, const int il,con
   Kokkos::parallel_for(Kokkos::TeamVectorRange(tmember, il, iu+1), function);
 }
 
-#define NREDUCTION_VARIABLES 20
+#define NREDUCTION_VARIABLES 24
 //----------------------------------------------------------------------------------------
 //! \struct summed_array_type
 // Following code is copied from Kokkos wiki pages on building custom reducers.  It allows

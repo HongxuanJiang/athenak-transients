@@ -8,6 +8,8 @@
 //! \file geodesic_grid.hpp
 //  \brief definitions for GaussLegendreGrid class
 
+#include <cstdint>
+
 #include "athena.hpp"
 #include "athena_tensor.hpp"
 
@@ -47,5 +49,8 @@ class SphericalSurface {
 
  private:
   MeshBlockPack *pmy_pack;  // ptr to MeshBlockPack containing this Hydro
+  // Mesh::topology_version the cached indices/weights were built against; every AMR
+  // regrid or LAT load-balance transaction invalidates them.
+  std::uint64_t interp_topology_version_;
 };
 #endif  // UTILS_SPHERICAL_SURFACE_HPP_

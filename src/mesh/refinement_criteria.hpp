@@ -44,9 +44,27 @@ struct RefCritData {
   RefCritMethod rmethod;           // refinement method (min_max, slope, etc.)
   std::string rvariable;           // name of variable to be tested for refinement
   Real rvalue_min, rvalue_max;     // min/max criteria for refinement
+  Real rderef_value_min;           // min criterion for derefinement hysteresis
+  Real rderef_value_max;           // max criterion for derefinement hysteresis
+  bool refine_only;                // if true, criterion can refine but not derefine
+  int max_ref_level;               // maximum logical level this criterion may control
+  bool use_density_min;            // if true, apply criterion only above density_min
+  Real density_min;                // minimum rest-frame density for criterion to apply
+  bool use_radius_gate;            // if true, apply criterion only inside radius bounds
+  bool radius_center_bh;           // if true, center radius gate on runtime BH position
+  Real radius_min, radius_max;     // radial bounds for applying this criterion
   Real rloc_x1, rloc_x2, rloc_x3;  // x1-,x2-,x3-locations of point to refine around
   Real rloc_rad;                   // radius of region around point to be refined
+  // Optional softening of the "slope" denominator, as a fraction of the GLOBAL maximum
+  // of the same variable: |grad q| dx / (q + frac*max_domain(q)).  0 (the default, and
+  // the only value any <amr_criterion> block can produce) leaves the denominator as the
+  // bare q of the original criterion, bit for bit.  Set only by the
+  // <mesh_refinement>/drad_max radiation criterion, whose variable spans many decades
+  // down to a vacuum floor where the bare logarithmic slope keeps growing outwards and
+  // carries no information about where the radiation field actually is.
+  Real slope_floor_frac;
   DvceArray5DnSlice rdata;         // slice of variable "n" in 5D array(m,n,k,j,i)
+  DvceArray5DnSlice density_data;  // density slice used by optional density_min gate
 };
 
 //----------------------------------------------------------------------------------------
@@ -69,6 +87,8 @@ class RefinementCriteria {
   void CheckSlope(MeshBlockPack* pmbp, RefCritData crit);
   void CheckSecondDeriv(MeshBlockPack* pmbp, RefCritData crit);
   void CheckLocation(MeshBlockPack* pmbp, RefCritData crit);
+  bool ResizeMeshBlockStorage(int nmb, bool exact = false);
+  void ReleaseMeshBlockStorage();
 
  private:
   // data

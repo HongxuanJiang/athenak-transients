@@ -9,6 +9,8 @@
 //! \file spherical_grid.hpp
 //  \brief definitions for SphericalGrid class
 
+#include <cstdint>
+
 #include "athena.hpp"
 #include "geodesic-grid/geodesic_grid.hpp"
 
@@ -31,9 +33,19 @@ class SphericalGrid: public GeodesicGrid {
     void InterpolateToSphere(int nvars, DvceArray5D<Real>& val);  // interpolate to sphere
     // interpolate a range of variables to a sphere
     void InterpolateToSphere(int vs, int ve, DvceArray5D<Real>& val);
+    // move the sphere to Euclidean radius rad about center (a surface that follows a
+    // moving black hole); the (block, cell) stencil is rebuilt on the next interpolation
+    void ResetCenterAndRadius(const Real center[3], Real rad);
+    // MeshBlock (index in this rank's pack) whose stencil serves angle n after the last
+    // interpolation, or -1 when the angle belongs to another rank
+    int OwnerMeshBlock(int n) const { return interp_indcs.h_view(n,0); }
 
  private:
     MeshBlockPack* pmy_pack;  // ptr to MeshBlockPack containing this Hydro
+    // Mesh::topology_version the cached interpolation indices/weights were built
+    // against.  Any topology or load-balance transaction (adaptive AMR, LAT rebalancing)
+    // invalidates them, as does moving the sphere (ResetCenterAndRadius).
+    std::uint64_t interp_topology_version_ = ~std::uint64_t{0};
     DualArray2D<int> interp_indcs;   // indices of MeshBlock and zones therein for interp
     DualArray3D<Real> interp_wghts;  // weights for interpolation
     void SetInterpolationCoordinates();  // set indexing for interpolation

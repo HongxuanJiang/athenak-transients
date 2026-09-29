@@ -405,6 +405,7 @@ namespace {
 //----------------------------------------------------------------------------------------
 void SetADMVariablesToFLRW(MeshBlockPack *pmbp) {
   const Real t = pmbp->pmesh->time;
+  const Real fac_local = fac;
   auto &adm = pmbp->padm->adm;
   auto &size = pmbp->pmb->mb_size;
   auto &indcs = pmbp->pmesh->mb_indcs;
@@ -439,12 +440,12 @@ void SetADMVariablesToFLRW(MeshBlockPack *pmbp) {
     adm.g_dd(m,1,2,k,j,i) = 0.0;
     adm.g_dd(m,2,2,k,j,i) = a2;
 
-    adm.vK_dd(m,0,0,k,j,i) = -a*fac;
+      adm.vK_dd(m,0,0,k,j,i) = -a*fac_local;
     adm.vK_dd(m,0,1,k,j,i) = 0.0;
     adm.vK_dd(m,0,2,k,j,i) = 0.0;
-    adm.vK_dd(m,1,1,k,j,i) = -a*fac;
+      adm.vK_dd(m,1,1,k,j,i) = -a*fac_local;
     adm.vK_dd(m,1,2,k,j,i) = 0.0;
-    adm.vK_dd(m,2,2,k,j,i) = -a*fac;
+      adm.vK_dd(m,2,2,k,j,i) = -a*fac_local;
 
     adm.alpha(m,k,j,i) = 1.0;
     adm.beta_u(m,0,k,j,i) = 0.0;

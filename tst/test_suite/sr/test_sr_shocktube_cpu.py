@@ -19,7 +19,7 @@ import test_suite.testutils as testutils
 
 
 _recon = ["plm", "ppm4", "ppmx", "wenoz"]  # do not change order
-_flux = ["llf", "hlle", "hllc"]
+_flux = ["llf", "hlle", "hllc", "hlld"]
 _res = [256, 512]  # resolutions to test
 _soe = ["hydro", "mhd"]  # system of equations to test
 name = {"hydro": "mb2", "mhd": "mub1"}  # names of the tests
@@ -63,6 +63,8 @@ def test_run(fv, rv, soe):
     iv = "rk2" if rv == "plm" else "rk3"
     if fv == "hllc" and soe == "mhd":
         pytest.skip("HLLC reconstruction is not available for MHD tests.")
+    if fv == "hlld" and soe == "hydro":
+        pytest.skip("SR HLLD is only available for MHD tests.")
     try:
         for res in _res:
             results[(soe, fv, rv, res)] = run_test(iv, rv, fv, res, name[soe], soe)
@@ -77,6 +79,8 @@ def test_run(fv, rv, soe):
 def test_convergence(fv, rv, soe):
     if fv == "hllc" and soe == "mhd":
         pytest.skip("HLLC reconstruction is not available for MHD tests.")
+    if fv == "hlld" and soe == "hydro":
+        pytest.skip("SR HLLD is only available for MHD tests.")
     if ref_key[soe] == (fv, rv):
         pytest.skip("Can't compare reference against reference")
 

@@ -1,0 +1,165 @@
+<comment>
+problem   = TDE of a 1 Msun star by a 1000 Msun black hole, step 2 of 5 (first remap)
+reference = Jiang et al., End-to-End Numerical Framework for TDEs with AthenaK, ApJS, Table 1
+
+# Step 2: remap to a larger box after pericenter (Sec. 6).
+#   * Reads the step-1 restart at t = 21 t0 (0.24 P_mb) and resamples the conserved
+#     variables onto a 256 Rsun box with 10 AMR levels.  The <remap> block switches
+#     this on; settle_steps relaxes the remapped state before the first full step.
+#   * Still in the translating stellar frame, so the tidal tails stay near the center.
+#   * Runs to t = 24 t0.  rst/TDEExternalLTEPrad.00008.rst (t = 24) is the source of
+#     step 3.  Output numbers continue from the source restart.
+#
+# Run from a directory named 02_remap_box256 next to 01_disruption.
+# Resources: the AMR hierarchy grows quickly after pericenter.  Use all 10 x 16 GB
+# GPUs; do not run this step on fewer cards.
+
+<job>
+basename = TDEExternalLTEPrad
+
+<mesh>
+nghost = 2
+nx1    = 32
+x1min  = -64
+x1max  = 64
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 32
+x2min  = -64
+x2max  = 64
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 32
+x3min  = -64
+x3max  = 64
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<units>
+mass_cgs   = 1.98841586e33          # 1 Msun
+length_cgs = 1.3914e11              # 2 Rsun, so star_radius = 0.5 is 1 Rsun
+time_cgs   = 1.2709152632111343e3   # t0 = sqrt(L0^3 / (4 pi G M0))
+mu         = 1.0
+
+<mesh_refinement>
+refinement          = adaptive
+num_levels          = 10
+ncycle_check        = 20
+refinement_interval = 20
+max_nmb_per_rank    = 750
+
+<amr_criterion0>
+method             = min_max
+variable           = hydro_w_d
+value_max          = 1.0e-3
+derefine_value_max = 1.0e-3
+
+<refined_region0>                   # minimum level in the central 200 Rsun
+level = 3
+x1min = -50
+x1max = 50
+x2min = -50
+x2max = 50
+x3min = -50
+x3max = 50
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.5
+nlim       = -1
+tlim       = 24.1
+ndiag      = 1
+lat        = false
+
+<hydro>
+eos              = lte_table_chabrier2021_t13_helm_union_prad
+table            = ../chabrier2021_t13_helm_union_prad_640.table
+reconstruct      = plm
+rsolver          = hlle
+dfloor           = 1.0e-10
+pfloor           = 1.0e-12
+tfloor_kelvin    = 1
+sfloor           = 0.0
+cs_ceil          = 15.0
+vceil            = 15.0
+fofc             = false
+dual_energy      = true             # Sec. 5
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
+lte_bounds       = clamp
+lte_debug_checks = false
+allow_reinterpretive_restart = true
+
+<gravity>
+self_gravity = true                 # multigrid self-gravity (Sec. 3.2)
+four_pi_G    = 1.0
+threshold    = 0.0
+fmg_ncycle   = 1
+show_defect  = true
+npresmooth   = 1
+npostsmooth  = 2
+rho_grav_min = 1.0e-9
+solve_dt     = 0.03                 # self-gravity cadence Delta t_sg (Sec. 8.1)
+
+<remap>
+enable        = true
+source        = ../01_disruption/rst/TDEExternalLTEPrad.00007.rst
+settle_steps  = 10
+settle_passes = 1
+
+<problem>
+pgen_name = tde_external
+user_srcs = true
+
+# star (read again by the problem generator, the state itself comes from the remap)
+star_radius            = 0.5
+poly_n                 = 1.5
+stellar_structure_mode = eos_balanced
+rho_floor              = 1.0e-10
+relax_damp             = true
+relax_tau              = 0.02
+relax_t_end            = 0.2
+relax_radius           = 0.5
+amp                    = 0.0
+x_center               = 0.0
+y_center               = 0.0
+z_center               = 0.0
+vx_star                = 0.0
+vy_star                = 0.0
+vz_star                = 0.0
+
+# frame and black hole
+external_bh_gravity_source = true   # BH gravity enters as a source term with the same stencil as the BH force
+bh_live               = true   # the BH orbit responds to the gas (leapfrog with the gas pull on the BH)
+use_translating_frame = true
+frame_rho_min         = 1.0e-9
+bh_grav_rho_min       = 1.0e-9
+bh_max_amr            = false
+mass_ratio            = 1000.0      # M_BH / M_star
+beta                  = 1.0         # r_t / r_p
+ecc_bh                = 1.0
+theta_bh              = 0.0
+sep_initial           = 10.0        # initial separation in units of r_t
+bh_softening          = 5.0e-3
+bh_excise_radius      = 0.2
+
+<output1>
+file_type = hst
+dt        = 0.1
+
+<output2>
+file_type = bin
+variable  = hydro_w
+dt        = 1.0
+
+<output3>
+file_type = rst
+dt        = 3.0

@@ -1,0 +1,107 @@
+# The star of mhd_star_surface_eps.athinput with a hundredfold stronger uniform field:
+# the atmosphere sits at beta ~ 4e-4 and the field is exactly normal to the x3 faces, so
+# the fast speed coincides with the Alfven speed there and the HLLD star states degenerate.
+<comment>
+problem = tabulated-EOS star in a low-beta uniform field, HLLD
+
+<job>
+basename = mhd_star_lowbeta_hlld
+
+<mesh>
+nghost = 2
+nx1 = 24
+x1min = -1.5
+x1max = 1.5
+ix1_bc = outflow
+ox1_bc = outflow
+nx2 = 24
+x2min = -1.5
+x2max = 1.5
+ix2_bc = outflow
+ox2_bc = outflow
+nx3 = 24
+x3min = -1.5
+x3max = 1.5
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement = static
+prolong_primitives = true
+max_nmb_per_rank = 2048
+
+<refined_region1>
+level = 1
+x1min = -0.1
+x1max = 0.1
+x2min = -0.1
+x2max = 0.1
+x3min = -0.1
+x3max = 0.1
+
+<units>
+mass_cgs = 1.98841586e33
+length_cgs = 1.3914e11
+time_cgs = 1.2709152632111343e3
+mu = 1.0
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.35
+nlim = 40
+tlim = 100.0
+ndiag = 1000
+
+<mhd>
+eos = lte_table_chabrier2021_t13_helm_union_prad
+table = eos_tables/chabrier2021_t13_helm_union_prad_640.table
+reconstruct = plm
+rsolver = hlld
+dfloor = 1.0e-10
+pfloor = 1.0e-12
+tfloor_kelvin = 1
+sfloor = 0.0
+cs_ceil = 15.0
+vceil = 15.0
+fofc = false
+dual_energy = true
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
+lte_bounds = clamp
+lte_debug_checks = false
+
+<gravity>
+self_gravity = true
+four_pi_G = 1.0
+threshold = 0.0
+fmg_ncycle = 1
+show_defect = false
+npresmooth = 1
+npostsmooth = 2
+rho_grav_min = 1.0e-9
+solve_dt = 0.02
+
+<problem>
+pgen_name = polytropic_star
+stellar_structure_mode = eos_balanced
+star_mass = 1.0
+star_radius = 0.5
+rho_central = 11.0
+poly_n = 1.5
+rho_floor = 1.0e-10
+pressure_support = 1.0
+relax_damp = false
+amp = 0.0
+njeans = 0.0
+b0 = 1.0e-4
+
+<output1>
+file_type = bin
+variable = mhd_w
+dt = 1.0e30

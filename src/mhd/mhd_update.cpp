@@ -30,17 +30,20 @@ TaskStatus MHD::RKUpdate(Driver *pdriver, int stage) {
   bool &multi_d = pmy_pack->pmesh->multi_d;
   bool &three_d = pmy_pack->pmesh->three_d;
 
-  Real &gam0 = pdriver->gam0[stage-1];
-  Real &gam1 = pdriver->gam1[stage-1];
-  Real beta_dt = (pdriver->beta[stage-1])*(pmy_pack->pmesh->dt);
+  Real gam0, gam1;
+  TransportStageWeights(pdriver, stage, gam0, gam1);
+  const Real beta_dt = (pdriver->beta[stage-1])*(pmy_pack->pmesh->dt);
   int nmb1 = pmy_pack->nmb_thispack - 1;
-  int nv1 = nmhd + nscalars - 1;
+  int nv1 = nvars - 1;
   auto u0_ = u0;
   auto u1_ = u1;
-  auto flx1 = uflx.x1f;
-  auto flx2 = uflx.x2f;
-  auto flx3 = uflx.x3f;
+  auto flx1 = FluxBand(uflx.x1f);
+  auto flx2 = FluxBand(uflx.x2f);
+  auto flx3 = FluxBand(uflx.x3f);
   auto &mbsize = pmy_pack->pmb->mb_size;
+  const bool coordinate_excise = pmy_pack->pcoord->coord_data.bh_excise;
+  const bool smooth_excision = pmy_pack->pcoord->coord_data.smooth_excision;
+  auto excision_floor = pmy_pack->pcoord->excision_floor;
 
   // hierarchical parallel loop that updates conserved variables to intermediate step
   // using weights and fractional time step appropriate to stages of time-integrator used
@@ -77,9 +80,17 @@ TaskStatus MHD::RKUpdate(Driver *pdriver, int stage) {
     }
 
     par_for_inner(member, is, ie, [&](const int i) {
-      u0_(m,n,k,j,i) = gam0*u0_(m,n,k,j,i) + gam1*u1_(m,n,k,j,i) - beta_dt*divf(i);
+      // A hard-excised cell is not updated: the next recovery resets its fluid state
+      // to the excision state whatever it holds (passive scalars keep their last
+      // recovered abundance and are no longer advected into the excision), and its
+      // update would reach a coarser neighbour through restriction before that
+      // recovery runs.  Smooth excision evolves its cells and is updated as usual.
+      if (coordinate_excise && !smooth_excision && excision_floor(m,k,j,i)) return;
+      u0_(m,n,k,j,i) =
+          gam0*u0_(m,n,k,j,i) + gam1*u1_(m,n,k,j,i) - beta_dt*divf(i);
     });
   });
+
   return TaskStatus::complete;
 }
 } // namespace mhd

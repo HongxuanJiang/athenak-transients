@@ -21,3 +21,11 @@ tst/test_log.txt
 *~
 *.swp
 Lorene
+
+# python cache
+__pycache__/
+
+# Data kept out of git (docs/opacity_tables.md, docs/eos_tables.md): downloaded opacity
+# sources, generated tables, and EOS tables other than the ones already tracked
+/data/
+/eos_tables/*.table

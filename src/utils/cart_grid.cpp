@@ -70,6 +70,7 @@ CartesianGrid::CartesianGrid(MeshBlockPack *pmy_pack, Real center[3],
   // SetInterpolationCoordinates();
   SetInterpolationIndices();
   SetInterpolationWeights();
+  interp_topology_version_ = pmy_pack->pmesh->topology_version;
 
   return;
 }
@@ -92,6 +93,7 @@ void CartesianGrid::ResetCenter(Real center[3]) {
 
   SetInterpolationIndices();
   SetInterpolationWeights();
+  interp_topology_version_ = pmy_pack->pmesh->topology_version;
 }
 
 void CartesianGrid::ResetCenterAndExtent(Real center[3], Real extent[3]) {
@@ -117,6 +119,7 @@ void CartesianGrid::ResetCenterAndExtent(Real center[3], Real extent[3]) {
 
   SetInterpolationIndices();
   SetInterpolationWeights();
+  interp_topology_version_ = pmy_pack->pmesh->topology_version;
 }
 
 void CartesianGrid::SetInterpolationIndices() {
@@ -257,11 +260,15 @@ void CartesianGrid::SetInterpolationWeights() {
 //! \brief interpolate Cartesian data to cart_grid for output
 
 void CartesianGrid::InterpolateToGrid(int ind, DvceArray5D<Real> &val) {
-  // reinitialize interpolation indices and weights if AMR
-  //if (pmy_pack->pmesh->adaptive) {
-  //  SetInterpolationIndices();
-  //  SetInterpolationWeights();
-  //}
+  // Rebuild the interpolation indices and weights whenever the block layout has changed
+  // since they were built: Mesh::topology_version is bumped, on every rank, by every AMR
+  // regrid and LAT load-balance transaction (MeshRefinement::RedistAndRefineMeshBlocks).
+  const std::uint64_t topology_version = pmy_pack->pmesh->topology_version;
+  if (topology_version != interp_topology_version_) {
+    SetInterpolationIndices();
+    SetInterpolationWeights();
+    interp_topology_version_ = topology_version;
+  }
 
   // capturing variables for kernel
   auto &indcs = pmy_pack->pmesh->mb_indcs;

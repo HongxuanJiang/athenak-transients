@@ -1,0 +1,206 @@
+<comment>
+problem   = TDE of a 1 Msun star by a 1000 Msun black hole, step 5 of 5 (fallback with LAT)
+reference = Jiang et al., End-to-End Numerical Framework for TDEs with AthenaK, ApJS, Table 1
+
+# Step 5: fallback stage of the FID run (Secs. 7-9), in the initial rest frame of the
+# BH.  The live BH (bh_live) moves in this frame.
+#   * Reads the step-4 restart at t = 70 t0 (0.79 P_mb) and remaps it onto a
+#     1024 x 1280 x 256 Rsun box that holds the bound debris until late times.
+#   * 8 AMR levels (finest cell 0.0625 Rsun, r_t / dx = 160) with localized adaptive
+#     time stepping (LAT, Sec. 7): 7 LAT levels, so f_max = 2^7 = 128.
+#   * Refinement: density criterion, BH-centered stream shells, and extra levels for
+#     gas that is unbound from the BH (unbound_amr).
+#
+# A remap cannot run with LAT on, so this step takes two commands, both run from a
+# directory named 05_fallback_lat next to 04_bh_frame:
+#   (a) remap with LAT off and stop at t = 71, which writes rst/TDEExternalLTEPrad.00017.rst
+#         mpirun -np 10 athena -i tde_05_fallback_lat.athinput
+#   (b) restart from that file with LAT on and run to t = 440 t0 (5 P_mb)
+#         mpirun -np 10 athena -r rst/TDEExternalLTEPrad.00017.rst time/lat=true problem/bh_reciprocal_force=true time/tlim=440.2
+# The LAT settings below are stored in the restart file and take effect in (b).
+# The reciprocal force on the live BH (the gas pull on the BH, applied with the same
+# stencil as the BH force on the gas) needs LAT, so it is switched on in (b) only.
+# For the synchronized reference run of the LAT benchmark (Sec. 7.4), leave out both
+# time/lat=true and problem/bh_reciprocal_force=true in (b), keep everything else
+# unchanged.
+
+<job>
+basename = TDEExternalLTEPrad
+
+<mesh>
+nghost = 2
+nx1    = 128
+x1min  = -128
+x1max  = 384
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 160
+x2min  = -192
+x2max  = 448
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 32
+x3min  = -64
+x3max  = 64
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<units>
+mass_cgs   = 1.98841586e33          # 1 Msun
+length_cgs = 1.3914e11              # 2 Rsun, so star_radius = 0.5 is 1 Rsun
+time_cgs   = 1.2709152632111343e3   # t0 = sqrt(L0^3 / (4 pi G M0))
+mu         = 1.0
+
+<mesh_refinement>
+refinement          = adaptive
+num_levels          = 8
+ncycle_check        = 512          # with LAT, AMR checks happen at most once
+refinement_interval = 512          # per LAT synchronization window
+max_nmb_per_rank    = 750
+
+<amr_criterion0>
+method             = min_max
+variable           = hydro_w_d
+value_max          = 1.0e-1
+derefine_value_max = 1.0e-4
+
+<amr_criterion1>                    # BH-centered shells, see stream_shell_* below
+method = user
+
+<refined_region0>                   # minimum level around the BH and the returning stream
+level = 3
+x1min = -65
+x1max = 15
+x2min = -80
+x2max = 0
+x3min = -5
+x3max = 5
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.5
+nlim       = -1
+tlim       = 71.0                   # set to 440.2 on the command line in (b)
+ndiag      = 1
+
+# localized adaptive time stepping (Sec. 7), switched on in (b)
+lat                      = false
+lat_levels               = 7
+lat_same_level           = true
+lat_same_level_max_ratio = 2
+lat_neighbor_limiter     = all
+lat_diagnostics          = false
+
+<hydro>
+eos              = lte_table_chabrier2021_t13_helm_union_prad
+table            = ../chabrier2021_t13_helm_union_prad_640.table
+reconstruct      = plm
+rsolver          = hlle
+dfloor           = 1.0e-10
+pfloor           = 1.0e-12
+tfloor_kelvin    = 1
+sfloor           = 0.0
+cs_ceil          = 15.0
+vceil            = 15.0
+fofc             = false
+dual_energy      = true             # Sec. 5
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
+lte_bounds       = clamp
+lte_debug_checks = false
+allow_reinterpretive_restart = true
+
+<gravity>
+self_gravity = true                 # multigrid self-gravity (Sec. 3.2)
+four_pi_G    = 1.0
+threshold    = 0.0
+fmg_ncycle   = 1
+show_defect  = true
+npresmooth   = 1
+npostsmooth  = 2
+rho_grav_min = 1.0e-9
+solve_dt     = 0.03                 # self-gravity cadence Delta t_sg (Sec. 8.1)
+
+<remap>
+enable        = true
+source        = ../04_bh_frame/rst/TDEExternalLTEPrad.00016.rst
+settle_steps  = 10
+settle_passes = 1
+
+<problem>
+pgen_name = tde_external
+user_srcs = true
+
+# star (read again by the problem generator, the state itself comes from the remap)
+star_radius            = 0.5
+poly_n                 = 1.5
+stellar_structure_mode = eos_balanced
+rho_floor              = 1.0e-10
+relax_damp             = true
+relax_tau              = 0.02
+relax_t_end            = 0.2
+relax_radius           = 0.5
+amp                    = 0.0
+x_center               = 0.0
+y_center               = 0.0
+z_center               = 0.0
+vx_star                = 0.0
+vy_star                = 0.0
+vz_star                = 0.0
+
+# frame and black hole
+external_bh_gravity_source = true   # BH gravity enters as a source term with the same stencil as the BH force
+bh_live               = true   # the BH orbit responds to the gas (leapfrog with the gas pull on the BH)
+bh_reciprocal_force   = false  # part (b) switches this on together with time/lat (see header)
+bh_pair_force         = finite_difference
+use_translating_frame = false
+frame_rho_min         = 1.0e-9
+bh_grav_rho_min       = 1.0e-9
+bh_max_amr            = false
+mass_ratio            = 1000.0      # M_BH / M_star
+beta                  = 1.0         # r_t / r_p
+ecc_bh                = 1.0
+theta_bh              = 0.0
+sep_initial           = 10.0        # initial separation in units of r_t
+bh_softening          = 5.0e-3
+bh_excise_radius      = 0.2
+
+# refinement shells around the BH used by <amr_criterion1>
+unbound_amr                       = true
+unbound_amr_level_offset          = 4
+unbound_amr_rho_min               = 1.0e-9
+stream_shell_dr                   = 0.5
+stream_shell_level_offset         = 0
+stream_shell_xsplit_radius        = 40.0
+stream_shell_rho_frac             = 0.9
+stream_shell_level_radius_1       = 10.0
+stream_shell_level_offset_1       = 1
+stream_shell_dr_1                 = 0.5
+stream_shell_rho_frac_1           = 0.9
+stream_shell_level_radius_2       = 50.0
+stream_shell_level_offset_2       = 2
+stream_shell_dr_2                 = 1.0
+stream_shell_rho_frac_2           = 0.9
+stream_shell_r_max                = 200.0
+stream_shell_derefine_dfloor_mult = 100.0
+
+<output1>
+file_type = hst
+dt        = 0.1
+
+<output2>
+file_type = bin
+variable  = hydro_w
+dt        = 0.5
+
+<output3>
+file_type = rst
+dt        = 10.0

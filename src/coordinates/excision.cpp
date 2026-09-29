@@ -8,6 +8,9 @@
 
 #include <float.h>
 
+#include <cstdlib>
+#include <iostream>
+
 #include "athena.hpp"
 #include "mesh/mesh.hpp"
 #include "coordinates.hpp"
@@ -162,7 +165,30 @@ void Coordinates::SetExcisionMasks(DvceArray4D<bool> &excision_floor,
   return;
 }
 
+//----------------------------------------------------------------------------------------
+//! \fn void Coordinates::UpdateExcisionMasks()
+//! \brief Re-derive the excision masks from the current geometry.
+//!
+//! Deliberately a NO-OP for ExcisionScheme::fixed, which is what a prescribed-metric BBH
+//! run uses: there the pgen callback writes excision_floor/excision_flux in the same
+//! kernel that writes the metric (and on the same LAT active mask), so the masks are
+//! already current when this returns and a second full-grid pass would only duplicate it.
+//! The call sites that pair SetADMVariablesAtTime(t) with this function are therefore
+//! correct but inert under `fixed`; do not read them as the thing that moves the masks.
 void Coordinates::UpdateExcisionMasks() {
+  // The horizon scheme reads the Z4c horizon finders.  Under LAT pz4c is guaranteed null
+  // (Driver refuses evolved Z4c with LAT), so this used to be a null dereference inside a
+  // host loop rather than a diagnosed refusal.  Only `fixed` and `lapse` are reachable
+  // without Z4c.
+  if (coord_data.excision_scheme == ExcisionScheme::horizon &&
+      pmy_pack->pz4c == nullptr) {
+    std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__ << std::endl
+              << "coord/excision_scheme = horizon needs the Z4c horizon finders, but Z4c "
+              << "is not evolved in this configuration (e.g. a prescribed metric, or "
+              << "local adaptive timestepping, which refuses evolved Z4c)." << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
+
   if (coord_data.excision_scheme == ExcisionScheme::lapse) {
     // capture variables for kernel
     auto &indcs = pmy_pack->pmesh->mb_indcs;
@@ -170,16 +196,20 @@ void Coordinates::UpdateExcisionMasks() {
     int n1 = indcs.nx1 + 2*ng;
     int n2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng) : 1;
     int n3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng) : 1;
-    int nmb1 = pmy_pack->nmb_thispack - 1;
-    auto &adm = pmy_pack->padm->adm;
+    const int nwork1 = pmy_pack->nmb_thispack - 1;
+    if (nwork1 < 0) return;
+    const auto metric = pmy_pack->padm->GetMetricView();
     auto &floor = excision_floor;
     auto &flux = excision_flux;
 
     Real &excise_lapse = coord_data.excise_lapse;
 
-    par_for("set_excision", DevExeSpace(), 0, nmb1, 0, (n3-1), 0, (n2-1), 0, (n1-1),
-    KOKKOS_LAMBDA(const int m, const int k, const int j, const int i) {
-      bool excise = (adm.alpha(m,k,j,i) < excise_lapse);
+    par_for("set_excision", DevExeSpace(), 0, nwork1, 0, (n3-1), 0, (n2-1), 0, (n1-1),
+    KOKKOS_LAMBDA(const int a, const int k, const int j, const int i) {
+      const int m = a;
+      adm::ADMMetricPoint metric_point{};
+      metric.CellMetric(m, k, j, i, metric_point);
+      bool excise = (metric_point.alpha < excise_lapse);
       floor(m,k,j,i) = excise;
       flux(m,k,j,i) = excise;
     });

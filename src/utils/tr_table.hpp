@@ -32,6 +32,8 @@ class Table {
   Table();
   ~Table();
 
+  // fname as a deck names it: a relative name is resolved by ResolveDataPath
+  // (utils/data_path.hpp).
   ReadResult ReadTable(const std::string fname);
 
   inline const std::map<std::string, std::string> GetMetadata() {

@@ -1,0 +1,56 @@
+# Regression for specific-energy PLM at steep atmosphere density gradients.
+<job>
+basename = hydro_plm_unit
+
+<mesh>
+nghost = 2
+nx1 = 16
+x1min = -1.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 8
+x2min = -1.0
+x2max = 1.0
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 8
+x3min = -1.0
+x3max = 1.0
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<units>
+mass_cgs = 1.98841586e33
+length_cgs = 1.3914e11
+time_cgs = 1.2709152632111343e3
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = 0
+tlim = 0.0
+
+<hydro>
+eos = lte_table_chabrier2021_t13_helm_union
+table = eos_tables/chabrier2021_t13_helm_union_640.table
+reconstruct = plm
+split_recon_chunk_nmb = 1
+rsolver = hlle
+nscalars = 2
+dual_energy = true
+fofc = false
+dfloor = 1.0e-19
+pfloor = 2.0e-23
+tfloor_kelvin = 100.0
+sfloor = 0.0
+lte_bounds = error
+
+<problem>
+pgen_name = hydro_plm_unit

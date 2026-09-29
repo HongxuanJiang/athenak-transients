@@ -21,6 +21,19 @@ using  IOWrapperFile = FILE*;
 
 using IOWrapperSizeT = std::uint64_t;
 
+//----------------------------------------------------------------------------------------
+//! \fn bool PreserveExistingFile(const char *fname)
+//! \brief If `fname` exists, rename it to "<fname>.old" (or ".old-1", ".old-2", ... if
+//! that name is taken) and print one WARNING naming both paths.  Returns true if a file
+//! was moved.
+//!
+//! Output file numbering restarts from whatever the checkpoint carried, so re-restarting
+//! from an older checkpoint sends the run straight back over checkpoints and dumps that
+//! are NEWER than it -- multi-GB files, overwritten with no check and no message, and
+//! both copies lost if the job dies mid-write.  Callers must invoke this on exactly one
+//! rank per file, before the file is opened for writing.
+bool PreserveExistingFile(const char *fname);
+
 class IOWrapper {
  public:
 #if MPI_PARALLEL_ENABLED

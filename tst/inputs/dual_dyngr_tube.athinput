@@ -1,0 +1,89 @@
+<comment>
+problem   = Dynamical-GR MHD shocktube MUB1, dual-energy auxiliary readable
+reference = Mignone, Ugliano, & Bodo 2009, MNRAS 393 1141
+
+<job>
+basename  = dual_dyngr_tube
+
+<mesh>
+nghost    = 2
+nx1       = 256
+x1min     = -0.5
+x1max     = 0.5
+ix1_bc    = outflow
+ox1_bc    = outflow
+
+nx2       = 1
+x2min     = -0.5
+x2max     = 0.5
+ix2_bc    = periodic
+ox2_bc    = periodic
+
+nx3       = 1
+x3min     = -0.5
+x3max     = 0.5
+ix3_bc    = periodic
+ox3_bc    = periodic
+
+<meshblock>
+nx1       = 256
+nx2       = 1
+nx3       = 1
+
+<coord>
+special_rel = false
+general_rel = true
+minkowski   = true
+
+<adm>
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.2
+nlim       = -1
+tlim       = 0.4
+ndiag      = 1000
+
+<mhd>
+eos              = ideal
+dyn_eos          = ideal
+dyn_error        = reset_floor
+reconstruct      = plm
+rsolver          = hlle
+gamma            = 2.0
+tfloor           = 1.0e-10
+dual_energy      = true
+dual_energy_eta1 = 1.0e-4
+dual_energy_eta2 = 1.0e-1
+
+<problem>
+pgen_name  = shock_tube
+shock_dir  = 1
+xshock     = 0.0
+
+dl  = 1.0
+pl  = 1.0
+ul  = 0.0
+vl  = 0.0
+wl  = 0.0
+bxl = 0.5
+byl = 1.0
+bzl = 0.0
+
+dr  = 0.125
+pr  = 0.1
+ur  = 0.0
+vr  = 0.0
+wr  = 0.0
+bxr = 0.5
+byr = -1.0
+bzr = 0.0
+
+<output1>
+file_type   = tab
+variable    = mhd_w
+data_format = %24.16e
+dt          = 0.4
+slice_x2    = 0.0
+slice_x3    = 0.0

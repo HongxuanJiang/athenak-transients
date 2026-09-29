@@ -1,0 +1,125 @@
+# AthenaK input: sink-particle Bondi accretion test (battery case "bondi", "sink_lat")
+#
+# Replicates ORION2 Test_Prob/Sink/Bondi (orion2_sink_map.md 9.1) at half its linear
+# resolution: a single static sink in a uniform, near-isothermal medium at rest.
+# Success criterion (ORION2's own, Doc/sphinx/tests/sink.rst:35-37): the accretion rate
+# settles within 10-20% of the analytic Bondi rate
+#     mdot_B = 4 pi lambda rho_inf (G M)^2 / c_s^3 ,   lambda = e^(3/2)/4 = 1.1204222676
+#
+# Code units chosen so every gate number is exact:
+#   G = 1, c_s = 1, rho_inf = 1e-3  =>  r_B = G M / c_s^2 = M = 0.625, t_B = r_B/c_s = 0.625
+#   dx = 4/32 = 0.125            =>  r_B = 5 dx      (Bondi radius resolved, KKM04)
+#   accrete_radius_cells = 4     =>  r_acc = 0.8 r_B (ORION2 uses 0.4 r_B at 64^3)
+#   L  = 4 = 6.4 r_B             =>  same box-to-Bondi ratio as ORION2's 64^3 run
+#   mdot_B = 0.005499859944940521 ; M_gas(0) = 0.064 ; drain time = 18.6 t_B
+# rho_inf is 1e-3, NOT 1: the ambient must satisfy M_gas << M_sink or the sink's mass
+# (and with it r_B and mdot_B) runs away inside one Bondi time -- with G = rho = c_s = 1
+# the mass-doubling time is 0.11 t_B, and the box is barely two Jeans lengths across.
+# At 1e-3 the sink grows ~1.2% over the whole run while M_gas stays large enough
+# (0.064 = 0.1 M_sink) that the mass ledger is checkable well above the sink's own ulp.
+# gamma = 1.0001 is ORION2's near-isothermal choice: the module's hard-coded
+# lambda = e^(3/2)/4 and its bondi_alpha() table are the ISOTHERMAL Bondi solution, so
+# the gas must be effectively isothermal for the analytic rate to be the right reference.
+#
+# Boundaries are PERIODIC (ORION2 uses open ones).  That is deliberate: it makes the
+# mass/momentum ledger d(M_sink + M_gas)/dt = 0 exact to round-off, which is the second
+# gate of this case.  The price is that the box drains (~10% by t = 2.4 t_B), so the
+# harness references the analytic rate to the INSTANTANEOUS box-mean density.
+#
+# The sink sits at the origin, which is the common corner of all 8 MeshBlocks: its
+# accretion kernel therefore straddles every block, and with -n 2 it straddles ranks,
+# which is exactly what the cross-rank reduction arm gates.
+
+<comment>
+problem   = sink particle Bondi accretion
+reference = Krumholz, Klein & McKee 2004, ApJ 611, 399
+
+<job>
+basename  = sink_bondi
+
+<mesh>
+nghost    = 2
+nx1       = 32
+x1min     = -2.0
+x1max     = 2.0
+ix1_bc    = periodic
+ox1_bc    = periodic
+
+nx2       = 32
+x2min     = -2.0
+x2max     = 2.0
+ix2_bc    = periodic
+ox2_bc    = periodic
+
+nx3       = 32
+x3min     = -2.0
+x3max     = 2.0
+ix3_bc    = periodic
+ox3_bc    = periodic
+
+<meshblock>
+nx1       = 16
+nx2       = 16
+nx3       = 16
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim       = -1
+tlim       = 1.875          # 3 t_B
+ndiag      = 50
+lat        = false          # runner flips this for the sink_lat arm
+hydro_lat_levels = 1
+
+<hydro>
+eos         = ideal
+reconstruct = plm
+rsolver     = hllc
+gamma       = 1.0001        # near-isothermal, as ORION2's Bondi test
+
+<sink_particles>
+create               = false      # no <gravity> block in this case
+accrete              = true
+accrete_radius_cells = 4          # ORION2 sink.radius default
+soften               = 1.0        # softening = 1 finest cell
+merge_link_cells     = 8.0        # 2*accrete_radius_cells (module default); inert, 1 sink
+mmergemax            = 0.0
+jeans_no             = 0.25
+r_angmom             = 1.0e100    # Keplerian cap disabled
+use_sink_timestep    = true
+subcell_gravity      = false
+bs_tol               = 1.0e-6
+newton_g             = 1.0
+log                  = sinks.log
+n_init               = 1
+# m, x, y, z, px, py, pz   (M = r_B c_s^2 / G = 0.625, at rest at the origin)
+init0                = 0.625, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
+
+<problem>
+pgen_name  = shock_tube
+shock_dir  = 1
+xshock     = 0.0
+# dl == dr and pl == pr: shock_tube degenerates to a uniform box
+dl = 1.0e-3
+pl = 0.000999900009999     # = rho/gamma  =>  c_s = sqrt(gamma p/rho) = 1 exactly
+ul = 0.0
+vl = 0.0
+wl = 0.0
+
+dr = 1.0e-3
+pr = 0.000999900009999
+ur = 0.0
+vr = 0.0
+wr = 0.0
+
+<output1>
+file_type   = hst
+data_format = %24.17e       # full double precision: the ledger gate is 1e-12
+dcycle      = 1             # one row per cycle, pairs with the per-cycle sink log
+
+<output2>
+file_type   = bin
+variable    = hydro_u
+data_format = %24.17e
+dt          = 0.625         # one frame per t_B (LAT bitwise arm compares these)
