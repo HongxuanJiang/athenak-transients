@@ -30,6 +30,18 @@
 #include "../mesh/mb_storage.hpp"
 
 namespace mhd {
+
+namespace {
+// Whether the ordinary MHD FOFC flags can ever be exchanged: the storage condition behind
+// MHD::FOFCMaskExchangeEnabled (mhd_tasks.cpp), which is false whenever pdyngr exists,
+// because DynGRMHD runs its own FOFC and never writes the shared flag mask.  Under
+// dynamical GR, pbval_fofc, coarse_fofc_mask and lat_correction_mask therefore carry
+// nothing.  pdyngr is built after this constructor, but it exists exactly when the
+// coordinates are dynamical and there is an <mhd> block (MeshBlockPack::AddPhysics).
+bool OrdinaryFOFCFlagsExchanged(const MeshBlockPack *ppack) {
+  return !ppack->pcoord->is_dynamical_relativistic;
+}
+}  // namespace
 //----------------------------------------------------------------------------------------
 // constructor, initializes data structures and parameters
 
@@ -528,7 +540,8 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
       Kokkos::realloc(efld.x1e, nmb, ncells3+1, ncells2+1, ncells1);
       Kokkos::realloc(efld.x2e, nmb, ncells3+1, ncells2, ncells1+1);
       Kokkos::realloc(efld.x3e, nmb, ncells3, ncells2+1, ncells1+1);
-      const bool fofc_mask_storage = use_fofc && pmy_pack->pmesh->multilevel;
+      const bool fofc_mask_storage = use_fofc && pmy_pack->pmesh->multilevel &&
+          OrdinaryFOFCFlagsExchanged(pmy_pack);
       if (fofc_mask_storage) {
         Kokkos::realloc(lat_correction_mask, nmb, 1, ncells3, ncells2, ncells1);
         Kokkos::deep_copy(lat_correction_mask, 0.0);
@@ -579,7 +592,7 @@ MHD::MHD(MeshBlockPack *ppack, ParameterInput *pin) :
   }
 
   const bool fofc_topology_sync = time_evolving && use_fofc &&
-      pmy_pack->pmesh->multilevel;
+      pmy_pack->pmesh->multilevel && OrdinaryFOFCFlagsExchanged(pmy_pack);
   if (fofc_topology_sync) {
     pbval_fofc = new MeshBoundaryValuesCC(ppack, pin, false);
     // A mask exchange through the standard CC machinery only: the receive slots drop the
@@ -729,7 +742,8 @@ bool MHD::ResizeMeshBlockStorage(int nmb, bool exact, bool allow_shrink) {
     resized = resize4(efld.x1e, nmb, ncells3 + 1, ncells2 + 1, ncells1) || resized;
     resized = resize4(efld.x2e, nmb, ncells3 + 1, ncells2, ncells1 + 1) || resized;
     resized = resize4(efld.x3e, nmb, ncells3, ncells2 + 1, ncells1 + 1) || resized;
-    const bool fofc_mask_storage = use_fofc && pmy_pack->pmesh->multilevel;
+    const bool fofc_mask_storage = use_fofc && pmy_pack->pmesh->multilevel &&
+        OrdinaryFOFCFlagsExchanged(pmy_pack);
     if (fofc_mask_storage) {
       const bool resized_lat_correction_mask = resize5(
           lat_correction_mask, nmb, 1, ncells3, ncells2, ncells1);
@@ -757,10 +771,27 @@ bool MHD::ResizeMeshBlockStorage(int nmb, bool exact, bool allow_shrink) {
     resized = resize4(e3_cc, nmb, nband3, nband2, nband1) || resized;
     const int nrecon = nvars;
     const int nrecon_nmb = std::min(nmb, split_recon_chunk_nmb);
-    resized = resize5(wl3d, nrecon_nmb, nrecon, ncells3, ncells2, ncells1) || resized;
-    resized = resize5(wr3d, nrecon_nmb, nrecon, ncells3, ncells2, ncells1) || resized;
-    resized = resize5(bl3d, nrecon_nmb, 3, ncells3, ncells2, ncells1) || resized;
-    resized = resize5(br3d, nrecon_nmb, 3, ncells3, ncells2, ncells1) || resized;
+    // The reconstruction scratch holds one chunk of blocks, not the pack: the flux
+    // kernels walk the pack in chunks of split_recon_chunk_nmb.  resize5 would size it
+    // from the preallocation reserve (mb_storage.hpp) and so grow it to max_nmb_per_rank
+    // blocks, several GB at production block counts.  Under the reserve it keeps the
+    // chunk extent the constructor gave it (split_recon_chunk_nmb is clamped there to
+    // the constructor's block count, which the reserve cannot exceed).  Without the
+    // reserve the policy is unchanged.
+    auto resize_chunk5 = [&](auto &view, int n1, int n2, int n3, int n4) {
+      if (MeshBlockStorageReserve() == 0) {
+        return resize5(view, nrecon_nmb, n1, n2, n3, n4);
+      }
+      const bool need = (view.extent_int(0) != split_recon_chunk_nmb ||
+                         view.extent_int(1) != n1 || view.extent_int(2) != n2 ||
+                         view.extent_int(3) != n3 || view.extent_int(4) != n4);
+      if (need) Kokkos::resize(view, split_recon_chunk_nmb, n1, n2, n3, n4);
+      return need;
+    };
+    resized = resize_chunk5(wl3d, nrecon, ncells3, ncells2, ncells1) || resized;
+    resized = resize_chunk5(wr3d, nrecon, ncells3, ncells2, ncells1) || resized;
+    resized = resize_chunk5(bl3d, 3, ncells3, ncells2, ncells1) || resized;
+    resized = resize_chunk5(br3d, 3, ncells3, ncells2, ncells1) || resized;
     if (use_fofc) {
       resized_fofc = resize4(fofc, nmb, ncells3, ncells2, ncells1) || resized_fofc;
       const bool trial_band = pmy_pack->pcoord->is_dynamical_relativistic;

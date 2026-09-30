@@ -125,6 +125,19 @@ skip_existing = true
     assert again.dump_dir == config.dump_dir and again.basename == "Other"
 
 
+def test_resolved_text_round_trips_dumps_all():
+    config = parse_parameters("<input>\ndump_dir = .\ndumps = all\n", base_dir="/")
+    assert config.dumps is None
+    resolved = config.resolved_text()
+    assert "dumps         = all" in resolved
+    assert parse_parameters(resolved, base_dir="/").dumps is None
+    # ``auto`` is still written for the keys that have it
+    assert any(
+        line.startswith("bh_mask_radius") and line.endswith("= auto")
+        for line in resolved.splitlines()
+    )
+
+
 def test_examples_list_every_key_and_use_the_paper_settings():
     for name in ("tde_snapshot.rtin", "tde_lightcurve.rtin"):
         path = EXAMPLES / name
@@ -183,6 +196,22 @@ def test_examples_list_every_key_and_use_the_paper_settings():
         ("<input>\ndump_dir = .\n", "<input>/dumps is required"),
         ("<input>\ndumps = 3\n", "<input>/dump_dir is required"),
         ("<input>\ndump_dir = .\ndumps = 5:1\n", "ends before it starts"),
+        ("<input>\ndump_dir = .\ndumps = 0:99999999999\n", "more than 1000000 dumps"),
+        ("<input>\ndump_dir = .\ndumps = 0:1999999, 5\n", "more than 1000000 dumps"),
+        ("<input>\ndump_dir = .\ndumps = 1_0\n", "cannot read '1_0'"),
+        ("<input>\ndump_dir = .\ndumps = \uff11\uff12\n", "cannot read"),
+        (MINIMAL + "<image>\nimage_size = 1_0\n", "line 5.*expected an integer"),
+        (MINIMAL + "<image>\nimage_size = \u0661\u0662\n", "expected an integer"),
+        (MINIMAL + "<transfer>\ntau_stop = 1_0.5\n", "expected a number"),
+        (MINIMAL + "<transfer>\ntau_stop = \uff11\n", "expected a number"),
+        (MINIMAL + "<image>\nbox = 0_0, 1, 0, 1, 0, 1\n", "expected a number"),
+        # range errors of RTSettings.validate name the line of the key
+        (MINIMAL + "<transfer>\nnfreq = 1\n", r"run.rtin, line 5: nfreq must be >= 2"),
+        (MINIMAL + "<image>\nimage_size = 1\n", r"line 5: image_size and los_steps"),
+        (MINIMAL + "<transfer>\nemin_ev = 10\nemax_ev = 1\n", r"line 5: The photon"),
+        (MINIMAL + "<run>\nthreads = 0\n", r"line 5: threads must be >= 1"),
+        (MINIMAL + "<selection>\nbh_mask_radius = -1\n", r"line 5: <selection>/bh_mask_radius"),
+        (MINIMAL + "<input>\nbasename = a/b\n", r"line 5: <input>/basename"),
     ],
 )
 def test_parameter_errors(tmp_path, text, match):
@@ -461,12 +490,12 @@ def test_skip_existing_reuses_matching_outputs(tmp_path, capsys):
     messages = []
     results = run_parameter_file(path, log=messages.append)
     assert [(r.snapshot_index, r.direction) for r in results] == [(41, "-y")]
-    assert sum(m.startswith("Skipping") for m in messages) == 3
+    assert sum(m.endswith("(reused)") for m in messages) == 3
     assert csv_path.read_text() == first
 
     # A changed setting must not silently reuse the old products.
     path.write_text(path.read_text().replace("image_size = 8", "image_size = 4"))
-    match = r"does not match the current settings \(image_size = 8 there, 4 now\)"
+    match = r"does not match the current settings or input dump \(image_size = 8 there, 4 now\)"
     with pytest.raises(RuntimeError, match=match):
         run_parameter_file(path, log=quiet)
     capsys.readouterr()
@@ -481,3 +510,177 @@ def test_single_dump_without_skip_overwrites(tmp_path):
     assert len(run_parameter_file(path, log=quiet)) == 2
     assert len(run_parameter_file(path, log=quiet)) == 2
     assert not (tmp_path / "out" / "rt_lightcurve_grey.csv").exists()
+
+
+# ---------------------------------------------------------------------------
+# Restart checks, light-curve merge, threads, API.
+# ---------------------------------------------------------------------------
+def product_path(tmp_path: Path, mode: str, direction: str, dump: int) -> Path:
+    return tmp_path / "out" / f"TDETest.hydro_w.{dump:05d}.rt_{mode}_{direction}.h5"
+
+
+def lightcurve_dumps(tmp_path: Path, mode: str) -> list:
+    with h5py.File(tmp_path / "out" / f"rt_lightcurve_{mode}.h5", "r") as h5:
+        return h5["dump"][...].tolist()
+
+
+def test_skip_existing_checks_the_input_dump(tmp_path):
+    bin_dir = make_run(tmp_path, series=((40, 1.0, 1.0), (41, 2.0, 1.1)))
+    path = write(tmp_path, lightcurve_text("tau1", "40, 41", "skip_existing = true\n"))
+    assert len(run_parameter_file(path, log=quiet)) == 4
+    assert len(run_parameter_file(path, log=quiet)) == 0
+
+    # Same name, other content: a different time, then a different cycle.
+    dump = bin_dir / "TDETest.hydro_w.00041.bin"
+    write_snapshot(dump, "../test_ideal_h.table", time=2.5, cycle=410, t_scale=1.1)
+    with pytest.raises(RuntimeError, match=r"input dump differs: time_code = 2.0 there, 2.5 now"):
+        run_parameter_file(path, log=quiet)
+    write_snapshot(dump, "../test_ideal_h.table", time=2.0, cycle=999, t_scale=1.1)
+    with pytest.raises(RuntimeError, match=r"input dump differs: cycle = 410 there, 999 now"):
+        run_parameter_file(path, log=quiet)
+    write_snapshot(dump, "../test_ideal_h.table", time=2.0, cycle=410, t_scale=1.1)
+    assert len(run_parameter_file(path, log=quiet)) == 0
+
+    # The same dumps in another directory (same names) are the same input.
+    other = tmp_path / "copy" / "bin"
+    other.mkdir(parents=True)
+    for name in ("TDETest.hydro_w.00040.bin", "TDETest.hydro_w.00041.bin"):
+        (other / name).write_bytes((bin_dir / name).read_bytes())
+    (tmp_path / "copy" / "test_ideal_h.table").write_bytes(
+        (tmp_path / "test_ideal_h.table").read_bytes()
+    )
+    text = path.read_text().replace("run/bin", "copy/bin")
+    assert len(run_parameter_file(write(tmp_path, text, "copy.rtin"), log=quiet)) == 0
+    # ... but not when the time differs.
+    write_snapshot(other / "TDETest.hydro_w.00040.bin", "../test_ideal_h.table",
+                   time=1.25, cycle=400, t_scale=1.0)
+    with pytest.raises(RuntimeError, match="input dump differs"):
+        run_parameter_file(tmp_path / "copy.rtin", log=quiet)
+
+
+def test_skip_existing_ignores_settings_the_mode_does_not_use(tmp_path):
+    make_run(tmp_path)
+    base = lightcurve_text("tau1", "42", "skip_existing = true\n")
+    path = write(tmp_path, base)
+    assert len(run_parameter_file(path, log=quiet)) == 2
+    unused = base.replace("nfreq      = 8", "nfreq      = 9\npopulations = saha\nemin_ev = 0.5\nemax_ev = 5\n"
+                          "scattering = false\ntau_stop = 3")
+    assert "nfreq      = 9" in unused
+    assert len(run_parameter_file(write(tmp_path, unused), log=quiet)) == 0
+    # tau_photosphere does matter in tau1 mode
+    changed = base.replace("nfreq      = 8", "nfreq = 8\ntau_photosphere = 2")
+    with pytest.raises(RuntimeError, match=r"tau_photosphere = 1.0 there, 2.0 now"):
+        run_parameter_file(write(tmp_path, changed), log=quiet)
+
+    # multifreq: tau_photosphere is unused, nfreq is not
+    text = lightcurve_text("multifreq", "42", "skip_existing = true\n")
+    assert len(run_parameter_file(write(tmp_path, text), log=quiet)) == 2
+    same = text.replace("nfreq      = 8", "nfreq = 8\ntau_photosphere = 5")
+    assert len(run_parameter_file(write(tmp_path, same), log=quiet)) == 0
+    with pytest.raises(RuntimeError, match=r"nfreq = 8 there, 9 now"):
+        run_parameter_file(write(tmp_path, text.replace("nfreq      = 8", "nfreq = 9")), log=quiet)
+
+
+def test_skip_existing_compares_table_hashes_not_paths(tmp_path):
+    make_run(tmp_path)
+    text = lightcurve_text("tau1", "42", "skip_existing = true\n")
+    table = tmp_path / "test_ideal_h.table"
+    moved = tmp_path / "elsewhere.table"
+    moved.write_bytes(table.read_bytes())
+    path = write(tmp_path, text + f"\n<tables>\neos_table = {table}\n")
+    assert len(run_parameter_file(path, log=quiet)) == 2
+    with h5py.File(product_path(tmp_path, "tau1", "z", 42), "r") as h5:
+        assert len(h5.attrs["eos_table_sha256"]) == 64
+        assert len(h5.attrs["mesa_high_t_sha256"]) == 64
+
+    # Same content under another path: reused.
+    path = write(tmp_path, text + f"\n<tables>\neos_table = {moved}\n")
+    assert len(run_parameter_file(path, log=quiet)) == 0
+    # Other content: refused.
+    moved.write_bytes(table.read_bytes() + b"\0")
+    with pytest.raises(RuntimeError, match="eos_table file differs"):
+        run_parameter_file(path, log=quiet)
+
+    # A product from an older version has no hashes: the paths are compared.
+    moved.write_bytes(table.read_bytes())
+    for direction in ("z", "-y"):
+        with h5py.File(product_path(tmp_path, "tau1", direction, 42), "r+") as h5:
+            for name in ("eos_table_sha256", "mesa_high_t_sha256", "mesa_low_t_sha256"):
+                del h5.attrs[name]
+    with pytest.raises(RuntimeError, match="eos_table_setting"):
+        run_parameter_file(path, log=quiet)
+    path = write(tmp_path, text + f"\n<tables>\neos_table = {table}\n")
+    assert len(run_parameter_file(path, log=quiet)) == 0
+
+
+def test_lightcurve_merges_earlier_matching_products(tmp_path):
+    make_run(tmp_path, series=((40, 1.0, 1.0), (41, 2.0, 1.1), (42, 3.0, 1.2), (43, 4.0, 1.3)))
+    messages = []
+    run_parameter_file(write(tmp_path, lightcurve_text("tau1", "40")), log=messages.append)
+    assert not (tmp_path / "out" / "rt_lightcurve_tau1.csv").exists()  # one row only
+    assert not any(m.startswith("Light curve") for m in messages)
+
+    run_parameter_file(write(tmp_path, lightcurve_text("tau1", "43")), log=quiet)
+    assert lightcurve_dumps(tmp_path, "tau1") == [40, 43]
+    run_parameter_file(write(tmp_path, lightcurve_text("tau1", "41, 42")), log=quiet)
+    assert lightcurve_dumps(tmp_path, "tau1") == [40, 41, 42, 43]
+    with (tmp_path / "out" / "rt_lightcurve_tau1.csv").open() as fp:
+        rows = list(csv.DictReader(fp))
+    assert [int(r["dump"]) for r in rows] == [40, 41, 42, 43]
+    assert [float(r["time_code"]) for r in rows] == [1.0, 2.0, 3.0, 4.0]
+
+    # Products made with other settings are left out.
+    other = lightcurve_text("tau1", "41, 42").replace("image_size = 8", "image_size = 4")
+    run_parameter_file(write(tmp_path, other), log=quiet)
+    assert lightcurve_dumps(tmp_path, "tau1") == [41, 42]
+
+    # A dump that lacks one of the directions is left out.
+    product_path(tmp_path, "tau1", "-y", 40).unlink()
+    run_parameter_file(write(tmp_path, lightcurve_text("tau1", "42, 43")), log=quiet)
+    assert lightcurve_dumps(tmp_path, "tau1") == [42, 43]
+
+    # Other modes have their own light curve.
+    run_parameter_file(write(tmp_path, lightcurve_text("grey", "40, 41")), log=quiet)
+    assert lightcurve_dumps(tmp_path, "grey") == [40, 41]
+    assert not list((tmp_path / "out").glob("*.part"))
+
+
+def test_lightcurve_skips_products_of_another_dump_with_the_same_name(tmp_path):
+    bin_dir = make_run(tmp_path, series=((40, 1.0, 1.0), (41, 2.0, 1.1), (42, 3.0, 1.2)))
+    run_parameter_file(write(tmp_path, lightcurve_text("tau1", "40, 41")), log=quiet)
+    assert lightcurve_dumps(tmp_path, "tau1") == [40, 41]
+    # Dump 40 of this directory is another snapshot than the one behind the product.
+    write_snapshot(bin_dir / "TDETest.hydro_w.00040.bin", "../test_ideal_h.table",
+                   time=9.0, cycle=1, t_scale=1.0)
+    run_parameter_file(write(tmp_path, lightcurve_text("tau1", "41, 42")), log=quiet)
+    assert lightcurve_dumps(tmp_path, "tau1") == [41, 42]
+
+
+def test_reused_products_are_reported(tmp_path, capsys):
+    make_run(tmp_path)
+    path = write(tmp_path, lightcurve_text("tau1", "42", "skip_existing = true\n"))
+    assert cli.main([str(path)]) == 0
+    first = capsys.readouterr().out
+    assert first.count("L_bol,iso") == 2 and "(reused)" not in first
+    assert cli.main([str(path)]) == 0
+    second = capsys.readouterr().out
+    lines = [l for l in second.splitlines() if "L_bol,iso" in l]
+    assert len(lines) == 2 and all(l.endswith("(reused)") for l in lines)
+    assert lines[0].startswith("TDETest.hydro_w.00042.bin tau1 z: L_bol,iso = ")
+    computed = [l for l in first.splitlines() if "L_bol,iso" in l]
+    assert [l + " (reused)" for l in computed] == lines
+
+
+def test_threads_are_capped_at_the_numba_limit():
+    import numba
+
+    from athenak_rt.pipeline import configure_threads
+
+    cap = numba.config.NUMBA_NUM_THREADS
+    messages = []
+    assert configure_threads(cap + 100, messages.append) == cap
+    assert len(messages) == 1 and "at most" in messages[0] and str(cap) in messages[0]
+    messages.clear()
+    assert configure_threads(1, messages.append) == 1 and not messages
+    assert 1 <= configure_threads(None, messages.append) <= cap
+    configure_threads(cap, messages.append)

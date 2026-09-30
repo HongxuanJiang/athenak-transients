@@ -127,7 +127,8 @@ The format is that of AthenaK input files.
 * A block starts with its name in angle brackets on a line of its own, for example
   `<transfer>`, and holds the `key = value` lines up to the next block.  A block may
   appear more than once.
-* `#` starts a comment, also after a value.  Blank lines are ignored.
+* `#` starts a comment anywhere on a line, also after a value, so a path that contains
+  `#` cannot be given.  Blank lines are ignored.
 * Every key that is left out takes the default listed below.  Only `<input>/dump_dir` and
   `<input>/dumps` are required.
 * An unknown block, an unknown key, a key given twice, and a value that cannot be read
@@ -160,8 +161,8 @@ default) a missing dump stops the run, and the message lists the missing numbers
 `missing_dumps = skip` the missing numbers are printed as a warning and the other dumps
 are processed.  If none of the selected dumps exists the run always stops.
 
-Every selected dump is processed for every direction.  With more than one dump the run
-also writes a light curve (Sec. 4).
+Every selected dump is processed for every direction.  The run also writes a light curve
+when at least two dumps qualify (Sec. 4).
 
 ### Keys
 
@@ -199,11 +200,12 @@ also writes a light curve (Sec. 4).
 | `<tables>` | `eos_table` | `auto` or path | `auto` | EOS table, `auto` takes the path in the dump header (Sec. 1) |
 | | `mesa_high_t` | `auto` or path | `auto` | MESA/OPAL high-temperature opacity table, `auto` is `athenak_rt/data/gs98_z0.02_x0.7.data` |
 | | `mesa_low_t` | `auto` or path | `auto` | MESA low-temperature opacity table, `auto` is `athenak_rt/data/lowT_fa05_gs98_z0.02_x0.7.data` |
-| `<run>` | `threads` | `auto` or int | `auto` | Number of numba threads, `auto` uses all CPUs available to the process |
-| | `skip_existing` | bool | `false` | Keep per-dump products that already exist (restart, see Sec. 4) |
+| `<run>` | `threads` | `auto` or int | `auto` | Number of numba threads. `auto` uses all CPUs available to the process. Both are capped at numba's limit (`NUMBA_NUM_THREADS`, by default the number of CPUs of the machine), with a warning if the request is higher |
+| | `skip_existing` | bool | `false` | Keep per-dump products that already exist, if they match the settings and the input dump (restart, see Sec. 4) |
 
 The program prints one line per dump and direction with the bolometric luminosity and the
-name of the output file.
+name of the output file.  Products that are reused with `skip_existing` are listed in the
+same way, marked `(reused)`.
 
 ## 4. Outputs
 
@@ -212,8 +214,8 @@ Each run writes into `<output>/dir`.
 | File | Written | Content |
 |---|---|---|
 | `<dump stem>.rt_<mode>_<direction>.h5` | always, one per dump and direction | Maps, spectrum, bands, every setting, and the parameter file |
-| `rt_lightcurve_<mode>.csv` | more than one dump | Light curve, one row per dump, all directions |
-| `rt_lightcurve_<mode>.h5` | more than one dump | The same plus per-dump diagnostics and the spectra of all dumps |
+| `rt_lightcurve_<mode>.csv` | at least two dumps qualify | Light curve, one row per dump, all directions |
+| `rt_lightcurve_<mode>.h5` | at least two dumps qualify | The same plus per-dump diagnostics and the spectra of all dumps |
 
 For example, the file for the `-y` view of dump 327 is
 `TDEExternalLTEPrad.hydro_w.00327.rt_multifreq_-y.h5`.
@@ -222,14 +224,14 @@ For example, the file for the `-y` view of dump 327 is
 
 | Group and dataset | Modes | Content |
 |---|---|---|
-| root attributes | all | Every setting (`RTSettings.as_attributes()`), table paths (`eos_table_resolved`, `eos_table_in_header`), `snapshot_index`, `time_code`, `time_s`, `cycle`, `luminosity_bolometric_erg_s`, the normalization (`luminosity_normalization`, `luminosity_bolometric_formula`, `projected_luminosity_factor`), pixel area `area_pixel_cm2`, step `los_step_cm`, `valid_pixels`, `max_tau`, `median_temp_K`, `mean_temp_K`, `dfloor_code`, `density_threshold_code`, ray box `rt_box_code` and the raw box `auto_box_raw_code`, `bh_xyz_code`, `bh_mask_radius_code`, unit scales, `grid_storage_dtype`, `numba_threads`, `populations_used`, package version |
+| root attributes | all | Every setting (`RTSettings.as_attributes()`), table paths (`eos_table_resolved`, `eos_table_in_header`), `snapshot_index`, `time_code`, `time_s`, `cycle`, `luminosity_bolometric_erg_s`, the normalization (`luminosity_normalization`, `luminosity_bolometric_formula`, `projected_luminosity_factor`), pixel area `area_pixel_cm2`, step `los_step_cm`, `valid_pixels`, `max_tau`, `median_temp_K`, `mean_temp_K`, `dfloor_code`, `density_threshold_code`, ray box `rt_box_code` and the raw box `auto_box_raw_code`, `bh_xyz_code`, `bh_mask_radius_code`, unit scales, `grid_storage_dtype`, `numba_threads`, `populations_used`, the SHA-256 of the table files (`eos_table_sha256`, `mesa_high_t_sha256`, `mesa_low_t_sha256`), package version |
 | `parameters/parameter_file`, `parameters/resolved` | all | The parameter file as read, and the same file with every key and the value used (defaults filled in, paths absolute). The attribute `parameters.attrs["path"]` is the file's location. The resolved text is itself a valid parameter file. |
 | `image/image_u_code`, `image/image_v_code` | all | Pixel coordinates along the image columns and rows |
 | `maps/tau_total`, `photosphere_temp_K`, `photosphere_coord_code`, `valid`, `bolometric_pixel_luminosity_erg_s` | `tau1` | Photosphere maps |
 | `maps/intensity_erg_s_cm2_sr`, `tau_effective`, `effective_temp_K`, `valid`, `bolometric_pixel_luminosity_erg_s` | `grey`, `grey-therm` | Intensity and effective-temperature maps |
 | `maps/intensity_erg_s_cm2_sr`, `effective_temp_K`, `valid`, `bolometric_pixel_luminosity_erg_s` | `multifreq` | Frequency-integrated intensity and effective-temperature maps |
 | `spectra/energy_ev`, `frequency_hz`, `quadrature_weight_hz`, `lnu_erg_s_hz`, `nu_lnu_erg_s`, `lnu_row_erg_s_hz` | `multifreq` | Spectrum on the photon-energy grid. `lnu_row_erg_s_hz` is `L_nu` per image row. The frequency integral is a trapezoid rule in `ln(nu)`. |
-| `bands/label`, `category`, `frequency_hz`, `wavelength_nm`, `energy_ev`, `lnu_erg_s_hz`, `nu_lnu_erg_s` | `tau1`, `multifreq` with `bands = true` | `L_nu` in observation bands. `tau1` uses the blackbody at the photosphere temperature and adds `lnu_pixel_erg_s_hz` (per-pixel maps). `multifreq` interpolates the spectrum log-log. Bands outside the spectrum are 0. `grey` and `grey-therm` write no band data. |
+| `bands/label`, `category`, `frequency_hz`, `wavelength_nm`, `energy_ev`, `lnu_erg_s_hz`, `nu_lnu_erg_s` | `tau1`, `multifreq` with `bands = true` | `L_nu` in observation bands. `tau1` uses the blackbody at the photosphere temperature and adds `lnu_pixel_erg_s_hz` (per-pixel maps). `multifreq` interpolates the spectrum log-log. A band is 0 if it lies outside the spectrum or if either of the two spectrum points around it is not positive. `grey` and `grey-therm` write no band data. |
 
 The bands are `nir_J`, `nir_H`, `nir_K` (1250, 1650, 2200 nm), `optical_u`, `_g`, `_r`,
 `_i` (355, 475, 622, 763 nm), `uv_UVW1`, `uv_UVM2`, `uv_UVW2`, `uv_FUV150` (260, 224.6,
@@ -237,8 +239,9 @@ The bands are `nir_J`, `nir_H`, `nir_K` (1250, 1650, 2200 nm), `optical_u`, `_g`
 
 ### Light curve
 
-When more than one dump is selected, `rt_lightcurve_<mode>.csv` is a plain CSV file with
-a header line and one row per dump in dump order.  It has no comment lines.
+`rt_lightcurve_<mode>.csv` is a plain CSV file with a header line and one row per dump in
+dump order.  It has no comment lines.  It contains every qualifying dump of the output
+directory, see below.
 
 | Column | Unit | Content |
 |---|---|---|
@@ -270,17 +273,44 @@ units for the example decks).
 | `parameters/parameter_file`, `parameters/resolved` | | As in the per-dump files |
 
 Both files are rewritten after each dump, so a light curve can be inspected while a long
-run is going.  They are assembled from the per-dump products.
+run is going.  They are assembled from the per-dump products and hold every dump, not
+only those of the current run.  A product enters the light curve if it is in the output
+directory, has the same file-name prefix (`<basename>.<variable>`) and mode, exists for
+all directions of the run, and passes the test of `skip_existing` (below): the same settings
+and tables and, where the dump is in `dump_dir`, the same time and cycle.  Rows are ordered
+by dump number.  The files are written once at least two dumps qualify, so a run of one
+dump next to earlier matching products updates the light curve, and a run of one dump in an
+empty directory writes none.  A light curve that no longer matches the current settings is
+not deleted, but it is not updated until two dumps qualify.
 
 ### Restarting a run
 
 Every product is first written under a temporary name ending in `.part` and renamed when it
 is complete, so an interrupted run leaves no truncated product.  With
 `<run>/skip_existing = true` a (dump, direction) whose product exists is not computed
-again.  The settings stored in the product are compared with the current ones (every
-setting except the output directory, the thread count and the compression), and the run
-stops if they differ, so a product made with other settings is never reused silently.
-Reused products enter the light curve as if they had been computed.
+again.  A product is reused only if it matches the current run, and the run stops before
+computing anything if an existing product does not, so a product made with other settings
+or from another dump is never reused silently.  The comparison covers the following.
+
+* The settings that enter the product of the mode.  The output directory, the thread
+  count and the compression are never compared.  Settings that the mode does not read are
+  ignored.
+
+  | Mode | Not compared |
+  |---|---|
+  | `tau1` | `tau_stop`, `nfreq`, `emin_ev`, `emax_ev`, `scattering`, `populations` |
+  | `grey` | `tau_photosphere`, `nfreq`, `emin_ev`, `emax_ev`, `scattering`, `populations`, the bands |
+  | `grey-therm` | `tau_photosphere`, `nfreq`, `emin_ev`, `emax_ev`, `scattering`, the bands |
+  | `multifreq` | `tau_photosphere`, the MESA tables |
+* The input dump: `snapshot_file`, `snapshot_index`, `time_code` and `cycle` stored in the
+  product against the dump of the current run.  A new `dump_dir` whose dump has the same
+  name but another time or cycle is refused.
+* The table files, by SHA-256 (`eos_table_sha256`, `mesa_*_sha256`), so moving the
+  repository or the table does not invalidate a product.  Products from versions that did
+  not store the hashes are compared by path as before.
+
+Reused products are reported on the command line and enter the light curve as if they had
+been computed.
 
 ### Reading the results
 
@@ -313,9 +343,16 @@ point `dump_dir` at a run of your own.  The example FID chain of
 This is `athenak_rt/examples/tde_snapshot.rtin`.
 
 ```
-<input>/dump_dir.  Relative paths are relative to this file's
-# directory; ~ and $VARIABLES are expanded.  A key that is left out takes the
-# default given in its comment; "auto" asks for the derived value.
+# athenak_rt parameter file: one dump, the settings of the paper's Fig. (last HR
+# snapshot, t/P_mb = 2.93, multifrequency transfer seen from +z and from -y).
+#
+# Copy this file to the directory that should receive the output, set
+# <input>/dump_dir, and run from the AthenaK repository root (or with the root on
+# PYTHONPATH)
+#     python3 -m athenak_rt /path/to/work/tde_snapshot.rtin
+# Relative paths are relative to this file's directory; ~ and $VARIABLES are
+# expanded.  A key that is left out takes the default given in its comment;
+# "auto" asks for the derived value.
 
 <input>
 dump_dir      = /path/to/run/bin    # directory with the .bin dumps (required)
@@ -403,17 +440,17 @@ snapshot example are
 ```
 <input>
 dumps         = 300:327             # dumps 300 to 327 inclusive; 300:327:3 takes every third
-missing_dumps = skip                # warn about missing dumps and process the others
+missing_dumps = skip                # error | skip (warn and process the others)
 
 <output>
-dir = rt_lightcurve
+dir              = rt_lightcurve    # output directory
 
 <image>
-image_size = 512                    # the paper's figure used 1024; 512 is 8 times cheaper
-los_steps  = 512
+image_size                = 512     # the paper's figure used 1024; 512 is 8 times cheaper
+los_steps                 = 512     # samples along the line of sight
 
 <run>
-skip_existing = true                # an interrupted run continues where it stopped
+skip_existing = true                # reuse per-dump outputs made with the same settings
 ```
 
 The run processes every dump from both directions and writes
@@ -434,8 +471,10 @@ config = athenak_rt.load_parameter_file("tde_snapshot.rtin")    # parse and chec
 print(config.settings, config.directions, config.find_dumps())
 ```
 
-`athenak_rt.run(settings, dumps, directions)` runs an `athenak_rt.RTSettings` object on a
-list of dump paths, and `athenak_rt.process_snapshot` handles one dump and one direction.
+`athenak_rt.run(settings, dumps, log=print, *, directions=None, skip_existing=False,
+provenance=None)` runs an `athenak_rt.RTSettings` object on a list of dump paths
+(`directions` defaults to the one in `settings`), and `athenak_rt.process_snapshot`
+handles one dump and one direction.
 The kernels in `athenak_rt.transfer` accept any `(nz, ny, nx)` cube of density in g/cm^3
 and temperature in K.
 
@@ -452,7 +491,8 @@ and temperature in K.
   1024 samples, at the storage precision used for the paper's production size.
 * The cost grows with the number of pixels times `los_steps`, and for `multifreq` with
   the number of photon energies.  Each direction is a separate pass over the dump.  The
-  kernels use numba threads over image rows, so `<run>/threads` should match the cores
+  `multifreq` kernel distributes the image rows over the numba threads, and the `tau1`
+  and grey kernels distribute the pixels, so `<run>/threads` should match the cores
   available.  The first call includes compilation.
 * Reading a large dump is limited by the file system, because the density and internal
   energy of every MeshBlock have to be read.  Copy the dumps to fast storage if

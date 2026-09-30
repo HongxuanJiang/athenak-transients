@@ -11,8 +11,9 @@ The format is that of AthenaK input files::
     directions = z, -y
 
 Blocks are written in angle brackets, every other line is ``key = value`` and
-``#`` starts a comment.  Unknown blocks or keys, keys given twice and values
-that cannot be read are errors.  A key that is left out takes its default
+``#`` starts a comment anywhere on a line (a path containing ``#`` cannot be
+given).  Unknown blocks or keys, keys given twice and values that cannot be
+read are errors.  A key that is left out takes its default
 (``SCHEMA`` below).  Relative paths are relative to the directory of the
 parameter file; ``~`` and ``$VARIABLES`` are expanded.
 """
@@ -29,7 +30,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from . import __version__
 from .bands import DEFAULT_OBSERVATION_BANDS
-from .config import GRID_DTYPES, MODES, POPULATIONS, RTSettings
+from .config import GRID_DTYPES, MODES, POPULATIONS, RTSettings, SettingsError
 from .opacity import DEFAULT_MESA_HIGH_T, DEFAULT_MESA_LOW_T
 from .snapshot import BoxSettings
 
@@ -149,7 +150,8 @@ SCHEMA: Dict[str, Dict[str, Key]] = {
 _TRUE = {"true", "yes", "on", "1"}
 _FALSE = {"false", "no", "off", "0"}
 _BLOCK_RE = re.compile(r"<\s*([A-Za-z_][A-Za-z0-9_]*)\s*>")
-_INT_RE = re.compile(r"\d+")
+_INT_RE = re.compile(r"[0-9]+")  # ASCII digits only
+MAX_DUMP_SELECTION = 1_000_000
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +165,8 @@ def parse_dump_selection(text: str) -> Optional[Tuple[int, ...]]:
     """Dump numbers selected by ``text``, sorted and unique; None for ``all``.
 
     Items are separated by commas or blanks: ``N``, ``A:B`` (A to B inclusive)
-    or ``A:B:STEP``.
+    or ``A:B:STEP``.  A selection of more than ``MAX_DUMP_SELECTION`` dumps is
+    refused (use ``all`` to take every dump present).
     """
     text = text.strip()
     if text.lower() == "all":
@@ -189,7 +192,17 @@ def parse_dump_selection(text: str) -> Optional[Tuple[int, ...]]:
             raise ValueError(f"range {item!r} needs a step >= 1")
         if stop < start:
             raise ValueError(f"range {item!r} ends before it starts")
+        if (stop - start) // step + 1 > MAX_DUMP_SELECTION:
+            raise ValueError(
+                f"range {item!r} selects more than {MAX_DUMP_SELECTION} dumps; "
+                "narrow the range or use all"
+            )
         selected.update(range(start, stop + 1, step))
+        if len(selected) > MAX_DUMP_SELECTION:
+            raise ValueError(
+                f"the selection has more than {MAX_DUMP_SELECTION} dumps; "
+                "narrow it or use all"
+            )
     return tuple(sorted(selected))
 
 
@@ -231,7 +244,14 @@ def parse_directions(text: str) -> Tuple[str, ...]:
     return tuple(out)
 
 
+def _ascii_number(text: str, what: str) -> None:
+    """Reject underscores and non-ASCII digits, which int() and float() accept."""
+    if not text.isascii() or "_" in text:
+        raise ValueError(what)
+
+
 def _parse_float(text: str) -> float:
+    _ascii_number(text, "expected a number")
     try:
         value = float(text)
     except ValueError:
@@ -242,6 +262,7 @@ def _parse_float(text: str) -> float:
 
 
 def _parse_int(text: str) -> int:
+    _ascii_number(text, "expected an integer")
     try:
         return int(text)
     except ValueError:
@@ -303,6 +324,8 @@ def _convert(spec: Key, text: str, base_dir: Path):
 
 
 def _format_value(spec: Key, value) -> str:
+    if spec.kind == "dumps":  # None means ``all`` here, not ``auto``
+        return format_dump_selection(value)
     if value is None:
         return "auto"
     if spec.kind == "bool":
@@ -313,8 +336,6 @@ def _format_value(spec: Key, value) -> str:
         return ", ".join(value)
     if spec.kind == "box":
         return ", ".join(repr(float(v)) for v in value)
-    if spec.kind == "dumps":
-        return format_dump_selection(value)
     return str(value)
 
 
@@ -378,6 +399,19 @@ def parse_blocks(text: str, source: str = "<string>") -> Dict[str, Dict[str, Tup
             )
         blocks[current][key] = (value, lineno)
     return blocks
+
+
+def _where(raw, source: str, block: str, key: str) -> str:
+    """``source, line N`` if the key was given in the file, else just ``source``."""
+    entry = raw.get(block, {}).get(key)
+    return f"{source}, line {entry[1]}" if entry else source
+
+
+# RTSettings field -> (block, key) for range errors reported by validate().
+_FIELD_KEYS = {"direction": ("transfer", "directions")}
+for _block, _keys in SCHEMA.items():
+    for _key in _keys:
+        _FIELD_KEYS.setdefault(_key, (_block, _key))
 
 
 @dataclass
@@ -540,6 +574,14 @@ def parse_parameters(
     for direction in directions:
         try:
             replace(settings, direction=direction).validate()
+        except SettingsError as exc:
+            where = source
+            for name in exc.fields:
+                block, key = _FIELD_KEYS.get(name, ("", name))
+                if key in raw.get(block, {}):
+                    where = _where(raw, source, block, key)
+                    break
+            raise ParameterError(f"{where}: {exc}") from None
         except RuntimeError as exc:
             raise ParameterError(f"{source}: {exc}") from None
     for block, key in (
@@ -550,12 +592,16 @@ def parse_parameters(
     ):
         value = values[block][key]
         if value is not None and value < 0.0:
-            raise ParameterError(f"{source}: <{block}>/{key} must be >= 0")
+            raise ParameterError(
+                f"{_where(raw, source, block, key)}: <{block}>/{key} must be >= 0"
+            )
     if img["auto_box_min_width"] <= 0.0:
-        raise ParameterError(f"{source}: <image>/auto_box_min_width must be > 0")
+        where = _where(raw, source, "image", "auto_box_min_width")
+        raise ParameterError(f"{where}: <image>/auto_box_min_width must be > 0")
     for name in ("basename", "variable"):
         if "/" in inp[name] or not inp[name]:
-            raise ParameterError(f"{source}: <input>/{name} must be a plain file-name part")
+            where = _where(raw, source, "input", name)
+            raise ParameterError(f"{where}: <input>/{name} must be a plain file-name part")
 
     return RunConfig(
         settings=settings,
@@ -587,7 +633,7 @@ def run_parameter_file(path: os.PathLike, log: Callable[[str], None] = print):
     """Process every selected dump and direction of a parameter file.
 
     Returns the ``RTResult`` of every (dump, direction) that was computed
-    (dumps reused through ``<run>/skip_existing`` are not included).
+    (products reused through ``<run>/skip_existing`` are only logged).
     """
     config = load_parameter_file(path)
     snapshots = config.find_dumps(log=log)
@@ -596,8 +642,8 @@ def run_parameter_file(path: os.PathLike, log: Callable[[str], None] = print):
     return run(
         config.settings,
         snapshots,
-        config.directions,
+        log,
+        directions=config.directions,
         skip_existing=config.skip_existing,
         provenance=config.provenance(),
-        log=log,
     )

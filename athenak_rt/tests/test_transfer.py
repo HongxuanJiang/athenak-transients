@@ -354,3 +354,26 @@ def test_grey_therm_is_darker_than_formal_when_scattering_dominates():
     therm, tau_t = integrate_grey_rays(rho, temp, *args, DIRECTION_Z, True, ds, True, 1e9)
     assert tau_t[0, 0] < tau_f[0, 0]
     assert therm[0, 0] < formal[0, 0]
+
+
+def test_band_luminosity_is_zero_across_spectral_zeros():
+    from athenak_rt.bands import band_lnu_from_spectrum
+
+    nu = np.array([1.0, 2.0, 4.0, 8.0, 16.0])
+    bands = np.array([0.5, 1.0, 1.5, 3.0, 6.0, 8.0, 12.0, 16.0, 20.0])
+    # strictly positive: log-log interpolation, 0 outside the range
+    lnu = np.array([1.0, 4.0, 16.0, 64.0, 256.0])  # power law nu^2
+    out = band_lnu_from_spectrum(nu, lnu, bands)
+    expected = np.where((bands >= 1.0) & (bands <= 16.0), bands**2, 0.0)
+    assert np.allclose(out, expected, rtol=1e-12, atol=0.0)
+    # an interior zero: the two brackets that contain it give 0, node values stay
+    lnu = np.array([1.0, 4.0, 0.0, 64.0, 256.0])
+    out = band_lnu_from_spectrum(nu, lnu, bands)
+    assert out[0] == 0.0 and out[1] == pytest.approx(1.0, rel=1e-12)
+    assert out[2] == pytest.approx(2.25, rel=1e-12)  # bracketed by 1 and 2
+    assert out[3] == 0.0 and out[4] == 0.0  # 3 and 6 lie next to the zero at nu = 4
+    assert out[5] == pytest.approx(64.0, rel=1e-12) and out[6] == pytest.approx(144.0, rel=1e-12)
+    assert out[7] == pytest.approx(256.0, rel=1e-12) and out[8] == 0.0
+    # zero at the ends and no positive point
+    assert band_lnu_from_spectrum(nu, np.array([0.0, 4.0, 16.0, 64.0, 256.0]), [1.5])[0] == 0.0
+    assert band_lnu_from_spectrum(nu, np.zeros(5), bands).tolist() == [0.0] * 9

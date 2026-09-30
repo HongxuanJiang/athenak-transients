@@ -17,6 +17,14 @@ POPULATIONS = ("eos", "saha")
 DEFAULT_POPULATIONS = "eos"
 
 
+class SettingsError(RuntimeError):
+    """An invalid setting; ``fields`` names the RTSettings fields concerned."""
+
+    def __init__(self, message: str, fields: Tuple[str, ...] = ()):
+        super().__init__(message)
+        self.fields = tuple(fields)
+
+
 @dataclass
 class RTSettings:
     """Everything that influences a run; every field is recorded in the HDF5 output."""
@@ -63,30 +71,46 @@ class RTSettings:
 
     def validate(self) -> None:
         if self.mode not in MODES:
-            raise RuntimeError(f"Unknown mode {self.mode!r}; choose from {MODES}.")
+            raise SettingsError(
+                f"Unknown mode {self.mode!r}; choose from {MODES}.", ("mode",)
+            )
         if (
             self.direction.lstrip("-") not in {"x", "y", "z"}
             or self.direction.count("-") > 1
         ):
-            raise RuntimeError(f"Unsupported direction {self.direction!r}.")
+            raise SettingsError(
+                f"Unsupported direction {self.direction!r}.", ("direction",)
+            )
         if self.image_size < 2 or self.los_steps < 2:
-            raise RuntimeError("image_size and los_steps must both be >= 2.")
+            raise SettingsError(
+                "image_size and los_steps must both be >= 2.", ("image_size", "los_steps")
+            )
         if self.populations not in POPULATIONS:
-            raise RuntimeError(
-                f"populations must be one of {POPULATIONS}, got {self.populations!r}."
+            raise SettingsError(
+                f"populations must be one of {POPULATIONS}, got {self.populations!r}.",
+                ("populations",),
             )
         if self.grid_dtype not in GRID_DTYPES:
-            raise RuntimeError(f"grid_dtype must be one of {GRID_DTYPES}.")
+            raise SettingsError(
+                f"grid_dtype must be one of {GRID_DTYPES}.", ("grid_dtype",)
+            )
         if self.tau_photosphere <= 0.0 or self.tau_stop <= 0.0:
-            raise RuntimeError("tau_photosphere and tau_stop must be positive.")
+            raise SettingsError(
+                "tau_photosphere and tau_stop must be positive.",
+                ("tau_photosphere", "tau_stop"),
+            )
         if self.density_threshold_factor < 0.0:
-            raise RuntimeError("density_threshold_factor must be >= 0.")
+            raise SettingsError(
+                "density_threshold_factor must be >= 0.", ("density_threshold_factor",)
+            )
         if self.nfreq < 2:
-            raise RuntimeError("nfreq must be >= 2.")
+            raise SettingsError("nfreq must be >= 2.", ("nfreq",))
         if not 0.0 < self.emin_ev < self.emax_ev:
-            raise RuntimeError("The photon energies need 0 < emin_ev < emax_ev.")
+            raise SettingsError(
+                "The photon energies need 0 < emin_ev < emax_ev.", ("emin_ev", "emax_ev")
+            )
         if self.threads is not None and self.threads < 1:
-            raise RuntimeError("threads must be >= 1.")
+            raise SettingsError("threads must be >= 1.", ("threads",))
 
     # Settings whose names would collide with the resolved values the output records.
     _ATTRIBUTE_RENAMES = {

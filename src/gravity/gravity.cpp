@@ -729,7 +729,12 @@ void Gravity::LedgerPotentialMoments(Real &phi_int, Real &mass, Real &volume) co
 
 void Gravity::AccumulateLATBoundaryFlux(Real final_dt) {
   if (!lat_boundary_flux_diagnostics) return;
-  if (!energy_window_open || !phi_valid || !std::isfinite(final_dt) || final_dt < 0) {
+  // The ledger reads Hydro's face fluxes below.  Its one caller is Hydro's source-term
+  // task, and BeginLATEnergyWindow refuses to open a window without Hydro, so an MHD run
+  // (self-gravity included) fails there first; the test keeps this function from
+  // dereferencing a null Hydro on its own.
+  if (!energy_window_open || !phi_valid || !std::isfinite(final_dt) || final_dt < 0 ||
+      pmy_pack->phydro == nullptr) {
     throw std::runtime_error("Boundary transport requires a valid active LAT energy window");
   }
   const auto *pm = pmy_pack->pmesh;

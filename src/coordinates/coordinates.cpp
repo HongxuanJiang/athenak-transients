@@ -17,6 +17,7 @@
 #include "cartesian_ks.hpp"
 #include "coordinates.hpp"
 #include "cell_locations.hpp"
+#include "mesh/mb_storage.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
 
@@ -211,8 +212,12 @@ Coordinates::Coordinates(ParameterInput *pin, MeshBlockPack *ppack) :
         coord_data.tdamp = pin->GetOrAddReal("coord","tdamp",1.0);
       }
 
-      // boolean masks allocation
+      // boolean masks allocation.  Coordinates is rebuilt at every regrid, so under
+      // <mesh_refinement>/preallocate the masks take the fixed reserve like every other
+      // per-MeshBlock array (mb_storage.hpp) instead of a new extent each time.  Every
+      // kernel that reads or writes them loops over nmb_thispack.
       int nmb = ppack->nmb_thispack;
+      if (MeshBlockStorageReserve() > 0) nmb = MeshBlockStorageCapacity(nmb);
       auto &indcs = pmy_pack->pmesh->mb_indcs;
       int ncells1 = indcs.nx1 + 2*(indcs.ng);
       int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;

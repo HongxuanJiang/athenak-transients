@@ -191,8 +191,19 @@ TaskStatus MHD::SaveMHDState(Driver *pdrive, int stage) {
           saved_dt(m) = pack_dt;
         });
 
-    Kokkos::deep_copy(DevExeSpace(), wsaved, w0);
-    Kokkos::deep_copy(DevExeSpace(), bccsaved, bcc0);
+    // Live blocks only: wsaved/bccsaved are sized by ResizeMeshBlockStorage's capacity
+    // policy while w0/bcc0 keep the constructor's max(nmb_thispack, nmb_maxperrank),
+    // so the two block extents differ in general and a whole-view deep_copy throws.
+    const auto live = Kokkos::make_pair(0, nwork);
+    Kokkos::deep_copy(DevExeSpace(),
+        Kokkos::subview(wsaved, live, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL,
+                        Kokkos::ALL),
+        Kokkos::subview(w0, live, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL));
+    Kokkos::deep_copy(DevExeSpace(),
+        Kokkos::subview(bccsaved, live, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL,
+                        Kokkos::ALL),
+        Kokkos::subview(bcc0, live, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL,
+                        Kokkos::ALL));
     wbcc_saved_dt.template modify<DevExeSpace>();
   }
   return TaskStatus::complete;

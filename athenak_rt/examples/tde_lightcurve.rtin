@@ -3,9 +3,9 @@
 #
 # Every dump of the selection is processed for every direction.  Besides one
 # HDF5 file per dump and direction, the run writes rt_lightcurve_multifreq.csv
-# and rt_lightcurve_multifreq.h5 in <output>/dir, one row per dump, rewritten
-# after each dump.  With skip_existing = true an interrupted run continues
-# where it stopped.
+# and rt_lightcurve_multifreq.h5 in <output>/dir, one row per dump (earlier
+# products there that match these settings are included), rewritten after each
+# dump.  With skip_existing = true an interrupted run continues where it stopped.
 #
 # Run from the AthenaK repository root with
 #     python3 -m athenak_rt /path/to/work/tde_lightcurve.rtin

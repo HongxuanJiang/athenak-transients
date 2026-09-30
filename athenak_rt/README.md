@@ -31,11 +31,13 @@ projected, isotropic-equivalent values for the chosen line of sight
 (L = 4 pi sum I dA; for a blackbody pixel L_bol = 4 sigma T^4 dA).
 `T_eff = (pi I / sigma)^{1/4}` per pixel.
 
-Every mode uses the same cell selection (`rho_code > factor * dfloor`, strict,
-default factor 10, both for the bounding box and the resampling), the same
-padded bounding box, the same black-hole excision mask (radius
+Every mode uses the same cell selection (strict `rho_code > threshold`, default factor
+10), the same padded bounding box, the same black-hole excision mask (radius
 `<problem>/bh_excise_radius` from the header) and the same MESA Rosseland
-opacity.  The integrals of the `grey*`/`multifreq` modes stop once the optical
+opacity.  The threshold differs slightly between the two uses.  The resampling takes
+`factor * dfloor` (`<hydro>/dfloor`), and the bounding box takes
+`factor * max(dfloor, <problem>/rho_floor)`.  An explicit `density_threshold_code` replaces
+both.  The integrals of the `grey*`/`multifreq` modes stop once the optical
 depth exceeds `tau_stop` (30).
 
 ## Usage
@@ -49,7 +51,8 @@ python -m athenak_rt PARAMETER_FILE
 ```
 
 The parameter file is the only argument (besides `--help` and `--version`).  It uses the
-AthenaK input format: `<block>` lines, `key = value` lines, `#` comments.  Unknown blocks
+AthenaK input format: `<block>` lines, `key = value` lines, `#` comments.  A `#` starts
+a comment anywhere on a line, so a path that contains `#` cannot be given.  Unknown blocks
 or keys, keys given twice and unreadable values are errors that name the line.  Keys
 left out take their defaults; only `<input>/dump_dir` and `<input>/dumps` are required.
 Relative paths are relative to the parameter file's directory.  A minimal file:
@@ -76,8 +79,11 @@ key with a comment.
 | `<transfer>` | `mode` (`multifreq`), `directions` (`z`), `tau_photosphere` (1.0), `tau_stop` (30.0), `nfreq` (73), `emin_ev` (0.1), `emax_ev` (1000.0), `scattering` (`true`), `populations` (`eos`, or `saha`) |
 | `<image>` | `image_size` (1024), `los_steps` (1024), `grid_dtype` (`auto`, `float32`, `float64`), `box` (`auto` or six numbers), `auto_box_padding_code` (0.25), `auto_box_padding_fraction` (0.1), `auto_box_min_width` (1.0), `auto_box_clip_to_mesh` (`true`) |
 | `<selection>` | `density_threshold_factor` (10.0), `density_threshold_code` (`auto`), `bh_mask` (`true`), `bh_mask_radius` (`auto`: header value) |
-| `<tables>` | `eos_table` (`auto`: `<hydro>/table` of the dump header, also tried relative to the run directory, the parent of `dump_dir`, and in `$ATHENAK_EOS_TABLE_DIR`), `mesa_high_t`, `mesa_low_t` (`auto`: the tables in `data/`, OPAL GS98 X=0.7 Z=0.02 and Ferguson et al. 2005 low-T; see `data/NOTICE`) |
-| `<run>` | `threads` (`auto`: all CPUs), `skip_existing` (`false`) |
+| `<tables>` | `eos_table` (`auto`: `<hydro>/table` of the dump header, also tried relative to the run directory (the parent of `dump_dir`), relative to `dump_dir`, and in `$ATHENAK_EOS_TABLE_DIR`), `mesa_high_t`, `mesa_low_t` (`auto`: the tables in `data/`, OPAL GS98 X=0.7 Z=0.02 and Ferguson et al. 2005 low-T; see `data/NOTICE`) |
+| `<run>` | `threads` (`auto`: all CPUs available to the process, capped at numba's `NUMBA_NUM_THREADS` with a warning, as is an explicit larger value), `skip_existing` (`false`) |
+
+The `multifreq` kernel distributes the image rows over the threads.  The `tau1` and grey
+kernels distribute the pixels.
 
 `grid_dtype = auto` stores the resampled cube in float32 once any axis reaches 1024
 samples, as in the production runs, and in float64 below.  The full table with types and
@@ -85,7 +91,7 @@ meanings is in `docs/athenak_rt.md`.
 
 The Python API mirrors the parameter file: `athenak_rt.run_parameter_file(path)`,
 `athenak_rt.load_parameter_file(path)` (returns the settings, directions and dump list),
-`athenak_rt.run(settings, dumps, directions)` and `athenak_rt.process_snapshot(...)`; the
+`athenak_rt.run(settings, dumps, log=print, *, directions=None, skip_existing=False, provenance=None)` and `athenak_rt.process_snapshot(...)`; the
 kernels in `athenak_rt.transfer` can be used directly on any `(nz, ny, nx)` cube of
 (rho [g/cm^3], T [K]).
 
@@ -118,19 +124,29 @@ bands/                                      label, category, frequency_hz, wavel
 ```
 
 Band L_nu is the blackbody value at T_ph in `tau1` and a log-log interpolation
-of the multifrequency spectrum in `multifreq`.
+of the multifrequency spectrum in `multifreq`.  A `multifreq` band is 0 if it lies outside
+the spectrum or if either spectrum point next to it is not positive.
 
-With more than one dump the run also writes, after every dump, the light curve
+The run also writes, after every dump, the light curve
 `rt_lightcurve_<mode>.csv`: plain CSV, one row per dump, columns `dump, cycle,
 time_code, time_s, L_bol_<dir>...` and, with band products, `nuLnu_<band>_<dir>...`
 (erg/s; `-y` is written `minus_y`).  `rt_lightcurve_<mode>.h5` holds the same rows
 plus per-direction diagnostics (`valid_pixels`, `max_tau`, temperatures, BH position),
 the band `L_nu` and the multifrequency spectra of all dumps, and the parameter file.
+The rows are the dumps of the run and every other dump in the output directory with the
+same file-name prefix and mode whose products exist for all directions of the run and
+match its settings and tables (the same test as `skip_existing`, below), so partial runs
+add to the light curve.  The files are written once at least two dumps qualify.
 
 Products are written as `*.part` and renamed when complete.  With
-`<run>/skip_existing = true` existing products are reused when their recorded settings
-match (the run stops otherwise), so an interrupted light-curve run can be resubmitted
-unchanged.
+`<run>/skip_existing = true` an existing product is reused when it matches the run, and the
+run stops before computing anything otherwise.  The comparison covers the settings that
+enter the product of the mode (not the output directory, threads or compression, nor
+transfer parameters the mode does not read, such as `nfreq` in `tau1`), the input dump
+(`snapshot_file`, `snapshot_index`, `time_code` and `cycle`), and the SHA-256 of the EOS and
+MESA tables (`eos_table_sha256`, `mesa_*_sha256`; products from older versions without
+hashes are compared by table path).  An interrupted light-curve run can therefore be
+resubmitted unchanged.  Reused products are listed on the command line, marked `(reused)`.
 
 ## Layout
 

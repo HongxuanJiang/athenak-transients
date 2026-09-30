@@ -698,8 +698,11 @@ void RefineBHPosition(MeshBlockPack *pmbp) {
   const Real bh_vz = bh_vz_global;
   const bool do_stream = stream_shell_enable_global;
   const bool do_unbound = unbound_refine_global;
+  // The relative tolerance keeps a product that is an integer up to round-off (for
+  // example 0.07*100 = 7.000000000000001) from rounding up to the next cell.
   const int unbound_min_cells = std::max(1, static_cast<int>(
-      std::ceil(unbound_refine_fill_frac_global * static_cast<Real>(nkji))));
+      std::ceil(unbound_refine_fill_frac_global * static_cast<Real>(nkji) *
+                (1.0 - 1.0e-12))));
 
   DvceArray1D<Real> block_rho_max_d("tde_amr_block_rho_max", nmb_alloc);
   DvceArray1D<int> block_unbound_d("tde_amr_block_unbound", nmb_alloc);

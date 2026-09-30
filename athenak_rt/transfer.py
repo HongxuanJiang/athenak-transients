@@ -55,6 +55,13 @@ from .opacity import (
 
 _NO_LNF = np.zeros((5, 2, 2))  # placeholder when the Saha solver is used
 
+# Population arguments (use_table, lr0, dlr, lt0, dlt, lnf, nh_per_rho, nhe_per_rho)
+# for the Saha solver and for the modes without ionization.  They have the same
+# types as the EOS-table arguments, so every mode shares one compiled (and cached)
+# specialization.  Omitting them would make numba key the cache on object ids and
+# recompile in every new process.
+SAHA_POPULATION_ARGS = (False, 0.0, 1.0, 0.0, 1.0, _NO_LNF, 0.0, 0.0)
+
 DIRECTION_X = 0
 DIRECTION_Y = 1
 DIRECTION_Z = 2

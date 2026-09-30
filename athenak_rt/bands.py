@@ -52,19 +52,26 @@ def band_lnu_from_spectrum(
 ) -> np.ndarray:
     """Log-log linear interpolation of a spectrum onto the band frequencies.
 
-    Bands outside the tabulated range, or where the spectrum is not positive,
-    get 0.
+    A band gets 0 if it lies outside the tabulated range or if either spectrum
+    point that brackets it is not positive (a band that coincides with a
+    tabulated frequency needs only that point to be positive).
     """
     nu = np.asarray(frequencies_hz, dtype=np.float64)
     lnu = np.asarray(lnu_erg_s_hz, dtype=np.float64)
     out = np.zeros(len(band_frequencies_hz), dtype=np.float64)
     positive = lnu > 0.0
-    if np.count_nonzero(positive) < 2:
+    if not np.any(positive):
         return out
     log_nu = np.log(nu[positive])
     log_lnu = np.log(lnu[positive])
     for i, target in enumerate(band_frequencies_hz):
-        if target < nu[positive][0] or target > nu[positive][-1]:
+        if target < nu[0] or target > nu[-1]:
             continue
-        out[i] = float(np.exp(np.interp(np.log(target), log_nu, log_lnu)))
+        upper = int(np.searchsorted(nu, target))  # nu[upper - 1] < target <= nu[upper]
+        if nu[upper] == target:
+            usable = bool(positive[upper])
+        else:
+            usable = bool(positive[upper - 1] and positive[upper])
+        if usable:
+            out[i] = float(np.exp(np.interp(np.log(target), log_nu, log_lnu)))
     return out

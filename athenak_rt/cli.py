@@ -9,6 +9,7 @@ from typing import Optional, Sequence
 
 from . import __version__
 from .params import SCHEMA, ParameterError, run_parameter_file
+from .pipeline import result_line
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,7 +49,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
     for result in results:
         print(
-            f"{result.snapshot.name} {result.mode} {result.direction}: "
-            f"L_bol,iso = {result.luminosity:.10e} erg/s -> {result.hdf5_path}"
+            result_line(
+                result.snapshot.name,
+                result.mode,
+                result.direction,
+                result.luminosity,
+                result.hdf5_path,
+            )
         )
     return 0
