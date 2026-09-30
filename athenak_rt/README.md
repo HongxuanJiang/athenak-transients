@@ -19,7 +19,7 @@ only replaces their hard-coded configuration with a command line.
 | `tau1`       | grey Rosseland (MESA/OPAL) optical depth; the first cell with tau >= tau_ph is the photosphere and emits 4 sigma T_ph^4 dA (paper, Sec. 9) | T_ph, tau, photosphere position, band L_nu (blackbody) |
 | `grey`       | grey formal solution I = int B(T) e^{-tau_R} dtau_R                                                   | I, T_eff, tau                        |
 | `grey-therm` | grey with scattering/absorption split: kappa_s = sigma_T n_e / rho, kappa_a = kappa_R - kappa_s, dtau* = sqrt(a_a (a_a + a_s)) ds, source weight 2 sqrt(eps)/(1 + sqrt(eps)), eps = a_a/(a_a + a_s) | I, T_eff, tau*                       |
-| `multifreq`  | (default) H/He continuum: Saha ionization, free-free + bound-free (H n <= 6, He I, He II) absorption with stimulated emission, electron scattering through the same thermalization-depth treatment per frequency, on a log-spaced photon-energy grid (default 73 points, 0.1–1000 eV) | I, T_eff, L_nu(E), band L_nu         |
+| `multifreq`  | (default) H/He continuum: populations from the EOS table (`--populations saha` for ideal Saha), free-free + bound-free (H n <= 6, He I, He II) absorption with stimulated emission, electron scattering through the same thermalization-depth treatment per frequency, on a log-spaced photon-energy grid (default 73 points, 0.1–1000 eV) | I, T_eff, L_nu(E), band L_nu         |
 
 `--no-scattering` turns `multifreq` into pure absorption.  All luminosities are
 projected, isotropic-equivalent values for the chosen line of sight
@@ -49,6 +49,10 @@ python -m athenak_rt SNAPSHOT.bin --direction z --mode multifreq \
 * `--direction`: `x`, `y`, `z` or `-x`, `-y`, `-z` (observer on that face).
   Negative directions must be written `--direction=-y` (argparse would
   otherwise read `-y` as an option).
+* `--populations {eos,saha}`: H/He populations for `multifreq` and `grey-therm`. Default
+  `eos` (ionization fractions of the EOS table, falls back to Saha with a warning if the
+  table lacks He/H2 fractions); `saha` is the built-in ideal solver. The choice used is
+  stored as `populations_used` in the HDF5 attributes.
 * `--eos-table`: defaults to the `<hydro>/table` path recorded in the snapshot
   header if it exists on this machine, else its basename under
   `$ATHENAK_EOS_TABLE_DIR`; otherwise the path must be given.

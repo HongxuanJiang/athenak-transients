@@ -9,7 +9,14 @@ from typing import Optional, Sequence
 
 from . import __version__
 from .bands import DEFAULT_OBSERVATION_BANDS
-from .config import DEFAULT_MODE, GRID_DTYPES, MODES, RTSettings
+from .config import (
+    DEFAULT_MODE,
+    DEFAULT_POPULATIONS,
+    GRID_DTYPES,
+    MODES,
+    POPULATIONS,
+    RTSettings,
+)
 from .opacity import DEFAULT_MESA_HIGH_T, DEFAULT_MESA_LOW_T
 from .snapshot import BoxSettings, snapshot_index_from_path
 
@@ -55,6 +62,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="AthenaK tabulated LTE EOS table (default: the <hydro>/table "
         "path recorded in the snapshot header, or its basename under "
         "$ATHENAK_EOS_TABLE_DIR / the repository's eos_tables/)",
+    )
+    tables.add_argument(
+        "--populations",
+        choices=POPULATIONS,
+        default=DEFAULT_POPULATIONS,
+        help="H/He ionization populations for grey-therm and multifreq: 'eos' "
+        "takes them from the EOS table (falls back to Saha with a message if "
+        "the table has no He/H2 fractions), 'saha' uses the built-in ideal Saha "
+        "solver",
     )
     tables.add_argument(
         "--mesa-high-t",
@@ -180,6 +196,7 @@ def settings_from_args(args: argparse.Namespace) -> RTSettings:
             min_width_code=args.auto_box_min_width,
         ),
         eos_table=args.eos_table,
+        populations=args.populations,
         mesa_high_t=args.mesa_high_t,
         mesa_low_t=args.mesa_low_t,
         density_threshold_factor=args.density_threshold_factor,

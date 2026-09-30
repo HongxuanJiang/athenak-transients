@@ -65,7 +65,7 @@ values for the chosen line of sight, `L = 4 pi sum(I dA)`.  For a blackbody pixe
 | `tau1` | The Rosseland optical depth is accumulated along each ray from the observer. The first cell with `tau >= tau_ph` (default 1) is the photosphere, and the pixel emits as a blackbody at the temperature of that cell. | MESA Rosseland (includes electron scattering) | photosphere temperature, coordinate, total `tau`, bolometric pixel luminosity, band `L_nu` (blackbody) |
 | `grey` | Grey formal solution `I = int B(T) exp(-tau_R) dtau_R`. | MESA Rosseland | intensity, `tau`, `T_eff`, bolometric pixel luminosity |
 | `grey-therm` | Grey solution with a thermalization depth. Scattering is `alpha_s = sigma_T n_e` and absorption `alpha_a = kappa_R rho - alpha_s`. The effective depth is `dtau* = sqrt(alpha_a (alpha_a + alpha_s)) ds` and the source function is weighted by `2 sqrt(eps) / (1 + sqrt(eps))` with `eps = alpha_a / (alpha_a + alpha_s)`. | MESA Rosseland | as `grey` |
-| `multifreq` (default) | Hydrogen and helium continuum transfer at each photon energy on a logarithmic grid (default 73 points from 0.1 to 1000 eV). Saha ionization gives the populations of H I, H II, He I, He II, He III. The absorption includes free-free, bound-free from H (levels `n <= 6`), He I and He II, with stimulated emission. Electron scattering enters through the same thermalization-depth treatment per frequency. | H/He continuum, no lines, no metals | intensity, `T_eff`, spectrum `L_nu(E)`, band `L_nu` |
+| `multifreq` (default) | Hydrogen and helium continuum transfer at each photon energy on a logarithmic grid (default 73 points from 0.1 to 1000 eV). The populations of H I, H II, He I, He II, He III come from the EOS table by default (`--populations eos`), or from an ideal Saha solver with `--populations saha`. The absorption includes free-free, bound-free from H (levels `n <= 6`), He I and He II, with stimulated emission. Electron scattering enters through the same thermalization-depth treatment per frequency. | H/He continuum, no lines, no metals | intensity, `T_eff`, spectrum `L_nu(E)`, band `L_nu` |
 
 `--no-scattering` turns `multifreq` into pure absorption.  In all modes the integration
 along a ray stops once the optical depth exceeds `--tau-stop` (default 30).  In
@@ -117,6 +117,7 @@ light curve and a stacked summary are written across them.
 | `--los-steps` | `1024` | Samples along the line of sight, must be `>= 2` |
 | `--out` | `athenak_rt_output` | Output directory |
 | `--eos-table` | from header | EOS table, see Sec. 1 |
+| `--populations` | `eos` | H/He populations for `grey-therm` and `multifreq`: `eos` (ionization fractions of the EOS table) or `saha` (built-in ideal Saha solver). If the table has no He or H2 fractions, `eos` falls back to Saha with a warning |
 | `--mesa-high-t` | `data/gs98_z0.02_x0.7.data` | MESA/OPAL high-temperature opacity table |
 | `--mesa-low-t` | `data/lowT_fa05_gs98_z0.02_x0.7.data` | MESA low-temperature opacity table |
 | `--density-threshold-factor` | `10.0` | Cells with `rho_code > factor * dfloor` are used |
@@ -322,9 +323,10 @@ The results are LTE post-processing estimates, and the following limits apply.
   and not through a full scattering solution.
 * **Composition.**  The grey modes use MESA opacities for `X = 0.7`, `Z = 0.02`, which
   is inconsistent with the metal-free H/He EOS of the hydrodynamics.  The multifrequency
-  mode uses `X = 0.7`, `Y = 0.3` in its Saha solver (fixed in `athenak_rt/constants.py`),
-  which matches the standard EOS table.  Do not use the multifrequency mode with a
-  table of another composition without changing these constants.
+  mode takes its populations from the EOS table, which is consistent with the hydrodynamics.
+  With `--populations saha` it assumes `X = 0.7`, `Y = 0.3` (fixed in
+  `athenak_rt/constants.py`), so do not use that option with a table of another composition
+  without changing these constants.
 * **Debris versus atmosphere.**  The snapshots contain no passive scalar that separates
   debris from the numerical atmosphere, so the density threshold does this job.  The
   luminosity depends on it, most strongly in the in-plane view.

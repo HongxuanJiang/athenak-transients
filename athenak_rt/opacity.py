@@ -8,8 +8,10 @@ Grey opacity
     used up to its maximum log T, the high-T table above it.
 
 Multifrequency H/He continuum (no lines, no metals)
-    ``saha_state`` solves Saha ionization equilibrium for an X=0.7, Y=0.3 gas
-    (H I/II, He I/II/III) by bisection on n_e.  ``continuum_absorption`` returns
+    ``table_state`` takes the populations from the tabulated EOS (the pipeline
+    default, ``--populations eos``).  ``saha_state`` (``--populations saha``)
+    solves Saha ionization equilibrium for an X=0.7, Y=0.3 gas (H I/II,
+    He I/II/III) by bisection on n_e.  ``continuum_absorption`` returns
     the free-free (H II, He II, He III) plus bound-free (H I n<=6, He I, He II)
     absorption coefficient with the stimulated-emission factor (1 - e^{-h nu/kT}).
     Electron scattering enters as alpha_s = sigma_T n_e.
@@ -285,6 +287,43 @@ def saha_state(rho, temp):
         n_he * r1 * f0,
         n_he * r1 * r2 * f0,
     )
+
+
+@njit(cache=True)
+def table_state(rho, temp, lr0, dlr, lt0, dlt, lnf, nh_per_rho, nhe_per_rho):
+    """Same return values as ``saha_state``, from EOS-table ionization fractions.
+
+    ``lnf[5, nr, nt]`` holds ln(H I, H II, He I, He II, He III fractions) on a
+    uniform (ln rho, ln T) grid; it is interpolated bilinearly (clamped to the
+    table range) and exponentiated, which keeps tiny neutral fractions accurate.
+    """
+    nr = lnf.shape[1]
+    nt = lnf.shape[2]
+    x = (math.log(rho) - lr0) / dlr
+    y = (math.log(temp) - lt0) / dlt
+    x = min(max(x, 0.0), nr - 1.000001)
+    y = min(max(y, 0.0), nt - 1.000001)
+    i = int(x)
+    j = int(y)
+    fx = x - i
+    fy = y - j
+    w00 = (1.0 - fx) * (1.0 - fy)
+    w10 = fx * (1.0 - fy)
+    w01 = (1.0 - fx) * fy
+    w11 = fx * fy
+    f0 = math.exp(w00 * lnf[0, i, j] + w10 * lnf[0, i + 1, j] + w01 * lnf[0, i, j + 1] + w11 * lnf[0, i + 1, j + 1])
+    f1 = math.exp(w00 * lnf[1, i, j] + w10 * lnf[1, i + 1, j] + w01 * lnf[1, i, j + 1] + w11 * lnf[1, i + 1, j + 1])
+    f2 = math.exp(w00 * lnf[2, i, j] + w10 * lnf[2, i + 1, j] + w01 * lnf[2, i, j + 1] + w11 * lnf[2, i + 1, j + 1])
+    f3 = math.exp(w00 * lnf[3, i, j] + w10 * lnf[3, i + 1, j] + w01 * lnf[3, i, j + 1] + w11 * lnf[3, i + 1, j + 1])
+    f4 = math.exp(w00 * lnf[4, i, j] + w10 * lnf[4, i + 1, j] + w01 * lnf[4, i, j + 1] + w11 * lnf[4, i + 1, j + 1])
+    n_h = nh_per_rho * rho
+    n_he = nhe_per_rho * rho
+    n_h1 = n_h * f0
+    n_h2 = n_h * f1
+    n_he1 = n_he * f2
+    n_he2 = n_he * f3
+    n_he3 = n_he * f4
+    return n_h2 + n_he2 + 2.0 * n_he3, n_h1, n_h2, n_he1, n_he2, n_he3
 
 
 @njit(cache=True)

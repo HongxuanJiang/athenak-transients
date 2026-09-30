@@ -13,6 +13,8 @@ from .snapshot import BoxSettings
 MODES = ("tau1", "grey", "grey-therm", "multifreq")
 DEFAULT_MODE = "multifreq"
 GRID_DTYPES = ("auto", "float32", "float64")
+POPULATIONS = ("eos", "saha")
+DEFAULT_POPULATIONS = "eos"
 
 
 @dataclass
@@ -48,6 +50,9 @@ class RTSettings:
     emin_ev: float = 0.1
     emax_ev: float = 1000.0
     scattering: bool = True  # multifreq: thermalization against sigma_T n_e
+    # H/He populations for grey-therm and multifreq: "eos" (fractions of the EOS
+    # table, falls back to Saha with a message if the table lacks them) or "saha".
+    populations: str = DEFAULT_POPULATIONS
 
     # Storage precision of the resampled cube ("auto": float32 at >= 1024 samples).
     grid_dtype: str = "auto"
@@ -66,6 +71,10 @@ class RTSettings:
             raise RuntimeError(f"Unsupported direction {self.direction!r}.")
         if self.image_size < 2 or self.los_steps < 2:
             raise RuntimeError("image_size and los_steps must both be >= 2.")
+        if self.populations not in POPULATIONS:
+            raise RuntimeError(
+                f"populations must be one of {POPULATIONS}, got {self.populations!r}."
+            )
         if self.grid_dtype not in GRID_DTYPES:
             raise RuntimeError(f"grid_dtype must be one of {GRID_DTYPES}.")
         if self.tau_photosphere <= 0.0 or self.tau_stop <= 0.0:

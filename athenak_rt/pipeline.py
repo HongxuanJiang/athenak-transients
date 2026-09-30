@@ -75,6 +75,8 @@ class RTResult:
     eos_table_in_header: Optional[str]
     grid_storage_dtype: str
     threads: int
+    populations: str = "n/a"  # "eos", "saha", or "n/a" (modes without ionization)
+    populations_note: str = ""
     spectrum: Optional[dict] = None
     bands: Optional[dict] = None
     hdf5_path: Optional[Path] = None
@@ -126,6 +128,21 @@ def process_snapshot(
     runtime = build_runtime(header)
     eos_table = resolve_eos_table(settings.eos_table, header.eos_table_in_header)
     eos = eos_cache.get(eos_table, units)
+
+    # H/He populations for the ionization-dependent modes (grey-therm, multifreq).
+    populations, populations_note = "n/a", ""
+    pop_args = (False,)
+    if settings.mode in ("grey-therm", "multifreq"):
+        populations = settings.populations
+        if populations == "eos":
+            try:
+                pop_args = (True, *eos.population_table())
+            except RuntimeError as exc:
+                populations = "saha"
+                populations_note = (
+                    f"{exc} Falling back to the ideal Saha solver (X=0.7, Y=0.3)."
+                )
+                log(f"WARNING: --populations eos unavailable: {populations_note}")
 
     auto_threshold = choose_auto_box_density_threshold(
         header, settings.density_threshold_factor, settings.density_threshold_code
@@ -239,6 +256,7 @@ def process_snapshot(
             ds_cm,
             settings.mode == "grey-therm",
             float(settings.tau_stop),
+            *pop_args,
         )
         luminosity = 4.0 * math.pi * intensity.sum() * area_cm2
         valid = intensity > 0.0
@@ -267,6 +285,7 @@ def process_snapshot(
             bool(settings.scattering),
             False,
             float(settings.tau_stop),
+            *pop_args,
         )
         luminosity = 4.0 * math.pi * intensity.sum() * area_cm2
         lnu = 4.0 * math.pi * spec_rows.sum(axis=1) * area_cm2
@@ -339,6 +358,8 @@ def process_snapshot(
         eos_table_in_header=header.eos_table_in_header,
         grid_storage_dtype=np.dtype(grid_dtype).name,
         threads=get_num_threads(),
+        populations=populations,
+        populations_note=populations_note,
         spectrum=spectrum,
         bands=bands,
         timings=timings,

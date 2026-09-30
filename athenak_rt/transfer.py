@@ -50,7 +50,10 @@ from .opacity import (
     mesa_alpha_scalar,
     planck_nu,
     saha_state,
+    table_state,
 )
+
+_NO_LNF = np.zeros((5, 2, 2))  # placeholder when the Saha solver is used
 
 DIRECTION_X = 0
 DIRECTION_Y = 1
@@ -222,6 +225,14 @@ def integrate_grey_rays(
     ds_cm,
     thermalization,
     tau_stop,
+    use_table=False,
+    lr0=0.0,
+    dlr=1.0,
+    lt0=0.0,
+    dlt=1.0,
+    lnf=_NO_LNF,
+    nh_per_rho=0.0,
+    nhe_per_rho=0.0,
 ):
     """Grey formal solution (or grey + thermalization depth).
 
@@ -260,7 +271,12 @@ def integrate_grey_rays(
             )
             bbol = SIGMA_OVER_PI * t**4
             if thermalization:
-                ne, n_h1, n_h2, n_he1, n_he2, n_he3 = saha_state(r, t)
+                if use_table:
+                    ne, n_h1, n_h2, n_he1, n_he2, n_he3 = table_state(
+                        r, t, lr0, dlr, lt0, dlt, lnf, nh_per_rho, nhe_per_rho
+                    )
+                else:
+                    ne, n_h1, n_h2, n_he1, n_he2, n_he3 = saha_state(r, t)
                 alpha_s = electron_scattering(ne)
                 a_s = min(alpha_s, alpha_r)
                 a_a = max(alpha_r - a_s, 1.0e-6 * alpha_r)
@@ -298,6 +314,14 @@ def integrate_multifreq_rays(
     scattering,
     grey_limit,
     tau_stop,
+    use_table=False,
+    lr0=0.0,
+    dlr=1.0,
+    lt0=0.0,
+    dlt=1.0,
+    lnf=_NO_LNF,
+    nh_per_rho=0.0,
+    nhe_per_rho=0.0,
 ):
     """Multifrequency H/He continuum transfer.
 
@@ -344,7 +368,12 @@ def integrate_multifreq_rays(
                     high_log_r,
                     high_log_kappa,
                 )
-                ne, n_h1, n_h2, n_he1, n_he2, n_he3 = saha_state(r, t)
+                if use_table:
+                    ne, n_h1, n_h2, n_he1, n_he2, n_he3 = table_state(
+                        r, t, lr0, dlr, lt0, dlt, lnf, nh_per_rho, nhe_per_rho
+                    )
+                else:
+                    ne, n_h1, n_h2, n_he1, n_he2, n_he3 = saha_state(r, t)
                 alpha_s = electron_scattering(ne)
                 active = False
                 for f in range(nf):

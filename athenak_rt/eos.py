@@ -240,6 +240,51 @@ class TabulatedLteTable:
         log_p = self._eval_field("logpress", np.log(rho_cgs), np.log(temp_cgs))
         return np.exp(log_p) / self.pressure_unit_cgs
 
+    def population_table(self):
+        """Ionization populations for the continuum transfer kernels.
+
+        Returns ``(lr0, dlr, lt0, dlt, lnf, nh_per_rho, nhe_per_rho)`` with
+        ``lnf[5, nrho, ntemp]`` the natural log of the (H I, H II, He I, He II,
+        He III) fractions (H I = 1 - xion - xh2; clipped to [1e-300, 1]) and
+        ``n_H = nh_per_rho * rho``, ``n_He = nhe_per_rho * rho``.
+
+        Raises ``RuntimeError`` (message says why) if the table cannot provide
+        consistent H/He populations, e.g. hydrogen-only Saha tables that carry
+        no ``xh2``/``xhe1``/``xhe2`` fields or the scalars ``x_h, y_he, m_h, m_he``.
+        """
+        missing = [n for n in ("xion", "xh2", "xhe1", "xhe2") if n not in self.fields]
+        if missing:
+            raise RuntimeError(
+                f"EOS table {self.table_path.name} has no {', '.join(missing)} "
+                "field(s) (hydrogen-only or Saha-type table)."
+            )
+        try:
+            x_h, y_he, m_h, m_he = (
+                float(self.metadata[k]) for k in ("x_h", "y_he", "m_h", "m_he")
+            )
+        except KeyError as exc:
+            raise RuntimeError(
+                f"EOS table {self.table_path.name} lacks the <scalars> entry {exc}."
+            ) from exc
+        if y_he > 0.0 and not np.any(self.fields["xhe1"] + self.fields["xhe2"] > 0.0):
+            raise RuntimeError(
+                f"EOS table {self.table_path.name} has y_he > 0 but no helium "
+                "ionization (xhe1 = xhe2 = 0 everywhere)."
+            )
+        xion, xh2 = self.fields["xion"], self.fields["xh2"]
+        xhe1, xhe2 = self.fields["xhe1"], self.fields["xhe2"]
+        frac = np.stack([1.0 - xion - xh2, xion, 1.0 - xhe1 - xhe2, xhe1, xhe2])
+        lnf = np.ascontiguousarray(np.log(np.clip(frac, 1.0e-300, 1.0)), dtype=np.float64)
+        return (
+            float(self.logrho[0]),
+            float(self.logrho[1] - self.logrho[0]),
+            float(self.logtemp[0]),
+            float(self.logtemp[1] - self.logtemp[0]),
+            lnf,
+            x_h / m_h,
+            y_he / m_he,
+        )
+
     def pressure_from_rho_eint(self, dens_code, eint_code):
         temp_code = self.temperature_from_rho_eint(dens_code, eint_code)
         return self.pressure_from_rho_t(dens_code, temp_code)

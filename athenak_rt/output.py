@@ -96,6 +96,8 @@ def write_snapshot_hdf5(output_dir: Path, result, settings) -> Path:
             "eos_table_in_header": result.eos_table_in_header or "",
             "grid_storage_dtype": result.grid_storage_dtype,
             "numba_threads": int(result.threads),
+            "populations_used": result.populations,
+            "populations_note": result.populations_note,
         }
         attrs.update(settings.as_attributes())
         if result.dense_box_info is not None:
