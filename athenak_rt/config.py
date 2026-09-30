@@ -81,6 +81,12 @@ class RTSettings:
             raise RuntimeError("tau_photosphere and tau_stop must be positive.")
         if self.density_threshold_factor < 0.0:
             raise RuntimeError("density_threshold_factor must be >= 0.")
+        if self.nfreq < 2:
+            raise RuntimeError("nfreq must be >= 2.")
+        if not 0.0 < self.emin_ev < self.emax_ev:
+            raise RuntimeError("The photon energies need 0 < emin_ev < emax_ev.")
+        if self.threads is not None and self.threads < 1:
+            raise RuntimeError("threads must be >= 1.")
 
     # Settings whose names would collide with the resolved values the output records.
     _ATTRIBUTE_RENAMES = {

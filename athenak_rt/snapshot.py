@@ -478,7 +478,7 @@ def determine_rt_box(
         raise RuntimeError(
             f"{header.path.name} has no cells above the adaptive RT threshold "
             f"rho_code>{info.threshold_code:.6e}; refusing a full-mesh empty-box "
-            "fallback (pass --box to force one)."
+            "fallback (set <image>/box to force one)."
         )
     return info.box, info
 

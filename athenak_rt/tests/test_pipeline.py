@@ -71,8 +71,13 @@ def write_eos_table(path: Path) -> None:
             fp.write(np.ascontiguousarray(values, dtype="<f8").tobytes())
 
 
-def write_snapshot(path: Path, eos_table: Path) -> None:
-    """Root block on [-1,1]^3 (level 0) plus one level-1 block on [0,1]^3."""
+def write_snapshot(
+    path: Path, eos_table, time: float = 1.5, cycle: int = 7, t_scale: float = 1.0
+) -> None:
+    """Root block on [-1,1]^3 (level 0) plus one level-1 block on [0,1]^3.
+
+    ``t_scale`` multiplies both temperatures (a different dump of a series).
+    """
     input_text = (
         "<mesh>\nx1min = -1.0\nx1max = 1.0\nx2min = -1.0\nx2max = 1.0\n"
         "x3min = -1.0\nx3max = 1.0\n"
@@ -84,6 +89,7 @@ def write_snapshot(path: Path, eos_table: Path) -> None:
     ).encode("ascii")
 
     def block(level, lims, rho_code, temp):
+        temp = temp * t_scale
         dens = np.full((NB, NB, NB), rho_code, dtype=np.float32)
         eint = np.full(
             (NB, NB, NB), rho_code * eps_of_temperature(temp) / EPS_UNIT, dtype=np.float32
@@ -97,8 +103,8 @@ def write_snapshot(path: Path, eos_table: Path) -> None:
     with path.open("wb") as fp:
         fp.write(b"Athena binary output version=1.1\n")
         fp.write(b"  preheader size=9\n")
-        fp.write(b"  time=1.5\n")
-        fp.write(b"  cycle=7\n")
+        fp.write(f"  time={time!r}\n".encode("ascii"))
+        fp.write(f"  cycle={cycle}\n".encode("ascii"))
         fp.write(b"  size of location=8\n")
         fp.write(b"  size of variable=4\n")
         fp.write(b"  number of variables=2\n")

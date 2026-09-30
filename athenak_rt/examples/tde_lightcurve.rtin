@@ -1,0 +1,60 @@
+# athenak_rt parameter file: light curve over a series of dumps, face-on (+z) and
+# in-plane (-y), multifrequency H/He continuum transfer as in the paper.
+#
+# Every dump of the selection is processed for every direction.  Besides one
+# HDF5 file per dump and direction, the run writes rt_lightcurve_multifreq.csv
+# and rt_lightcurve_multifreq.h5 in <output>/dir, one row per dump, rewritten
+# after each dump.  With skip_existing = true an interrupted run continues
+# where it stopped.
+#
+# Run from the AthenaK repository root with
+#     python3 -m athenak_rt /path/to/work/tde_lightcurve.rtin
+# Relative paths are relative to this file's directory.
+
+<input>
+dump_dir      = /path/to/run/bin    # directory with the .bin dumps (required)
+basename      = TDEExternalLTEPrad  # files are <basename>.<variable>.<NNNNN>.bin
+variable      = hydro_w             # output variable of the dumps (needs dens and eint)
+dumps         = 300:327             # dumps 300 to 327 inclusive; 300:327:3 takes every third
+missing_dumps = skip                # error | skip (warn and process the others)
+
+<output>
+dir              = rt_lightcurve    # output directory
+hdf5_compression = lzf              # lzf | gzip | none
+bands            = true             # band columns nuLnu_<band>_<direction> in the light curve
+
+<transfer>
+mode            = multifreq         # tau1 | grey | grey-therm | multifreq
+directions      = z, -y             # lines of sight among x y z -x -y -z
+tau_photosphere = 1.0               # tau1: optical depth of the photosphere
+tau_stop        = 30.0              # grey*, multifreq: stop a ray past this depth
+nfreq           = 73                # multifreq: log-spaced photon energies
+emin_ev         = 0.1               # multifreq: lowest photon energy [eV]
+emax_ev         = 1000.0            # multifreq: highest photon energy [eV]
+scattering      = true              # multifreq: thermalization depth (false: pure absorption)
+populations     = eos               # eos (EOS-table fractions) | saha (ideal Saha, X=0.7, Y=0.3)
+
+<image>
+image_size                = 512     # the paper's figure used 1024; 512 is 8 times cheaper
+los_steps                 = 512     # samples along the line of sight
+grid_dtype                = auto    # auto | float32 | float64 (auto: float64 below 1024 samples)
+box                       = auto    # auto | xmin, xmax, ymin, ymax, zmin, zmax (code units)
+auto_box_padding_code     = 0.25    # auto box: absolute padding per side
+auto_box_padding_fraction = 0.1     # auto box: padding per side as a fraction of the width
+auto_box_min_width        = 1.0     # auto box: minimum width
+auto_box_clip_to_mesh     = true    # auto box: clip to the mesh
+
+<selection>
+density_threshold_factor = 10.0     # cells with rho_code > factor * dfloor enter the grid
+density_threshold_code   = auto     # auto | explicit threshold in code units (overrides the factor)
+bh_mask                  = true     # empty the BH excision sphere
+bh_mask_radius           = auto     # auto (<problem>/bh_excise_radius of the dump) | radius in code units
+
+<tables>
+eos_table   = auto                  # auto: <hydro>/table of the dump header (see tde_snapshot.rtin)
+mesa_high_t = auto                  # auto: athenak_rt/data/gs98_z0.02_x0.7.data
+mesa_low_t  = auto                  # auto: athenak_rt/data/lowT_fa05_gs98_z0.02_x0.7.data
+
+<run>
+threads       = auto                # numba threads (auto: all CPUs available to the process)
+skip_existing = true                # reuse per-dump outputs made with the same settings

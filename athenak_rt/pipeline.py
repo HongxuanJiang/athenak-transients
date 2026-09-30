@@ -1,13 +1,13 @@
-"""Per-snapshot driver: header -> box -> resample -> transfer -> products."""
+"""Per-dump driver (header -> box -> resample -> transfer -> products) and run loop."""
 
 from __future__ import annotations
 
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 from numba import get_num_threads, set_num_threads
@@ -16,7 +16,12 @@ from .bands import band_lnu_from_spectrum, band_metadata
 from .config import RTSettings
 from .eos import TabulatedLteTable, resolve_eos_table
 from .opacity import MesaOpacityModel, frequency_quadrature_weights, photon_energy_grid
-from .output import write_lightcurve, write_snapshot_hdf5, write_summary_hdf5
+from .output import (
+    existing_output_mismatch,
+    snapshot_hdf5_path,
+    write_lightcurve,
+    write_snapshot_hdf5,
+)
 from .snapshot import (
     DenseGasBoxInfo,
     RTBox,
@@ -116,7 +121,13 @@ def process_snapshot(
     mesa: MesaOpacityModel,
     eos_cache: Optional[EosCache] = None,
     log=print,
+    provenance: Optional[Mapping[str, str]] = None,
 ) -> RTResult:
+    """Run one dump for ``settings.direction`` and write its HDF5 product.
+
+    ``provenance`` (the parameter file, see ``RunConfig.provenance``) is
+    stored in the product's ``/parameters`` group.
+    """
     settings.validate()
     snapshot = Path(snapshot)
     eos_cache = eos_cache if eos_cache is not None else EosCache()
@@ -126,7 +137,13 @@ def process_snapshot(
     header = read_snapshot_header(snapshot)
     units = build_units(header.input_data)
     runtime = build_runtime(header)
-    eos_table = resolve_eos_table(settings.eos_table, header.eos_table_in_header)
+    # A relative <hydro>/table path is relative to the run directory, which is
+    # normally the parent of the dump directory (<run>/bin/).
+    eos_table = resolve_eos_table(
+        settings.eos_table,
+        header.eos_table_in_header,
+        relative_to=(snapshot.resolve().parent.parent, snapshot.resolve().parent),
+    )
     eos = eos_cache.get(eos_table, units)
 
     # H/He populations for the ionization-dependent modes (grey-therm, multifreq).
@@ -142,7 +159,7 @@ def process_snapshot(
                 populations_note = (
                     f"{exc} Falling back to the ideal Saha solver (X=0.7, Y=0.3)."
                 )
-                log(f"WARNING: --populations eos unavailable: {populations_note}")
+                log(f"WARNING: populations = eos unavailable: {populations_note}")
 
     auto_threshold = choose_auto_box_density_threshold(
         header, settings.density_threshold_factor, settings.density_threshold_code
@@ -366,7 +383,9 @@ def process_snapshot(
     )
 
     t3 = time.perf_counter()
-    result.hdf5_path = write_snapshot_hdf5(settings.output_dir, result, settings)
+    result.hdf5_path = write_snapshot_hdf5(
+        settings.output_dir, result, settings, provenance
+    )
     timings["output"] = time.perf_counter() - t3
     log(
         f"  timings: box={timings['box']:.2f}s resample+EOS={timings['resample']:.2f}s "
@@ -379,22 +398,75 @@ def process_snapshot(
     return result
 
 
-def run(settings: RTSettings, snapshots: Sequence[Path], log=print) -> List[RTResult]:
-    """Process several snapshots with one setting set; write light curve + summary."""
-    settings.validate()
-    settings.output_dir = Path(settings.output_dir).expanduser().resolve()
-    settings.output_dir.mkdir(parents=True, exist_ok=True)
+def run(
+    settings: RTSettings,
+    snapshots: Sequence[Path],
+    directions: Optional[Sequence[str]] = None,
+    *,
+    skip_existing: bool = False,
+    provenance: Optional[Mapping[str, str]] = None,
+    log=print,
+) -> List[RTResult]:
+    """Process every dump for every direction with one set of settings.
+
+    ``directions`` defaults to ``(settings.direction,)``.  With more than one
+    dump a light curve (``rt_lightcurve_<mode>.csv`` / ``.h5``) is rewritten
+    after each dump.  With ``skip_existing`` a (dump, direction) whose product
+    exists is not recomputed, provided it was made with the same settings.
+    Returns the results computed in this call.
+    """
+    directions = tuple(directions) if directions else (settings.direction,)
+    output_dir = Path(settings.output_dir).expanduser().resolve()
+    per_direction = [
+        replace(settings, direction=d, output_dir=output_dir) for d in directions
+    ]
+    for item in per_direction:
+        item.validate()
+    snapshots = [Path(s) for s in snapshots]
+    if skip_existing:
+        # Refuse to reuse products made with other settings before computing anything.
+        for snapshot in snapshots:
+            for item in per_direction:
+                target = snapshot_hdf5_path(output_dir, snapshot, item.mode, item.direction)
+                mismatch = (
+                    existing_output_mismatch(target, item) if target.is_file() else None
+                )
+                if mismatch is not None:
+                    raise RuntimeError(
+                        f"{target} exists but does not match the current settings "
+                        f"({mismatch}); remove it, change <output>/dir, or set "
+                        "<run>/skip_existing = false."
+                    )
+    output_dir.mkdir(parents=True, exist_ok=True)
     nthreads = configure_threads(settings.threads)
     log(f"athenak_rt: numba ray integration with {nthreads} thread(s).")
-    mesa = MesaOpacityModel(Path(settings.mesa_high_t), Path(settings.mesa_low_t))
+    mesa: Optional[MesaOpacityModel] = None
     eos_cache = EosCache()
     results: List[RTResult] = []
+    rows: List[Dict[str, Path]] = []
     for snapshot in snapshots:
-        results.append(
-            process_snapshot(Path(snapshot), settings, mesa, eos_cache, log=log)
-        )
-        write_lightcurve(settings.output_dir, settings.mode, settings.direction, results)
-        write_summary_hdf5(
-            settings.output_dir, settings.mode, settings.direction, results
-        )
+        row: Dict[str, Path] = {}
+        for item in per_direction:
+            target = snapshot_hdf5_path(output_dir, snapshot, item.mode, item.direction)
+            if skip_existing and target.is_file():
+                log(
+                    f"Skipping {snapshot.name} [{item.mode}, {item.direction}]: "
+                    f"{target.name} exists."
+                )
+                row[item.direction] = target
+                continue
+            if mesa is None:
+                mesa = MesaOpacityModel(Path(item.mesa_high_t), Path(item.mesa_low_t))
+            result = process_snapshot(
+                snapshot, item, mesa, eos_cache, log=log, provenance=provenance
+            )
+            results.append(result)
+            row[item.direction] = result.hdf5_path
+        rows.append(row)
+        if len(snapshots) > 1:
+            csv_path, h5_path = write_lightcurve(
+                output_dir, settings.mode, directions, rows, provenance
+            )
+    if len(snapshots) > 1:
+        log(f"Light curve ({len(rows)} dumps): {csv_path} and {h5_path.name}")
     return results

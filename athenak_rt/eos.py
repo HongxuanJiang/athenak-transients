@@ -294,12 +294,16 @@ def resolve_eos_table(
     explicit: Optional[os.PathLike],
     header_path: Optional[str],
     search_dirs: Iterable[os.PathLike] = (),
+    relative_to: Iterable[os.PathLike] = (),
 ) -> Path:
     """Locate the EOS table.
 
-    Order: an explicit ``--eos-table``; the path recorded in the snapshot header
-    (``<hydro>/table``) if it exists on this machine; ``$ATHENAK_EOS_TABLE_DIR``
-    or any ``search_dirs`` joined with the header path's basename.
+    Order: an explicit table (``<tables>/eos_table``); the path recorded in the
+    snapshot header (``<hydro>/table``) as written, then, if it is relative,
+    below each of ``relative_to`` (the pipeline passes the run directory, i.e.
+    the parent of the dump directory, and the dump directory); finally
+    ``$ATHENAK_EOS_TABLE_DIR`` or any ``search_dirs`` joined with the header
+    path's basename.
     """
     tried = []
     if explicit is not None:
@@ -310,6 +314,8 @@ def resolve_eos_table(
     if header_path:
         raw = Path(header_path).expanduser()
         candidates = [raw]
+        if not raw.is_absolute():
+            candidates.extend(Path(d).expanduser() / raw for d in relative_to)
         env_dir = os.environ.get("ATHENAK_EOS_TABLE_DIR")
         if env_dir:
             candidates.append(Path(env_dir).expanduser() / raw.name)
@@ -319,6 +325,6 @@ def resolve_eos_table(
                 return candidate.resolve()
             tried.append(str(candidate))
     raise RuntimeError(
-        "Could not locate the EOS table; pass --eos-table explicitly. Tried:\n  "
+        "Could not locate the EOS table; set <tables>/eos_table. Tried:\n  "
         + "\n  ".join(tried or ["(snapshot header records no <hydro>/table)"])
     )

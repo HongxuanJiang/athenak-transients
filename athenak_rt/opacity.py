@@ -9,7 +9,7 @@ Grey opacity
 
 Multifrequency H/He continuum (no lines, no metals)
     ``table_state`` takes the populations from the tabulated EOS (the pipeline
-    default, ``--populations eos``).  ``saha_state`` (``--populations saha``)
+    default, ``populations = eos``).  ``saha_state`` (``populations = saha``)
     solves Saha ionization equilibrium for an X=0.7, Y=0.3 gas (H I/II,
     He I/II/III) by bisection on n_e.  ``continuum_absorption`` returns
     the free-free (H II, He II, He III) plus bound-free (H I n<=6, He I, He II)

@@ -179,8 +179,8 @@ directory in which you start the code, one level above each step directory.  A r
 path is tried in the working directory first, then under `$ATHENAK_DATA`, then under
 `<source tree>/data`.  You can also override the path on the command line, for example
 `hydro/table=/path/to/chabrier2021_t13_helm_union_prad_640.table`, and the other tools
-accept the same file through `--eos-table` (`athenak_rt`) or the path in the snapshot header
-(plot scripts).
+accept the same file through `<tables>/eos_table` (the `athenak_rt` parameter file) or the
+path in the snapshot header (plot scripts).
 
 Two more tables are only needed by tools.  The chemistry plots of
 `scripts/TDE/bin/plot_slice.py` need `lte_t13_prad_eos.table` next to the main table

@@ -1,4 +1,4 @@
-"""EOS-table H/He populations (``--populations eos``) versus the Saha solver."""
+"""EOS-table H/He populations (``populations = eos``) versus the Saha solver."""
 
 import math
 from pathlib import Path
@@ -6,8 +6,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from athenak_rt.cli import build_parser, settings_from_args
 from athenak_rt.config import DEFAULT_POPULATIONS, RTSettings
+from athenak_rt.params import parse_parameters
 from athenak_rt.eos import TabulatedLteTable
 from athenak_rt.opacity import (
     DEFAULT_MESA_HIGH_T,
@@ -112,9 +112,8 @@ def test_grey_limit_identity_with_both_populations(eos, use_table):
 def test_default_populations_is_eos():
     assert DEFAULT_POPULATIONS == "eos"
     assert RTSettings().populations == "eos"
-    args = build_parser().parse_args(["snap.bin"])
-    assert args.populations == "eos"
-    assert settings_from_args(args).populations == "eos"
-    args = build_parser().parse_args(["snap.bin", "--populations", "saha"])
-    assert settings_from_args(args).populations == "saha"
+    minimal = "<input>\ndump_dir = .\ndumps = 1\n"
+    assert parse_parameters(minimal).settings.populations == "eos"
+    saha = minimal + "<transfer>\npopulations = saha\n"
+    assert parse_parameters(saha).settings.populations == "saha"
     assert RTSettings().as_attributes()["populations"] == "eos"

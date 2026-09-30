@@ -1,0 +1,61 @@
+# athenak_rt parameter file: one dump, the settings of the paper's Fig. (last HR
+# snapshot, t/P_mb = 2.93, multifrequency transfer seen from +z and from -y).
+#
+# Copy this file to the directory that should receive the output, set
+# <input>/dump_dir, and run from the AthenaK repository root (or with the root on
+# PYTHONPATH)
+#     python3 -m athenak_rt /path/to/work/tde_snapshot.rtin
+# Relative paths are relative to this file's directory; ~ and $VARIABLES are
+# expanded.  A key that is left out takes the default given in its comment;
+# "auto" asks for the derived value.
+
+<input>
+dump_dir      = /path/to/run/bin    # directory with the .bin dumps (required)
+basename      = TDEExternalLTEPrad  # files are <basename>.<variable>.<NNNNN>.bin
+variable      = hydro_w             # output variable of the dumps (needs dens and eint)
+dumps         = 327                 # N | N1, N2, ... | A:B | A:B:STEP (inclusive) | all
+missing_dumps = error               # error | skip (warn and process the others)
+
+<output>
+dir              = rt_out           # output directory (default athenak_rt_output)
+hdf5_compression = lzf              # lzf | gzip | none
+bands            = true             # NIR/optical/UV/X-ray band L_nu
+
+<transfer>
+mode            = multifreq         # tau1 | grey | grey-therm | multifreq
+directions      = z, -y             # lines of sight among x y z -x -y -z (default z)
+tau_photosphere = 1.0               # tau1: optical depth of the photosphere
+tau_stop        = 30.0              # grey*, multifreq: stop a ray past this depth
+nfreq           = 73                # multifreq: log-spaced photon energies
+emin_ev         = 0.1               # multifreq: lowest photon energy [eV]
+emax_ev         = 1000.0            # multifreq: highest photon energy [eV]
+scattering      = true              # multifreq: thermalization depth (false: pure absorption)
+populations     = eos               # eos (EOS-table fractions) | saha (ideal Saha, X=0.7, Y=0.3)
+
+<image>
+image_size                = 1024    # pixels across the image plane
+los_steps                 = 1024    # samples along the line of sight
+grid_dtype                = auto    # auto | float32 | float64 (auto: float32 from 1024 samples)
+box                       = auto    # auto | xmin, xmax, ymin, ymax, zmin, zmax (code units)
+auto_box_padding_code     = 0.25    # auto box: absolute padding per side
+auto_box_padding_fraction = 0.1     # auto box: padding per side as a fraction of the width
+auto_box_min_width        = 1.0     # auto box: minimum width
+auto_box_clip_to_mesh     = true    # auto box: clip to the mesh
+
+<selection>
+density_threshold_factor = 10.0     # cells with rho_code > factor * dfloor enter the grid
+density_threshold_code   = auto     # auto | explicit threshold in code units (overrides the factor)
+bh_mask                  = true     # empty the BH excision sphere
+bh_mask_radius           = auto     # auto (<problem>/bh_excise_radius of the dump) | radius in code units
+
+<tables>
+eos_table   = auto                  # auto: <hydro>/table of the dump header, also tried relative
+                                    # to the run directory (parent of dump_dir) and in
+                                    # $ATHENAK_EOS_TABLE_DIR; or a path, e.g.
+                                    # /path/to/chabrier2021_t13_helm_union_prad_640.table
+mesa_high_t = auto                  # auto: athenak_rt/data/gs98_z0.02_x0.7.data
+mesa_low_t  = auto                  # auto: athenak_rt/data/lowT_fa05_gs98_z0.02_x0.7.data
+
+<run>
+threads       = auto                # numba threads (auto: all CPUs available to the process)
+skip_existing = false               # true: keep per-dump outputs that already exist
