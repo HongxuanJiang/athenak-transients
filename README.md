@@ -61,10 +61,10 @@ the tabulated LTE equation of state; a black-hole excision mask is applied only 
 snapshot defines one.  The optional Saha solver (`populations = saha`) assumes
 `X = 0.7`, `Y = 0.3`.
 
-`athenak_rt` is built on the photospheric post-processing method of
-[Yang et al. (2026, ApJ, 998, 118)]({YANG_ADS}) ([arXiv:2510.25547]({YANG_ARX})), developed
-by Mengqi Yang for Athena++ and adapted here to Cartesian AthenaK output.  If you use it,
-please cite Yang et al. (2026) together with Jiang et al. (2026).
+The radiative transfer in `athenak_rt` follows the photospheric post-processing method of
+[Yang et al. (2026, ApJ, 998, 118)](https://ui.adsabs.harvard.edu/abs/2026ApJ...998..118Y) ([arXiv:2510.25547](https://arxiv.org/abs/2510.25547)), adapted to Cartesian
+AthenaK output.  Publications that use `athenak_rt` should cite Yang et al. (2026) and
+Jiang et al. (2026).
 
 ```bash
 cd /path/to/athenak
@@ -146,7 +146,7 @@ can also be downloaded from the release assets of this repository.  See
 
 If you use the TDE workflow, please cite the paper above
 ([arXiv:2609.37859](https://arxiv.org/abs/2609.37859)) and the AthenaK code paper.  If you use `athenak_rt`,
-please also cite [Yang et al. (2026)](https://ui.adsabs.harvard.edu/abs/2026ApJ...998..118Y), whose method it implements.
+please also cite [Yang et al. (2026)](https://ui.adsabs.harvard.edu/abs/2026ApJ...998..118Y).
 A BibTeX entry for each is given in [`docs/TDE/README.md`](docs/TDE/README.md#how-to-cite).
 
 For more details on the features and algorithms implemented in AthenaK, see the code papers:

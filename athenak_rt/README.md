@@ -7,16 +7,15 @@ the finest AMR level of the dense gas onto a uniform Cartesian ray grid,
 recovers the temperature from the tabulated LTE equation of state the run used,
 and integrates the transfer equation along parallel rays with numba.
 
-The method is the photospheric post-processing of
+The radiative transfer follows the photospheric post-processing method of
 [Yang et al. (2026, ApJ, 998, 118)](https://ui.adsabs.harvard.edu/abs/2026ApJ...998..118Y) ([arXiv:2510.25547](https://arxiv.org/abs/2510.25547)),
-developed by Mengqi Yang for Athena++ and adapted here to Cartesian AthenaK output, with
-the multifrequency continuum transfer of
+adapted to Cartesian AthenaK output, and the multifrequency continuum transfer of
 [Jiang et al. (2026)](https://arxiv.org/abs/2609.37859).  The physics and numerics are those of the scripts
-validated for that paper (`light_curve_tde_cartesian.py` and `rt_continuum_experiments.py`
+validated for the latter paper (`light_curve_tde_cartesian.py` and `rt_continuum_experiments.py`
 in the reproducibility archive); the package replaces their hard-coded configuration
 with a parameter file.
 
-If you use `athenak_rt`, please cite Yang et al. (2026) and Jiang et al. (2026).
+Publications that use `athenak_rt` should cite Yang et al. (2026) and Jiang et al. (2026).
 
 ## Modes
 
@@ -192,5 +191,5 @@ production size (1024) the default `auto` rule already selects float32.
   `light_curve_tde_adaptive_rays.py`): they are tied to the archived driver's
   configuration object and were not validated for the paper, so they were left
   out rather than shipped untested.
-* The analytic (Mengqi-style) and constant-opacity options of the original
+* The analytic-opacity and constant-opacity options of the original
   script; the paper used the MESA tables only.

@@ -444,8 +444,7 @@ Notes on resources.
 ## How to cite
 
 If you use this framework, please cite the TDE paper and the AthenaK code paper.  If you
-use the radiative post-processing `athenak_rt`, please also cite Yang et al. (2026), whose
-photospheric method it implements.
+use the radiative post-processing `athenak_rt`, please also cite Yang et al. (2026).
 
 ```bibtex
 @article{Jiang2026TDE,
