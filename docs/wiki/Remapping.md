@@ -303,8 +303,9 @@ report; rank-0 `std::cout` throughout).
   extrusion, not a remap, and the CC sampler's unconditional `(ngh+k, ngh+j, ngh+i)`
   addressing would walk a full ghost stride into the next variable's slice on a
   `nout3 == 1` source.
-- **Fluid EOS must match** (column count, ideal-vs-isothermal, tabulated-vs-analytic, and
-  `gamma` to `1e-12` for a gamma-law gas); floors (`dfloor`/`pfloor`/`tfloor`) only warn.
+- **Fluid EOS must match** (column count, tabulated-vs-analytic, and `gamma` to `1e-12`
+  for a gamma-law gas); floors (`dfloor`/`pfloor`/`tfloor`) only warn.  An `isothermal`
+  EOS is refused on either end.
 - **`band_mode = floor` with a GR class is fatal** — Newtonian floor-fade thermodynamics
   (ambient `rho`/`p` floors, `E = eint + 0.5 rho v²`) has no meaning for densitized GR
   conserved variables.

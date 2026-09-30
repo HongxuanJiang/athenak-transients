@@ -198,9 +198,10 @@ restarting into.
 - Source and target relativity classes must match, and so must the CC module type
   (hydro->hydro, mhd->mhd).
 - **Fluid EOS must match**: the source's own `<hydro|mhd>/eos` decides its conserved
-  column count (only `isothermal` drops the energy column), and it must agree with the
-  target's on the column count, on ideal-vs-isothermal, on tabulated-vs-analytic and, for
-  a gamma-law gas, on `gamma` to 1e-12.  Floors (`dfloor`, `pfloor`, `tfloor`) only warn.
+  column count, and it must agree with the target's on the column count, on
+  tabulated-vs-analytic and, for a gamma-law gas, on `gamma` to 1e-12.  Floors (`dfloor`,
+  `pfloor`, `tfloor`) only warn.
+- An `isothermal` EOS (no energy column) is refused on either end.
 - 3D on both ends, whether or not there is a B field to remap.
 - `band_mode = floor` with a GR class.
 - Cannot be combined with `time/lat = true` (remap first, then restart the remapped run

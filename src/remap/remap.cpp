@@ -117,13 +117,6 @@ RemapSummary LoadAndApplyRemap(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *ds
     const int base_nvars = is_mhd ? (pmbp->pmhd->nmhd + pmbp->pmhd->nscalars)
                                   : (pmbp->phydro->nhydro + pmbp->phydro->nscalars);
     impl::BuildSourceThermalEnergy(src, base_nvars, floor_rho, floor_eint);
-    if (use_dual) {
-      if (is_mhd) {
-        pmbp->pmhd->dual_energy_needs_init = true;
-      } else {
-        pmbp->phydro->dual_energy_needs_init = true;
-      }
-    }
   }
 
   if (on_loaded) {
@@ -134,6 +127,18 @@ RemapSummary LoadAndApplyRemap(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *ds
   if (src.load_fc) {
     impl::BuildCoveringPotential(src, eff_opts);
     impl::ApplyRemapFC(pm, pmbp, eff_opts, src);
+  }
+  // A floor-fade pass writes the dual-energy column of every target cell (the source's
+  // own auxiliary where it has one, else e_int of the remapped state), so the startup
+  // re-seed from E - KE, which would discard the auxiliary the source trusted in its cold
+  // cells, is skipped.  A keep pass leaves the target's pgen cells to be seeded.
+  if (!src.gr_mode && use_dual) {
+    const bool seed = (eff_opts.band_mode == RemapBandMode::kKeepTarget);
+    if (is_mhd) {
+      pmbp->pmhd->dual_energy_needs_init = seed;
+    } else {
+      pmbp->phydro->dual_energy_needs_init = seed;
+    }
   }
 
   pm->time = src.time;

@@ -421,8 +421,12 @@ int main(int argc, char *argv[]) {
   // TDE remapping is applied after mesh construction, so reject combinations that would
   // make BuildTree/LoadBalance consume LAT metadata for the pre-remap state.
   const bool initial_tde_remap =
-      !res_flag && pinput->DoesParameterExist("problem", "remap") &&
-      pinput->GetBoolean("problem", "remap");
+      !res_flag &&
+      ((pinput->DoesParameterExist("problem", "remap") &&
+        pinput->GetBoolean("problem", "remap")) ||
+       (pinput->DoesBlockExist("remap") &&
+        (!pinput->DoesParameterExist("remap", "enable") ||
+         pinput->GetBoolean("remap", "enable"))));
   const bool hydro_lat_requested = pinput->IsLATEnabled();
   const bool self_gravity_requested =
       pinput->DoesBlockExist("gravity") &&
@@ -439,8 +443,8 @@ int main(int argc, char *argv[]) {
   if (initial_tde_remap && hydro_lat_requested) {
     std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
               << std::endl
-              << "time/lat cannot be used with problem/remap=true."
-              << std::endl;
+              << "time/lat cannot be used with a remap (<remap> block); remap first, "
+              << "then restart the remapped run with time/lat = true." << std::endl;
     std::exit(EXIT_FAILURE);
   }
   const bool self_gravity_lat_has_solve_dt =

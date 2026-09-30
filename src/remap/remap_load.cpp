@@ -249,6 +249,12 @@ bool LoadRemapSourceData(const std::string &path, Mesh *pm, MeshBlockPack *pmbp,
   const bool src_tabulated = (src_eos != "ideal" && src_eos != "isothermal");
   const int src_nhyd = src_is_ideal ? 5 : 4;
   auto gas_eos = (pmhd != nullptr) ? pmhd->peos->eos_data : phyd->peos->eos_data;
+  // The remap engine floors, carries and rebuilds the energy column (IEN), which an
+  // isothermal gas does not have, so isothermal sources and targets are refused.
+  if (!src_is_ideal || !gas_eos.is_ideal) {
+    FatalLoad("Remap requires a fluid EOS with an energy equation on both ends; "
+              "isothermal sources and targets are not supported.");
+  }
   if (src_nhyd != target_nhyd) {
     FatalLoad(std::string("Remap source <") + gas_block + ">/eos = '" + src_eos +
               "' stores " + std::to_string(src_nhyd) + " conserved gas columns but the "

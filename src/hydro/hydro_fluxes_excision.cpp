@@ -121,7 +121,9 @@ void Hydro::ApplyExcisionSinkBoundary(const Real t) {
   const int ks = indcs_.ks;
   const int ke = indcs_.ke;
   const int nvars_ = nvars;
-  const bool dual_enabled = use_dual_energy;
+  // Only the Newtonian p dV auxiliary has its own face-velocity array and flux here; a
+  // GR auxiliary (D*kappa) is advected with the mass flux like a passive scalar.
+  const bool dual_enabled = use_dual_energy && dual_energy_pdv;
   const int dual_idx = dual_energy_idx;
   const Real excise_r2 = excise_radius * excise_radius;
   auto &size_ = pmy_pack->pmb->mb_size;

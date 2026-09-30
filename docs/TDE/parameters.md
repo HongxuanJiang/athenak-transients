@@ -68,7 +68,7 @@ stay unchanged.
 | `problem/mass_ratio` | real | `1000.0` | `M_BH / M_star`. With `M_star = 1` this is also the BH mass in code units. Must be `> 0`. | `src/pgen/tde_external.cpp` |
 | `problem/beta` | real | `1.0` | Penetration factor `r_t / r_p`, with `r_t = star_radius * mass_ratio^(1/3)` and `r_p = r_t / beta`. Must be `> 0`. | `src/pgen/tde_external.cpp` |
 | `problem/ecc_bh` | real | `1.0` | Orbital eccentricity, `0 < e <= 1`. `1` gives a parabolic orbit. For `e < 1` the star starts at apoapsis and `sep_initial` is ignored. | `src/pgen/tde_external.cpp` |
-| `problem/theta_bh` | real | `0.0` | Inclination in degrees. The orbit is rotated about the y axis. | `src/pgen/tde_external.cpp` |
+| `problem/theta_bh` | real | `0.0` | Inclination in degrees. The orbit is rotated about the y axis, so a positive value tilts the orbital angular momentum from `+z` toward `+x`. Both orbit branches use the same sign. | `src/pgen/tde_external.cpp` |
 | `problem/sep_initial` | real | `10.0` | Initial star-BH separation in units of `r_t` for the parabolic orbit. Must be `> 0`, and large enough for the chosen `beta`. | `src/pgen/tde_external.cpp` |
 | `problem/provide_params` | bool | `false` | If `true`, the star state relative to the BH is given directly by `x1..vz1` and the orbit keys above are not used. | `src/pgen/tde_external.cpp` |
 | `problem/x1`, `y1`, `z1` | real | `0.0` | Star position relative to the BH when `provide_params = true`. | `src/pgen/tde_external.cpp` |
@@ -168,8 +168,9 @@ maximum density lies below `stream_shell_derefine_dfloor_mult * dfloor` are dere
 
 Up to four tiers (`N = 1..4`, `kMaxStreamLevelTiers` at `src/pgen/tde_external.cpp`) change the target level,
 thickness, and thresholds beyond a given radius.  Tier radii must increase with `N`.
-Each tier needs both its radius and its offset, and the other keys inherit the
-zone-0 values when omitted.
+Each tier needs both its radius and its offset.  An omitted `rho_frac_N` or `fill_frac_N`
+takes the zone-0 value, while an omitted `stream_shell_dr_N` is automatic (four block
+widths at the tier's target level), not `stream_shell_dr`.
 
 | Key | Type | Default | Meaning | Source |
 |---|---|---|---|---|
@@ -221,7 +222,7 @@ Details: [`../wiki/Multigrid-Self-Gravity.md`](../wiki/Multigrid-Self-Gravity.md
 | Key | Type | Default | Meaning | Value in decks | Source |
 |---|---|---|---|---|---|
 | `gravity/self_gravity` | bool | `true` | Enables the multigrid Poisson solver. | `true` | `src/srcterms/srcterms.cpp` |
-| `gravity/four_pi_G` | real | `1.0` in `tde_external` | Value of `4 pi G` in code units. Must be `> 0`. The BH potential uses `G = four_pi_G / (4 pi)`. | `1.0` | `src/pgen/tde_external.cpp`, `src/gravity/mg_gravity.cpp` |
+| `gravity/four_pi_G` | real | required with self-gravity (`1.0` without a `<gravity>` block) | Value of `4 pi G` in code units. Must be `> 0`. The gravity module stores `-1` when the key is omitted, so the run stops. The BH potential uses `G = four_pi_G / (4 pi)`. | `1.0` | `src/pgen/tde_external.cpp`, `src/gravity/mg_gravity.cpp` |
 | `gravity/solve_dt` | real | none (see below) | Physical interval between Poisson solves, `Delta t_sg`. Must be `>= 0`. The decks use `0.03`, and the paper compares it with `0.0025`. | `0.03` | `src/gravity/mg_gravity.cpp` |
 | `gravity/solve_every` | int | `1` | Solve every N-th cycle. Used only when `solve_dt` is absent or `0`. | not set | `src/gravity/mg_gravity.cpp` |
 | `gravity/threshold` | real | `-1.0` | Defect convergence threshold. `0.0` selects automatic convergence control. Either `threshold` or `niteration` must be given. | `0.0` | `src/gravity/mg_gravity.cpp` |

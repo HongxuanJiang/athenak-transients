@@ -26,7 +26,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --output-dir) OUTPUT_DIR=${2:?--output-dir needs a directory}; shift 2 ;;
     --keep-download) KEEP_DOWNLOAD=1; shift ;;
-    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1 (see --help)" >&2; exit 2 ;;
   esac
 done

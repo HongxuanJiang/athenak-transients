@@ -2872,9 +2872,11 @@ ExcisionShellBlocks excision_shell_blocks;
 void TDEExternalHydroStateFixup(MeshBlockPack *pmbp, const Real time) {
   if (pmbp == nullptr || pmbp->pmesh == nullptr || pmbp->phydro == nullptr) return;
   // A stage-0 call outside a step (InitBoundaryValuesAndPrimitives) has no valid
-  // pmesh->dt -- on a fresh start it runs before the first Mesh::NewTimeStep -- so it
-  // must not advance the translating frame; it reads the current frame state instead.
-  if (!use_translating_frame_global || pmbp->pmesh->pgen->user_srcs_time_valid) {
+  // pmesh->dt -- on a fresh start it runs before the first Mesh::NewTimeStep, and after a
+  // remap it holds the source's last dt -- so it must not advance the translating frame
+  // or a live BH; it reads the current frame and BH state instead.
+  if ((!use_translating_frame_global && !bh_live_global) ||
+      pmbp->pmesh->pgen->user_srcs_time_valid) {
     PrepareFrameBHStepState(pmbp->pmesh);
   }
   if (!bh_inner_boundary_global || bh_excise_radius_global <= 0.0) return;
@@ -3012,7 +3014,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   Real four_pi_G = pin->GetOrAddReal("gravity", "four_pi_G", 1.0);
   if (four_pi_G <= 0.0) {
     std::cout << "### FATAL ERROR in ProblemGenerator::UserProblem" << std::endl
-              << "gravity/four_pi_G must be > 0." << std::endl;
+              << "gravity/four_pi_G must be > 0 (set it in <gravity>, e.g. 1.0)."
+              << std::endl;
     std::exit(EXIT_FAILURE);
   }
   newton_g_global = four_pi_G / (4.0*M_PI);
@@ -3529,8 +3532,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       star_vx = v_apo;
       star_vy = 0.0;
       star_vz = 0.0;
-      RotateAboutY(star_x, star_y, star_z, -theta_bh);
-      RotateAboutY(star_vx, star_vy, star_vz, -theta_bh);
+      RotateAboutY(star_x, star_y, star_z, theta_bh);
+      RotateAboutY(star_vx, star_vy, star_vz, theta_bh);
     } else {
       // Parabolic branch follows the same construction used in Phantom's TDE setup.
       Real r0 = sep_initial * r_tidal;
@@ -3672,6 +3675,13 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
         const remap::RemapSummary &) {
       if (use_translating_frame_global) {
         frame_state_time_global = pm_cap->time;
+        // The source state moved the frame center and the BH, so the stored frame
+        // acceleration is re-evaluated at the new state, as on a restart.
+        EvaluateBHAccelerationAtPoint(orbit_center_x_global, orbit_center_y_global,
+                                      orbit_center_z_global,
+                                      bh_inertial_x_global, bh_inertial_y_global,
+                                      bh_inertial_z_global,
+                                      frame_ax_global, frame_ay_global, frame_az_global);
         InvalidateFrameBHStepState();
         SyncProblemRuntimeState();
       } else {

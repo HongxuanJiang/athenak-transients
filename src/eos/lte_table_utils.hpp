@@ -717,23 +717,6 @@ inline void InitializeLTETableEOS(const std::string &block, MeshBlockPack *pp,
     const double *xhe2_row = table["xhe2"] + ir*ntemp;
     const double *mu_row = table["mu"] + ir*ntemp;
     const double *beta_rad_row = table["beta_rad"] + ir*ntemp;
-    Real floor_logtemp = std::log(std::max(tfloor_code*eos_data.temp_unit_cgs,
-                                           static_cast<Real>(1.0e-99)));
-    if (eos_data.pfloor > 0.0) {
-      if (log_p_floor <= logpress_row[0]) {
-        floor_logtemp = std::max(floor_logtemp, static_cast<Real>(table["logtemp"][0]));
-      } else if (log_p_floor >= logpress_row[ntemp - 1]) {
-        floor_logtemp = std::max(floor_logtemp,
-                                 static_cast<Real>(table["logtemp"][ntemp - 1]));
-      } else {
-        floor_logtemp = std::max(
-            floor_logtemp,
-            InvertMonotonicFieldAtRow(table["logtemp"], logpress_row, ntemp,
-                log_p_floor));
-      }
-    }
-    h_logeps_floor(ir) =
-        EvalFieldAtLogTemp(table["logtemp"], logeps_row, ntemp, floor_logtemp);
     for (int ie = 0; ie < eos_data.saha_neps; ++ie) {
       const Real log_eps_target = eos_data.saha_logeps_min + ie*dlogeps;
       Real log_temp = static_cast<Real>(table["logtemp"][0]);
