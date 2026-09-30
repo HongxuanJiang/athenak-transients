@@ -2,28 +2,6 @@
 problem   = TDE of a 1 Msun star by a 1000 Msun black hole, step 5 of 5 (fallback with LAT)
 reference = Jiang et al., End-to-End Numerical Framework for TDEs with AthenaK, ApJS, Table 1
 
-# Step 5: fallback stage of the FID run (Secs. 7-9), in the initial rest frame of the
-# BH.  The live BH (bh_live) moves in this frame.
-#   * Reads the step-4 restart at t = 70 t0 (0.79 P_mb) and remaps it onto a
-#     1024 x 1280 x 256 Rsun box that holds the bound debris until late times.
-#   * 8 AMR levels (finest cell 0.0625 Rsun, r_t / dx = 160) with localized adaptive
-#     time stepping (LAT, Sec. 7): 7 LAT levels, so f_max = 2^7 = 128.
-#   * Refinement: density criterion, BH-centered stream shells, and extra levels for
-#     gas that is unbound from the BH (unbound_amr).
-#
-# A remap cannot run with LAT on, so this step takes two commands, both run from a
-# directory named 05_fallback_lat next to 04_bh_frame:
-#   (a) remap with LAT off and stop at t = 71, which writes rst/TDEExternalLTEPrad.00017.rst
-#         mpirun -np 10 athena -i tde_05_fallback_lat.athinput
-#   (b) restart from that file with LAT on and run to t = 440 t0 (5 P_mb)
-#         mpirun -np 10 athena -r rst/TDEExternalLTEPrad.00017.rst time/lat=true problem/bh_reciprocal_force=true time/tlim=440.2
-# The LAT settings below are stored in the restart file and take effect in (b).
-# The reciprocal force on the live BH (the gas pull on the BH, applied with the same
-# stencil as the BH force on the gas) needs LAT, so it is switched on in (b) only.
-# For the synchronized reference run of the LAT benchmark (Sec. 7.4), leave out both
-# time/lat=true and problem/bh_reciprocal_force=true in (b), keep everything else
-# unchanged.
-
 <job>
 basename = TDEExternalLTEPrad
 
@@ -53,17 +31,17 @@ nx2 = 32
 nx3 = 32
 
 <units>
-mass_cgs   = 1.98841586e33          # 1 Msun
-length_cgs = 1.3914e11              # 2 Rsun, so star_radius = 0.5 is 1 Rsun
-time_cgs   = 1.2709152632111343e3   # t0 = sqrt(L0^3 / (4 pi G M0))
+mass_cgs   = 1.98841586e33
+length_cgs = 1.3914e11
+time_cgs   = 1.2709152632111343e3
 mu         = 1.0
 
 <mesh_refinement>
 refinement          = adaptive
 num_levels          = 8
-ncycle_check        = 512          # with LAT, AMR checks happen at most once
-refinement_interval = 512          # per LAT synchronization window
-max_nmb_per_rank    = 750
+ncycle_check        = 512
+refinement_interval = 512
+max_nmb_per_rank    = 520
 
 <amr_criterion0>
 method             = min_max
@@ -71,10 +49,10 @@ variable           = hydro_w_d
 value_max          = 1.0e-1
 derefine_value_max = 1.0e-4
 
-<amr_criterion1>                    # BH-centered shells, see stream_shell_* below
+<amr_criterion1>
 method = user
 
-<refined_region0>                   # minimum level around the BH and the returning stream
+<refined_region0>
 level = 3
 x1min = -65
 x1max = 15
@@ -88,10 +66,9 @@ evolution  = dynamic
 integrator = rk2
 cfl_number = 0.5
 nlim       = -1
-tlim       = 71.0                   # set to 440.2 on the command line in (b)
+tlim       = 71.0
 ndiag      = 1
 
-# localized adaptive time stepping (Sec. 7), switched on in (b)
 lat                      = false
 lat_levels               = 7
 lat_same_level           = true
@@ -111,7 +88,7 @@ sfloor           = 0.0
 cs_ceil          = 15.0
 vceil            = 15.0
 fofc             = false
-dual_energy      = true             # Sec. 5
+dual_energy      = true
 dual_energy_eta1 = 1.0e-3
 dual_energy_eta2 = 1.0e-4
 lte_bounds       = clamp
@@ -119,7 +96,7 @@ lte_debug_checks = false
 allow_reinterpretive_restart = true
 
 <gravity>
-self_gravity = true                 # multigrid self-gravity (Sec. 3.2)
+self_gravity = true
 four_pi_G    = 1.0
 threshold    = 0.0
 fmg_ncycle   = 1
@@ -127,7 +104,7 @@ show_defect  = true
 npresmooth   = 1
 npostsmooth  = 2
 rho_grav_min = 1.0e-9
-solve_dt     = 0.03                 # self-gravity cadence Delta t_sg (Sec. 8.1)
+solve_dt     = 0.03
 
 <remap>
 enable        = true
@@ -139,7 +116,6 @@ settle_passes = 1
 pgen_name = tde_external
 user_srcs = true
 
-# star (read again by the problem generator, the state itself comes from the remap)
 star_radius            = 0.5
 poly_n                 = 1.5
 stellar_structure_mode = eos_balanced
@@ -156,24 +132,22 @@ vx_star                = 0.0
 vy_star                = 0.0
 vz_star                = 0.0
 
-# frame and black hole
-external_bh_gravity_source = true   # BH gravity enters as a source term with the same stencil as the BH force
-bh_live               = true   # the BH orbit responds to the gas (leapfrog with the gas pull on the BH)
-bh_reciprocal_force   = false  # part (b) switches this on together with time/lat (see header)
+external_bh_gravity_source = true
+bh_live               = true
+bh_reciprocal_force   = false
 bh_pair_force         = finite_difference
 use_translating_frame = false
 frame_rho_min         = 1.0e-9
 bh_grav_rho_min       = 1.0e-9
 bh_max_amr            = false
-mass_ratio            = 1000.0      # M_BH / M_star
-beta                  = 1.0         # r_t / r_p
+mass_ratio            = 1000.0
+beta                  = 1.0
 ecc_bh                = 1.0
 theta_bh              = 0.0
-sep_initial           = 10.0        # initial separation in units of r_t
+sep_initial           = 10.0
 bh_softening          = 5.0e-3
 bh_excise_radius      = 0.2
 
-# refinement shells around the BH used by <amr_criterion1>
 unbound_amr                       = true
 unbound_amr_level_offset          = 4
 unbound_amr_rho_min               = 1.0e-9

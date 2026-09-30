@@ -2,21 +2,6 @@
 problem   = TDE of a 1 Msun star by a 1000 Msun black hole, step 1 of 5 (disruption)
 reference = Jiang et al., End-to-End Numerical Framework for TDEs with AthenaK, ApJS, Table 1
 
-# Step 1: initial star and first pericenter passage.
-#   * EOS-balanced 1 Msun, 1 Rsun star built from the tabulated H/He EOS (Sec. 4.3),
-#     briefly relaxed with velocity damping for t < relax_t_end.
-#   * The star starts at 10 r_t on a parabolic orbit (beta = 1) and is evolved in a
-#     frame translating with the stellar center of mass (Sec. 3.1).
-#   * 64 Rsun box, 9 AMR levels, about 256 cells across the initial stellar diameter.
-#   * Runs to pericenter, t = 21 t0 (0.24 P_mb).  The restart file written at t = 21
-#     (rst/TDEExternalLTEPrad.00007.rst) is the source of step 2.
-#
-# Code units: M0 = 1 Msun, L0 = 2 Rsun, t0 = 1271 s, 4 pi G = 1.
-# Build:  cmake -D PROBLEM=tde_external ...   (see README.md in this directory)
-# Run from a directory named 01_disruption next to the EOS table, e.g.
-#   mpirun -np 10 athena -i tde_01_disruption.athinput
-# Resources: 10 x 16 GB GPUs are sufficient.
-
 <job>
 basename = TDEExternalLTEPrad
 
@@ -46,9 +31,9 @@ nx2 = 32
 nx3 = 32
 
 <units>
-mass_cgs   = 1.98841586e33          # 1 Msun
-length_cgs = 1.3914e11              # 2 Rsun, so star_radius = 0.5 is 1 Rsun
-time_cgs   = 1.2709152632111343e3   # t0 = sqrt(L0^3 / (4 pi G M0))
+mass_cgs   = 1.98841586e33
+length_cgs = 1.3914e11
+time_cgs   = 1.2709152632111343e3
 mu         = 1.0
 
 <mesh_refinement>
@@ -56,7 +41,7 @@ refinement          = adaptive
 num_levels          = 9
 ncycle_check        = 10
 refinement_interval = 10
-max_nmb_per_rank    = 720           # lower this on GPUs with less than 16 GB
+max_nmb_per_rank    = 520
 
 <amr_criterion0>
 method             = min_max
@@ -64,7 +49,7 @@ variable           = hydro_w_d
 value_max          = 1.0e-2
 derefine_value_max = 1.0e-3
 
-<refined_region0>                   # keeps the star at the finest level initially
+<refined_region0>
 level = 8
 x1min = -0.5
 x1max = 0.5
@@ -94,14 +79,14 @@ sfloor           = 0.0
 cs_ceil          = 15.0
 vceil            = 15.0
 fofc             = false
-dual_energy      = true             # Sec. 5
+dual_energy      = true
 dual_energy_eta1 = 1.0e-3
 dual_energy_eta2 = 1.0e-4
 lte_bounds       = clamp
 lte_debug_checks = false
 
 <gravity>
-self_gravity = true                 # multigrid self-gravity (Sec. 3.2)
+self_gravity = true
 four_pi_G    = 1.0
 threshold    = 0.0
 fmg_ncycle   = 1
@@ -109,13 +94,12 @@ show_defect  = true
 npresmooth   = 1
 npostsmooth  = 2
 rho_grav_min = 1.0e-9
-solve_dt     = 0.03                 # self-gravity cadence Delta t_sg (Sec. 8.1)
+solve_dt     = 0.03
 
 <problem>
 pgen_name = tde_external
 user_srcs = true
 
-# star
 star_radius            = 0.5
 poly_n                 = 1.5
 stellar_structure_mode = eos_balanced
@@ -132,19 +116,17 @@ vx_star                = 0.0
 vy_star                = 0.0
 vz_star                = 0.0
 
-# frame and black hole
-external_bh_gravity_source = true   # BH gravity enters as a source term with the same stencil as the BH force
-bh_live               = false  # the BH starts outside this 64 Rsun box, so it follows the two-body
-                                # orbit here; it becomes live at the first remap (step 2)
+external_bh_gravity_source = true
+bh_live               = false
 use_translating_frame = true
 frame_rho_min         = 1.0e-9
 bh_grav_rho_min       = 1.0e-9
 bh_max_amr            = false
-mass_ratio            = 1000.0      # M_BH / M_star
-beta                  = 1.0         # r_t / r_p
+mass_ratio            = 1000.0
+beta                  = 1.0
 ecc_bh                = 1.0
 theta_bh              = 0.0
-sep_initial           = 10.0        # initial separation in units of r_t
+sep_initial           = 10.0
 bh_softening          = 5.0e-3
 bh_excise_radius      = 0.2
 
