@@ -443,7 +443,9 @@ Notes on resources.
 
 ## How to cite
 
-If you use this framework, please cite the TDE paper and the AthenaK code paper.
+If you use this framework, please cite the TDE paper and the AthenaK code paper.  If you
+use the radiative post-processing `athenak_rt`, please also cite Yang et al. (2026), whose
+photospheric method it implements.
 
 ```bibtex
 @article{Jiang2026TDE,
@@ -451,7 +453,22 @@ If you use this framework, please cite the TDE paper and the AthenaK code paper.
              Yu, Fangyuan and Xia, Jing-Ze and Li, Xinyu and Mizuno, Yosuke},
   title   = {An End-to-End Numerical Framework for Tidal Disruption Events with {AthenaK}},
   journal = {The Astrophysical Journal Supplement Series},
-  note    = {in revision}
+  year    = {2026},
+  note    = {in revision},
+  archivePrefix = {arXiv},
+  eprint  = {2609.37859}
+}
+
+@article{Yang2026Engulfment,
+  author  = {Yang, Mengqi and Lai, Dong and Wu, Fuyuan and Zhang, Jie},
+  title   = {Engulfment of Eccentric Planets by Giant Stars: Hydrodynamics and Light Curves},
+  journal = {The Astrophysical Journal},
+  year    = {2026},
+  volume  = {998},
+  pages   = {118},
+  doi     = {10.3847/1538-4357/ae3157},
+  archivePrefix = {arXiv},
+  eprint  = {2510.25547}
 }
 
 @article{Stone2026AthenaK,

@@ -7,10 +7,16 @@ the finest AMR level of the dense gas onto a uniform Cartesian ray grid,
 recovers the temperature from the tabulated LTE equation of state the run used,
 and integrates the transfer equation along parallel rays with numba.
 
-The physics and numerics are those of the scripts validated for the paper
-(Yang et al. 2026; `light_curve_tde_cartesian.py` and
-`rt_continuum_experiments.py` in the reproducibility archive).  The package
-only replaces their hard-coded configuration with a parameter file.
+The method is the photospheric post-processing of
+[Yang et al. (2026, ApJ, 998, 118)](https://ui.adsabs.harvard.edu/abs/2026ApJ...998..118Y) ([arXiv:2510.25547](https://arxiv.org/abs/2510.25547)),
+developed by Mengqi Yang for Athena++ and adapted here to Cartesian AthenaK output, with
+the multifrequency continuum transfer of
+[Jiang et al. (2026)](https://arxiv.org/abs/2609.37859).  The physics and numerics are those of the scripts
+validated for that paper (`light_curve_tde_cartesian.py` and `rt_continuum_experiments.py`
+in the reproducibility archive); the package replaces their hard-coded configuration
+with a parameter file.
+
+If you use `athenak_rt`, please cite Yang et al. (2026) and Jiang et al. (2026).
 
 ## Modes
 

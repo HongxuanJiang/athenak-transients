@@ -24,7 +24,7 @@ and mergers, common-envelope evolution, and other transients.
 
 > Jiang, H.-X., Yang, M., Velasco-Romero, D. A., Yu, F., Xia, J.-Z., Li, X., and Mizuno, Y.,
 > *An End-to-End Numerical Framework for Tidal Disruption Events with AthenaK*,
-> The Astrophysical Journal Supplement Series (in revision).
+> The Astrophysical Journal Supplement Series (in revision), [arXiv:2609.37859](https://arxiv.org/abs/2609.37859).
 
 ## Highlights
 
@@ -51,15 +51,20 @@ and mergers, common-envelope evolution, and other transients.
 or AMR) into line-of-sight luminosities, spectra, and images:
 
 * **multifrequency H/He continuum transfer**: free-free and bound-free absorption of H and
-  He with Saha ionization, and electron scattering through a thermalization-depth
-  treatment;
+  He with the ionization fractions of the tabulated EOS, and electron scattering through a
+  thermalization-depth treatment;
 * **grey reference modes**: the formal solution, the formal solution with thermalization,
   and the tau = 1 photosphere.
 
 It is not specific to TDEs.  It works on any AthenaK hydrodynamic snapshot written with
 the tabulated LTE equation of state; a black-hole excision mask is applied only when the
-snapshot defines one.  The Saha solver of the multifrequency mode currently assumes
+snapshot defines one.  The optional Saha solver (`populations = saha`) assumes
 `X = 0.7`, `Y = 0.3`.
+
+`athenak_rt` is built on the photospheric post-processing method of
+[Yang et al. (2026, ApJ, 998, 118)]({YANG_ADS}) ([arXiv:2510.25547]({YANG_ARX})), developed
+by Mengqi Yang for Athena++ and adapted here to Cartesian AthenaK output.  If you use it,
+please cite Yang et al. (2026) together with Jiang et al. (2026).
 
 ```bash
 cd /path/to/athenak
@@ -139,7 +144,9 @@ can also be downloaded from the release assets of this repository.  See
 
 ## Citation
 
-If you use the TDE workflow, please cite the paper above and the AthenaK code paper.
+If you use the TDE workflow, please cite the paper above
+([arXiv:2609.37859](https://arxiv.org/abs/2609.37859)) and the AthenaK code paper.  If you use `athenak_rt`,
+please also cite [Yang et al. (2026)](https://ui.adsabs.harvard.edu/abs/2026ApJ...998..118Y), whose method it implements.
 A BibTeX entry for each is given in [`docs/TDE/README.md`](docs/TDE/README.md#how-to-cite).
 
 For more details on the features and algorithms implemented in AthenaK, see the code papers:

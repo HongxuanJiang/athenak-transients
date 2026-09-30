@@ -3,7 +3,9 @@
 `athenak_rt` (the top-level `athenak_rt/` directory) computes line-of-sight luminosities,
 spectra, image-plane maps, and light curves from AthenaK `.bin` dumps, for example of a TDE
 run.  It is the post-processing described in the section "Radiative post-processing and
-synthetic observables" of Jiang et al. (ApJS).  The package reads a dump, resamples the
+synthetic observables" of [Jiang et al. (2026)](https://arxiv.org/abs/2609.37859), built on the photospheric
+method of [Yang et al. (2026, ApJ, 998, 118)](https://ui.adsabs.harvard.edu/abs/2026ApJ...998..118Y) that Mengqi Yang developed for
+Athena++.  If you use `athenak_rt`, please cite both papers.  The package reads a dump, resamples the
 finest AMR level of the dense gas onto a uniform Cartesian ray grid, recovers the gas
 temperature from the same tabulated equation of state (EOS) that the simulation used, and
 integrates the transfer equation along parallel rays.  A run is described by a parameter
@@ -77,7 +79,7 @@ a warning, and the choice used is stored as `populations_used` in the output.
 
 The multifrequency mode is the one adopted in the paper.  The grey `tau1` photosphere
 is kept as a reference.  In the paper it overestimates the luminosity by roughly a
-factor of five, because near the Planck peak the bound-free opacity is much larger than
+factor of seven, because near the Planck peak the bound-free opacity is much larger than
 the Rosseland mean and the emission emerges from cooler, outer layers.
 
 ### Cell selection and geometry
@@ -518,8 +520,10 @@ The results are LTE post-processing estimates, and the following limits apply.
 
 ## References
 
-The photospheric method follows Yang et al. (2026, ApJ, 998, 118), adapted to Cartesian
-AthenaK output.  Opacities come from MESA (Paxton et al. 2011, 2013, 2015, 2018, 2019),
+The photospheric method follows [Yang et al. (2026, ApJ, 998, 118)](https://ui.adsabs.harvard.edu/abs/2026ApJ...998..118Y)
+([arXiv:2510.25547](https://arxiv.org/abs/2510.25547)), adapted to Cartesian AthenaK output, and the
+multifrequency transfer is that of [Jiang et al. (2026)](https://arxiv.org/abs/2609.37859).  Please cite both
+papers when you use `athenak_rt`.  Opacities come from MESA (Paxton et al. 2011, 2013, 2015, 2018, 2019),
 including OPAL tables (Iglesias & Rogers 1996) and the low-temperature tables of
 Ferguson et al. (2005), for the Grevesse & Sauval (1998) mixture.  Credit these sources
 when you use results derived from the bundled tables (see
