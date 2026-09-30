@@ -9,8 +9,7 @@
   gas density in the orbital plane of the fiducial (FID) run over seven fallback times of the most
   bound debris (7&nbsp;P<sub>mb</sub>).  The inset follows the pericenter region; white areas lie outside the
   computational box, which grows with each remap.
-  <br><strong><a href="https://youtu.be/Roow6KcmfUI">&#9654; Watch the full movie on YouTube (4K)</a></strong>
-  &middot; download <a href="https://github.com/HongxuanJiang/athenak-transients/releases/download/v1.0.0/tde_fid_7pmb_1080p.mp4">1080p MP4</a>,
+  <a href="https://youtu.be/Roow6KcmfUI">YouTube</a> &middot;
   <a href="https://github.com/HongxuanJiang/athenak-transients/releases/download/v1.0.0/tde_fid_7pmb_full.mp4">original-resolution MP4</a></em>
 </p>
 
