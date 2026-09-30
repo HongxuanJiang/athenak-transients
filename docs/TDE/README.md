@@ -321,15 +321,18 @@ Refinement combines the standard density criterion with TDE-specific requests.
 * `<refined_regionN>` sets a minimum level in a box, for example around the BH and the
   returning stream.
 * `<amr_criterion1> method = user` enables the problem-specific requests:
-  * `bh_max_amr` forces blocks touching the excision sphere to the finest level
-    (`max_level - bh_max_amr_level_offset`).
-  * `unbound_amr` puts blocks that contain gas unbound from the BH on the level
-    `max_level - unbound_amr_level_offset`, above the density `unbound_amr_rho_min`.
+  * `bh_max_amr` targets blocks touching the excision sphere at
+    `max_level - bh_max_amr_level_offset`.
+  * `unbound_amr` targets blocks in which at least `unbound_amr_fill_frac` of the cells
+    hold gas unbound from the BH, above the density `unbound_amr_rho_min`, at
+    `max_level - unbound_amr_level_offset`.
   * `stream_shell_*` follows the dense stream with spherical shells around the BH.  Up
     to four radial tiers (`stream_shell_level_radius_N`, `_level_offset_N`, `_dr_N`,
     `_rho_frac_N`, `_fill_frac_N`) select a finer or coarser target level with
     distance, and `stream_shell_xsplit_radius` tracks the two sides of the BH separately
     inside a radius.
+  * A block is moved toward the finest of the targets that apply to it, and a block
+    finer than all of them is derefined unless a standard criterion asks to refine it.
 * With LAT, `ncycle_check` and `refinement_interval` are set to 512, so that AMR checks
   happen at most about once per LAT synchronization window.
 * `mesh_refinement/max_nmb_per_rank` caps the MeshBlocks per rank and therefore the device

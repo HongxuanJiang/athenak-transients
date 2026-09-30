@@ -16,6 +16,7 @@
 #include "parameter_input.hpp"
 #include "mesh.hpp"
 #include "mesh_refinement.hpp"
+#include "mesh/mb_storage.hpp"
 
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
@@ -172,7 +173,7 @@ RefinementCriteria::RefinementCriteria(Mesh *pm, ParameterInput *pin) :
     int ncells1 = indcs.nx1 + 2*(indcs.ng);
     int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
     int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
-    int nmb = pm->pmb_pack->nmb_thispack;
+    int nmb = std::max(pm->pmb_pack->nmb_thispack, MeshBlockStorageReserve());
     Kokkos::realloc(dvars, nmb, nderived, ncells3, ncells2, ncells1);
   }
 
@@ -188,6 +189,7 @@ RefinementCriteria::~RefinementCriteria() {
 
 bool RefinementCriteria::ResizeMeshBlockStorage(int nmb, bool exact) {
   if (nderived <= 0) return false;
+  nmb = std::max(nmb, MeshBlockStorageReserve());
   auto &indcs = pmy_mesh->mb_indcs;
   int ncells1 = indcs.nx1 + 2*(indcs.ng);
   int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
@@ -336,6 +338,7 @@ void RefinementCriteria::SetRefinementData(MeshBlockPack* pmbp, bool count_deriv
 
 void RefinementCriteria::CheckMinMax(MeshBlockPack* pmbp, RefCritData crit) {
   auto &refine_flag = pmbp->pmesh->pmr->refine_flag;
+  auto &refine_hold = pmbp->pmesh->pmr->refine_hold;
   int mbs = pmbp->pmesh->gids_eachrank[global_variable::my_rank];
 
   // capture variables for kernels
@@ -403,6 +406,9 @@ void RefinementCriteria::CheckMinMax(MeshBlockPack* pmbp, RefCritData crit) {
       bool criterion_active = (team_qmax > -0.5*FLT_MAX);
       bool refine_active = criterion_active && team_qmax > valmax;
       if (refine_active && level.d_view(m) < max_ref_level) {flag = 1;}
+      if (refine_active && level.d_view(m) == max_ref_level) {
+        refine_hold.d_view(m+mbs) = 1;
+      }
       if (criterion_active && !refine_only && level.d_view(m) <= max_ref_level &&
           (team_qmax < deref_valmax) && (flag == 0)) {flag = -1;}
     });
@@ -437,6 +443,9 @@ void RefinementCriteria::CheckMinMax(MeshBlockPack* pmbp, RefCritData crit) {
       bool criterion_active = (team_qmin < 0.5*FLT_MAX);
       bool refine_active = criterion_active && team_qmin < valmin;
       if (refine_active && level.d_view(m) < max_ref_level) {flag = 1;}
+      if (refine_active && level.d_view(m) == max_ref_level) {
+        refine_hold.d_view(m+mbs) = 1;
+      }
       if (criterion_active && !refine_only && level.d_view(m) <= max_ref_level &&
           (team_qmin > deref_valmin) && (flag == 0)) {flag = -1;}
     });
@@ -444,6 +453,8 @@ void RefinementCriteria::CheckMinMax(MeshBlockPack* pmbp, RefCritData crit) {
   // sync device array with host
   refine_flag.template modify<DevExeSpace>();
   refine_flag.template sync<HostMemSpace>();
+  refine_hold.template modify<DevExeSpace>();
+  refine_hold.template sync<HostMemSpace>();
   return;
 }
 
@@ -455,6 +466,7 @@ void RefinementCriteria::CheckMinMax(MeshBlockPack* pmbp, RefCritData crit) {
 
 void RefinementCriteria::CheckSlope(MeshBlockPack* pmbp, RefCritData crit) {
   auto &refine_flag = pmbp->pmesh->pmr->refine_flag;
+  auto &refine_hold = pmbp->pmesh->pmr->refine_hold;
   int mbs = pmbp->pmesh->gids_eachrank[global_variable::my_rank];
 
   // capture variables for kernels
@@ -522,6 +534,9 @@ void RefinementCriteria::CheckSlope(MeshBlockPack* pmbp, RefCritData crit) {
       // only derefine when flag has not been set by other criteria
       int &flag = refine_flag.d_view(m+mbs);
       if  (team_dqmax > valmax && level.d_view(m) < max_ref_level) {flag = 1;}
+      if (team_dqmax > valmax && level.d_view(m) == max_ref_level) {
+        refine_hold.d_view(m+mbs) = 1;
+      }
       if (!refine_only && level.d_view(m) <= max_ref_level &&
           (team_dqmax < deref_valmax) && (flag == 0)) {flag = -1;}
     });
@@ -529,6 +544,8 @@ void RefinementCriteria::CheckSlope(MeshBlockPack* pmbp, RefCritData crit) {
   // sync device array with host
   refine_flag.template modify<DevExeSpace>();
   refine_flag.template sync<HostMemSpace>();
+  refine_hold.template modify<DevExeSpace>();
+  refine_hold.template sync<HostMemSpace>();
   return;
 }
 
@@ -540,6 +557,7 @@ void RefinementCriteria::CheckSlope(MeshBlockPack* pmbp, RefCritData crit) {
 
 void RefinementCriteria::CheckSecondDeriv(MeshBlockPack* pmbp, RefCritData crit) {
   auto &refine_flag = pmbp->pmesh->pmr->refine_flag;
+  auto &refine_hold = pmbp->pmesh->pmr->refine_hold;
   int mbs = pmbp->pmesh->gids_eachrank[global_variable::my_rank];
 
   // capture variables for kernels
@@ -578,6 +596,9 @@ void RefinementCriteria::CheckSecondDeriv(MeshBlockPack* pmbp, RefCritData crit)
       // only derefine when flag has not been set by other criteria
       int &flag = refine_flag.d_view(m+mbs);
       if  (team_d2qmax > valmax && level.d_view(m) < max_ref_level) {flag = 1;}
+      if (team_d2qmax > valmax && level.d_view(m) == max_ref_level) {
+        refine_hold.d_view(m+mbs) = 1;
+      }
       if (!refine_only && level.d_view(m) <= max_ref_level &&
           (team_d2qmax < deref_valmax) && (flag == 0)) {flag = -1;}
     });
@@ -585,6 +606,8 @@ void RefinementCriteria::CheckSecondDeriv(MeshBlockPack* pmbp, RefCritData crit)
   // sync device array with host
   refine_flag.template modify<DevExeSpace>();
   refine_flag.template sync<HostMemSpace>();
+  refine_hold.template modify<DevExeSpace>();
+  refine_hold.template sync<HostMemSpace>();
   return;
 }
 
@@ -595,6 +618,7 @@ void RefinementCriteria::CheckSecondDeriv(MeshBlockPack* pmbp, RefCritData crit)
 
 void RefinementCriteria::CheckLocation(MeshBlockPack* pmbp, RefCritData crit) {
   auto &refine_flag = pmbp->pmesh->pmr->refine_flag;
+  auto &refine_hold = pmbp->pmesh->pmr->refine_hold;
   int mbs = pmbp->pmesh->gids_eachrank[global_variable::my_rank];
   int nmb = pmbp->nmb_thispack;
   auto &size = pmbp->pmb->mb_size;
@@ -629,6 +653,8 @@ void RefinementCriteria::CheckLocation(MeshBlockPack* pmbp, RefCritData crit) {
              ((x3max > (x3+rad)) && (x3min < (x3-rad)))) ) {
           if (level.h_view(m) < max_ref_level) {
             refine_flag.h_view(m + mbs) = 1;
+          } else if (level.h_view(m) == max_ref_level) {
+            refine_hold.h_view(m + mbs) = 1;
           }
         }
       }
@@ -637,5 +663,7 @@ void RefinementCriteria::CheckLocation(MeshBlockPack* pmbp, RefCritData crit) {
   // sync host array with device
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
+  refine_hold.template modify<HostMemSpace>();
+  refine_hold.template sync<DevExeSpace>();
   return;
 }

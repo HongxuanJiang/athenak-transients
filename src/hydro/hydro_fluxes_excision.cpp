@@ -33,7 +33,7 @@ namespace {
 
 KOKKOS_INLINE_FUNCTION
 void ZeroSinkFaceFlux(const bool dual_enabled, const int nvars,
-                      DvceArray5D<Real> flx, DvceArray5D<Real> vf,
+                      BandView5D<Real> flx, BandView5D<Real> vf,
                       const int m, const int k, const int j, const int i) {
   for (int n = 0; n < nvars; ++n) {
     flx(m, n, k, j, i) = 0.0;
@@ -133,12 +133,12 @@ void Hydro::ApplyExcisionSinkBoundary(const Real t) {
   const bool is_sr = pmy_pack->pcoord->is_special_relativistic;
   const bool is_gr = pmy_pack->pcoord->is_general_relativistic;
   const int nhyd_ = nhydro;
-  auto &flx1_ = uflx.x1f;
-  auto &flx2_ = uflx.x2f;
-  auto &flx3_ = uflx.x3f;
-  auto &vf1_ = dual_vf.x1f;
-  auto &vf2_ = dual_vf.x2f;
-  auto &vf3_ = dual_vf.x3f;
+  auto flx1_ = FluxBand(uflx.x1f);
+  auto flx2_ = FluxBand(uflx.x2f);
+  auto flx3_ = FluxBand(uflx.x3f);
+  auto vf1_ = FluxBand(dual_vf.x1f);
+  auto vf2_ = FluxBand(dual_vf.x2f);
+  auto vf3_ = FluxBand(dual_vf.x3f);
 
   const bool lat_enabled = pmy_pack->lat_active_mask_enabled;
   auto &active_indices = pmy_pack->lat_active_indices;

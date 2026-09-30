@@ -18,6 +18,7 @@
 #include "parameter_input.hpp"
 #include "mesh/nghbr_index.hpp"
 #include "mesh/mesh.hpp"
+#include "mesh/mb_storage.hpp"
 #include "particles/particles.hpp"
 #include "bvals.hpp"
 
@@ -1245,6 +1246,8 @@ int MeshBoundaryValues::BufferBlockCapacity(const int nmb_needed) const {
   // (large) buffers on every single growth step, but never reserve past the hard
   // per-rank cap, which is what the MPI_Request arrays are sized for.
   const int cap = pmy_pack->pmesh->nmb_maxperrank;
+  // Preallocation: always the full per-rank cap, so the buffers are never regrown.
+  if (MeshBlockStorageReserve() > 0) return std::max(nmb_needed, cap);
   int nmb = ((std::max(nmb_needed, 1) + 31)/32)*32;
   if ((cap > 0) && (nmb > cap)) nmb = std::max(nmb_needed, cap);
   return nmb;

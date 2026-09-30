@@ -130,6 +130,7 @@ Gravity::Gravity(MeshBlockPack *pmbp, ParameterInput *pin):
     //pmb->pbval->bvars.push_back(&gbvar);
     //pmb->pbval->pgbvar = &gbvar;
     int nmb = pmy_pack->nmb_thispack;
+    if (MeshBlockStorageReserve() > 0) nmb = MeshBlockStorageCapacity(nmb);
     auto &indcs = pmy_pack->pmesh->mb_indcs;
     int ncells1 = indcs.nx1 + 2*(indcs.ng);
     int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
@@ -743,9 +744,9 @@ void Gravity::AccumulateLATBoundaryFlux(Real final_dt) {
   const auto bc = pmy_pack->pmb->mb_bcs.d_view;
   const auto size = pmy_pack->pmb->mb_size.d_view;
   const auto potential = phi;
-  const auto f1 = pmy_pack->phydro->uflx.x1f;
-  const auto f2 = pmy_pack->phydro->uflx.x2f;
-  const auto f3 = pmy_pack->phydro->uflx.x3f;
+  const auto f1 = pmy_pack->phydro->FluxBand(pmy_pack->phydro->uflx.x1f);
+  const auto f2 = pmy_pack->phydro->FluxBand(pmy_pack->phydro->uflx.x2f);
+  const auto f3 = pmy_pack->phydro->FluxBand(pmy_pack->phydro->uflx.x3f);
   bool has_bh = false;
   Real bhx=0, bhy=0, bhz=0, mass=0, softening=0, newton_g=0;
   problem_runtime::GetExternalBHPotential(problem_runtime::HydroStageTimeOr(pm->time),

@@ -9,6 +9,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <iostream>
 
 #include "athena.hpp"
@@ -243,7 +244,11 @@ TaskStatus Hydro::HydroStateFixup(Driver *pdrive, int stage) {
 TaskStatus Hydro::CopyCons(Driver *pdrive, int stage) {
   if (stage == 1) {
     if (!(pmy_pack->lat_active_mask_enabled)) {
-      Kokkos::deep_copy(DevExeSpace(), u1, u0);
+      // Live blocks only: the storage extent may exceed nmb_thispack.
+      const auto live = std::make_pair(0, pmy_pack->nmb_thispack);
+      Kokkos::deep_copy(DevExeSpace(),
+          Kokkos::subview(u1, live, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL),
+          Kokkos::subview(u0, live, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL, Kokkos::ALL));
     } else {
       auto &indcs = pmy_pack->pmesh->mb_indcs;
       int ncells1 = indcs.nx1 + 2*indcs.ng;
@@ -324,10 +329,10 @@ TaskStatus Hydro::Fluxes(Driver *pdrive, int stage) {
 
   // Add diffusion fluxes
   if (pcond != nullptr) {
-    pcond->AddHeatFluxes(w0, peos->eos_data, uflx);
+    pcond->AddHeatFluxes(w0, peos->eos_data, FluxBand(uflx));
   }
   if (pvisc != nullptr) {
-    pvisc->AddViscousFluxes(w0, peos->eos_data, uflx);
+    pvisc->AddViscousFluxes(w0, peos->eos_data, FluxBand(uflx));
   }
 
   // A slower bin's corrector with a pending finer neighbour runs on the fine flux
@@ -344,11 +349,12 @@ TaskStatus Hydro::Fluxes(Driver *pdrive, int stage) {
     if (use_fofc && pbval_u->PendingFineFluxMismatchDue()) {
       StashFOFCEdgeFlags(pdrive, stage);
     }
-    pbval_u->AddPendingFineFluxMismatchCC(uflx, dual_energy_pdv ? &dual_vf : nullptr);
+    pbval_u->AddPendingFineFluxMismatchCC(uflx, dual_energy_pdv ? &dual_vf : nullptr,
+                                          FluxOrigin());
     if (pdrive->hydro_lat_union_stage1_active && stage == 1) {
       pbval_u->SnapshotPendingOwnFluxCC(
           lat_reflux, dual_energy_pdv ? &lat_dual_vf_reflux : nullptr,
-          uflx, dual_energy_pdv ? &dual_vf : nullptr);
+          uflx, dual_energy_pdv ? &dual_vf : nullptr, FluxOrigin());
     }
   }
 
@@ -401,10 +407,10 @@ TaskStatus Hydro::SendFlux(Driver *pdrive, int stage) {
       const bool time_integrate = pmy_pack->lat_per_block_timestep;
       tstat = pbval_u->PackAndSendFluxCC(
           uflx, dual_energy_pdv ? &dual_vf : nullptr, time_integrate,
-          lat::FinalFluxWeight(pdrive, stage), {}, excised);
+          lat::FinalFluxWeight(pdrive, stage), FluxOrigin(), excised);
     } else {
       tstat = pbval_u->PackAndSendFluxCC(uflx, dual_energy_pdv ? &dual_vf : nullptr,
-                                         false, 1.0, {}, excised);
+                                         false, 1.0, FluxOrigin(), excised);
     }
   }
   return tstat;
@@ -430,9 +436,11 @@ TaskStatus Hydro::RecvFlux(Driver *pdrive, int stage) {
       tstat = pbval_u->RecvAndAccumulateFluxCC(
           lat_reflux, scale, true,
           dual_energy_pdv ? &lat_dual_vf_reflux : nullptr, &uflx,
-          dual_energy_pdv ? &dual_vf : nullptr, sync_integrated_weight, true, {}, true);
+          dual_energy_pdv ? &dual_vf : nullptr, sync_integrated_weight, true,
+          FluxOrigin(), true);
     } else {
-      tstat = pbval_u->RecvAndUnpackFluxCC(uflx, dual_energy_pdv ? &dual_vf : nullptr);
+      tstat = pbval_u->RecvAndUnpackFluxCC(uflx, dual_energy_pdv ? &dual_vf : nullptr,
+                                           FluxOrigin());
     }
   }
   flux_recv_complete_ = (tstat == TaskStatus::complete);

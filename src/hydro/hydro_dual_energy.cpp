@@ -220,9 +220,9 @@ void Hydro::ApplyDualEnergyFormalism(const Real dt) {
   const bool three_d = pmy_pack->pmesh->three_d;
   auto u0_ = u0;
   auto w0_ = w0;
-  auto vf1_ = dual_vf.x1f;
-  auto vf2_ = dual_vf.x2f;
-  auto vf3_ = dual_vf.x3f;
+  auto vf1_ = FluxBand(dual_vf.x1f);
+  auto vf2_ = FluxBand(dual_vf.x2f);
+  auto vf3_ = FluxBand(dual_vf.x3f);
   auto &mbsize = pmy_pack->pmb->mb_size;
   auto &eos = peos->eos_data;
   const int de_idx = dual_energy_idx;

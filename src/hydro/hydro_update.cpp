@@ -60,9 +60,9 @@ TaskStatus Hydro::RKUpdate(Driver *pdriver, int stage) {
   int nvar = nvars;
   auto u0_ = u0;
   auto u1_ = u1;
-  auto flx1 = uflx.x1f;
-  auto flx2 = uflx.x2f;
-  auto flx3 = uflx.x3f;
+  auto flx1 = FluxBand(uflx.x1f);
+  auto flx2 = FluxBand(uflx.x2f);
+  auto flx3 = FluxBand(uflx.x3f);
   auto &mbsize = pmy_pack->pmb->mb_size;
   const bool lat_enabled = pmy_pack->lat_active_mask_enabled;
   const bool lat_per_block_dt = pmy_pack->lat_per_block_timestep;
@@ -223,18 +223,18 @@ void Hydro::AccumulateLATCoarseFluxes(Driver *pdriver, int stage) {
   auto lat_step_factor = pmy_pack->lat_step_factor.d_view;
   auto lat_nghbr_factor = pmy_pack->lat_nghbr_factor.d_view;
   auto rbuf = pbval_u->recvbuf_device;
-  auto flx1 = uflx.x1f;
-  auto flx2 = uflx.x2f;
-  auto flx3 = uflx.x3f;
+  auto flx1 = FluxBand(uflx.x1f);
+  auto flx2 = FluxBand(uflx.x2f);
+  auto flx3 = FluxBand(uflx.x3f);
   auto acc1 = lat_reflux.x1f;
   auto acc2 = lat_reflux.x2f;
   auto acc3 = lat_reflux.x3f;
   auto vfacc1 = lat_dual_vf_reflux.x1f;
   auto vfacc2 = lat_dual_vf_reflux.x2f;
   auto vfacc3 = lat_dual_vf_reflux.x3f;
-  auto vf1 = dual_vf.x1f;
-  auto vf2 = dual_vf.x2f;
-  auto vf3 = dual_vf.x3f;
+  auto vf1 = FluxBand(dual_vf.x1f);
+  auto vf2 = FluxBand(dual_vf.x2f);
+  auto vf3 = FluxBand(dual_vf.x3f);
   const bool dual_enabled = dual_energy_pdv;
 
   const int nflux_nghbr = lat::FluxFaceCount(nnghbr);

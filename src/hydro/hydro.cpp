@@ -65,6 +65,9 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
   // ResizeMeshBlockStorage(), so reserving the hard cap here only inflates the
   // persistent CUDA pool and can make an otherwise valid restart run out of memory.
   int nmb = ppack->nmb_thispack;
+  // Block extent of the field arrays: exact, or the fixed reserve under preallocation.
+  const int nmb_a =
+      (MeshBlockStorageReserve() > 0) ? MeshBlockStorageCapacity(nmb) : nmb;
   split_recon_chunk_nmb =
       pin->GetOrAddInteger("hydro", "split_recon_chunk_nmb", 32);
   if (split_recon_chunk_nmb <= 0) split_recon_chunk_nmb = std::max(1, nmb);
@@ -238,11 +241,11 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     int ncells1 = indcs.nx1 + 2*(indcs.ng);
     int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
     int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
-    Kokkos::realloc(u0, nmb, nvars, ncells3, ncells2, ncells1);
-    Kokkos::realloc(w0, nmb, nvars, ncells3, ncells2, ncells1);
+    Kokkos::realloc(u0, nmb_a, nvars, ncells3, ncells2, ncells1);
+    Kokkos::realloc(w0, nmb_a, nvars, ncells3, ncells2, ncells1);
     if (use_dual_energy) {
-      Kokkos::realloc(dual_excise_mask, nmb, ncells3, ncells2, ncells1);
-      Kokkos::realloc(dual_etot_max, nmb, ncells3, ncells2, ncells1);
+      Kokkos::realloc(dual_excise_mask, nmb_a, ncells3, ncells2, ncells1);
+      Kokkos::realloc(dual_etot_max, nmb_a, ncells3, ncells2, ncells1);
     }
   }
 
@@ -252,10 +255,10 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
     int n_ccells1 = indcs.cnx1 + 2*(indcs.ng);
     int n_ccells2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*(indcs.ng)) : 1;
     int n_ccells3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*(indcs.ng)) : 1;
-    Kokkos::realloc(coarse_u0, nmb, nvars, n_ccells3, n_ccells2, n_ccells1);
-    Kokkos::realloc(coarse_w0, nmb, nvars, n_ccells3, n_ccells2, n_ccells1);
+    Kokkos::realloc(coarse_u0, nmb_a, nvars, n_ccells3, n_ccells2, n_ccells1);
+    Kokkos::realloc(coarse_w0, nmb_a, nvars, n_ccells3, n_ccells2, n_ccells1);
     if (time_evolving) {
-      Kokkos::realloc(coarse_u1, nmb, nvars, n_ccells3, n_ccells2, n_ccells1);
+      Kokkos::realloc(coarse_u1, nmb_a, nvars, n_ccells3, n_ccells2, n_ccells1);
     }
   }
 
@@ -473,24 +476,34 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
       int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
       int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
       dtnew_eachmb = DualArray1D<Real>("hydro_dtnew_eachmb", std::max(1, nmb));
-      sink_block_indices = DualArray1D<int>("hydro_sink_blocks", std::max(1, nmb));
-      Kokkos::realloc(u1,       nmb, nvars, ncells3, ncells2, ncells1);
+      sink_block_indices = DualArray1D<int>("hydro_sink_blocks", std::max(1, nmb_a));
+      Kokkos::realloc(u1,       nmb_a, nvars, ncells3, ncells2, ncells1);
       if (lat_dense_output_enabled) {
-        Kokkos::realloc(lat_u_stage1, nmb, nvars, ncells3, ncells2, ncells1);
+        Kokkos::realloc(lat_u_stage1, nmb_a, nvars, ncells3, ncells2, ncells1);
       }
-      Kokkos::realloc(uflx.x1f, nmb, nvars, ncells3, ncells2, ncells1);
-      Kokkos::realloc(uflx.x2f, nmb, nvars, ncells3, ncells2, ncells1);
-      Kokkos::realloc(uflx.x3f, nmb, nvars, ncells3, ncells2, ncells1);
-      const int nrecon_nmb = std::max(1, std::min(nmb, split_recon_chunk_nmb));
+      // flux band (see hydro.hpp): margin 1 with FOFC, none without
+      const bool multi_d = pmy_pack->pmesh->multi_d;
+      const bool three_d = pmy_pack->pmesh->three_d;
+      const int fmar = use_fofc ? 1 : 0;
+      flux_ko = three_d ? indcs.ks-fmar : 0;
+      flux_jo = multi_d ? indcs.js-fmar : 0;
+      flux_io = indcs.is-fmar;
+      const int nband1 = indcs.nx1 + 2*fmar;
+      const int nband2 = multi_d ? indcs.nx2 + 2*fmar : 1;
+      const int nband3 = three_d ? indcs.nx3 + 2*fmar : 1;
+      Kokkos::realloc(uflx.x1f, nmb_a, nvars, nband3, nband2, nband1+1);
+      Kokkos::realloc(uflx.x2f, nmb_a, nvars, nband3, nband2+1, nband1);
+      Kokkos::realloc(uflx.x3f, nmb_a, nvars, nband3+1, nband2, nband1);
+      const int nrecon_nmb = std::max(1, std::min(nmb_a, split_recon_chunk_nmb));
       Kokkos::realloc(wl3d, nrecon_nmb, nvars, ncells3, ncells2, ncells1);
       Kokkos::realloc(wr3d, nrecon_nmb, nvars, ncells3, ncells2, ncells1);
       if (lat_correction_storage_) {
-        Kokkos::realloc(lat_reflux.x1f, nmb, nvars, ncells3, ncells2, 2);
-        Kokkos::realloc(lat_reflux.x2f, nmb, nvars, ncells3, 2, ncells1);
-        Kokkos::realloc(lat_reflux.x3f, nmb, nvars, 2, ncells2, ncells1);
-        Kokkos::realloc(lat_reflux_theta.x1f, nmb, 1, ncells3, ncells2, 2);
-        Kokkos::realloc(lat_reflux_theta.x2f, nmb, 1, ncells3, 2, ncells1);
-        Kokkos::realloc(lat_reflux_theta.x3f, nmb, 1, 2, ncells2, ncells1);
+        Kokkos::realloc(lat_reflux.x1f, nmb_a, nvars, ncells3, ncells2, 2);
+        Kokkos::realloc(lat_reflux.x2f, nmb_a, nvars, ncells3, 2, ncells1);
+        Kokkos::realloc(lat_reflux.x3f, nmb_a, nvars, 2, ncells2, ncells1);
+        Kokkos::realloc(lat_reflux_theta.x1f, nmb_a, 1, ncells3, ncells2, 2);
+        Kokkos::realloc(lat_reflux_theta.x2f, nmb_a, 1, ncells3, 2, ncells1);
+        Kokkos::realloc(lat_reflux_theta.x3f, nmb_a, 1, 2, ncells2, ncells1);
         Kokkos::deep_copy(lat_reflux_theta.x1f, 1.0);
         Kokkos::deep_copy(lat_reflux_theta.x2f, 1.0);
         Kokkos::deep_copy(lat_reflux_theta.x3f, 1.0);
@@ -502,28 +515,28 @@ Hydro::Hydro(MeshBlockPack *ppack, ParameterInput *pin) :
           (psrc->self_gravity || psrc->external_bh_gravity || psrc->sink_gravity);
       if (lat_grav_reflux_allocated) {
         const int ngw = lat_reflux::kNGravWork;
-        Kokkos::realloc(lat_grav_reflux.x1f, nmb, ngw, ncells3, ncells2, 2);
-        Kokkos::realloc(lat_grav_reflux.x2f, nmb, ngw, ncells3, 2, ncells1);
-        Kokkos::realloc(lat_grav_reflux.x3f, nmb, ngw, 2, ncells2, ncells1);
+        Kokkos::realloc(lat_grav_reflux.x1f, nmb_a, ngw, ncells3, ncells2, 2);
+        Kokkos::realloc(lat_grav_reflux.x2f, nmb_a, ngw, ncells3, 2, ncells1);
+        Kokkos::realloc(lat_grav_reflux.x3f, nmb_a, ngw, 2, ncells2, ncells1);
         Kokkos::deep_copy(lat_grav_reflux.x1f, 0.0);
         Kokkos::deep_copy(lat_grav_reflux.x2f, 0.0);
         Kokkos::deep_copy(lat_grav_reflux.x3f, 0.0);
       }
       if (dual_energy_pdv) {
         if (lat_correction_storage_) {
-          Kokkos::realloc(lat_dual_vf_reflux.x1f, nmb, 1, ncells3, ncells2, 2);
-          Kokkos::realloc(lat_dual_vf_reflux.x2f, nmb, 1, ncells3, 2, ncells1);
-          Kokkos::realloc(lat_dual_vf_reflux.x3f, nmb, 1, 2, ncells2, ncells1);
+          Kokkos::realloc(lat_dual_vf_reflux.x1f, nmb_a, 1, ncells3, ncells2, 2);
+          Kokkos::realloc(lat_dual_vf_reflux.x2f, nmb_a, 1, ncells3, 2, ncells1);
+          Kokkos::realloc(lat_dual_vf_reflux.x3f, nmb_a, 1, 2, ncells2, ncells1);
         }
-        Kokkos::realloc(dual_vf.x1f, nmb, 1, ncells3, ncells2, ncells1+1);
-        Kokkos::realloc(dual_vf.x2f, nmb, 1, ncells3, ncells2+1, ncells1);
-        Kokkos::realloc(dual_vf.x3f, nmb, 1, ncells3+1, ncells2, ncells1);
+        Kokkos::realloc(dual_vf.x1f, nmb_a, 1, nband3, nband2, nband1+1);
+        Kokkos::realloc(dual_vf.x2f, nmb_a, 1, nband3, nband2+1, nband1);
+        Kokkos::realloc(dual_vf.x3f, nmb_a, 1, nband3+1, nband2, nband1);
       }
 
       // allocate array of flags used with FOFC
       if (use_fofc) {
-        Kokkos::realloc(fofc,  nmb, ncells3, ncells2, ncells1);
-        Kokkos::realloc(utest, nmb, nvars, ncells3, ncells2, ncells1);
+        Kokkos::realloc(fofc,  nmb_a, ncells3, ncells2, ncells1);
+        Kokkos::realloc(utest, nmb_a, nvars, ncells3, ncells2, ncells1);
         Kokkos::deep_copy(fofc, false);
       }
     }
@@ -618,7 +631,8 @@ bool Hydro::ResizeMeshBlockStorage(int nmb, bool exact, bool allow_shrink) {
   resized = resize5(u0, nmb, nvars, ncells3, ncells2, ncells1) || resized;
   resized = resize5(w0, nmb, nvars, ncells3, ncells2, ncells1) || resized;
   const int nmb_storage = u0.extent_int(0);
-  const int sink_capacity = std::max(1, nmb);
+  const int sink_capacity = (MeshBlockStorageReserve() > 0) ?
+      MeshBlockStorageCapacity(nmb) : std::max(1, nmb);
   const int old_sink_capacity = static_cast<int>(sink_block_indices.extent(0));
   if (old_sink_capacity < sink_capacity || (exact &&
       old_sink_capacity != sink_capacity)) {
@@ -649,12 +663,17 @@ bool Hydro::ResizeMeshBlockStorage(int nmb, bool exact, bool allow_shrink) {
       resized = realloc5(lat_u_stage1, nmb_storage, nvars, ncells3, ncells2, ncells1) ||
                 resized;
     }
-    resized = realloc5(uflx.x1f, nmb_storage, nvars, ncells3, ncells2,
-        ncells1) || resized;
-    resized = realloc5(uflx.x2f, nmb_storage, nvars, ncells3, ncells2,
-        ncells1) || resized;
-    resized = realloc5(uflx.x3f, nmb_storage, nvars, ncells3, ncells2,
-        ncells1) || resized;
+    // flux band extents (origin and margin are fixed in the constructor)
+    const int fmar2 = use_fofc ? 2 : 0;
+    const int nband1 = indcs.nx1 + fmar2;
+    const int nband2 = pmy_pack->pmesh->multi_d ? indcs.nx2 + fmar2 : 1;
+    const int nband3 = pmy_pack->pmesh->three_d ? indcs.nx3 + fmar2 : 1;
+    resized = realloc5(uflx.x1f, nmb_storage, nvars, nband3, nband2, nband1 + 1) ||
+              resized;
+    resized = realloc5(uflx.x2f, nmb_storage, nvars, nband3, nband2 + 1, nband1) ||
+              resized;
+    resized = realloc5(uflx.x3f, nmb_storage, nvars, nband3 + 1, nband2, nband1) ||
+              resized;
     const int nrecon_nmb =
         std::max(1, std::min(nmb_storage, split_recon_chunk_nmb));
     resized = realloc5(wl3d, nrecon_nmb, nvars, ncells3, ncells2, ncells1) || resized;
@@ -691,11 +710,11 @@ bool Hydro::ResizeMeshBlockStorage(int nmb, bool exact, bool allow_shrink) {
         resized = realloc5(lat_dual_vf_reflux.x3f, nmb_storage, 1, 2, ncells2,
             ncells1) || resized;
       }
-      resized = realloc5(dual_vf.x1f, nmb_storage, 1, ncells3, ncells2, ncells1 + 1) ||
+      resized = realloc5(dual_vf.x1f, nmb_storage, 1, nband3, nband2, nband1 + 1) ||
                 resized;
-      resized = realloc5(dual_vf.x2f, nmb_storage, 1, ncells3, ncells2 + 1, ncells1) ||
+      resized = realloc5(dual_vf.x2f, nmb_storage, 1, nband3, nband2 + 1, nband1) ||
                 resized;
-      resized = realloc5(dual_vf.x3f, nmb_storage, 1, ncells3 + 1, ncells2, ncells1) ||
+      resized = realloc5(dual_vf.x3f, nmb_storage, 1, nband3 + 1, nband2, nband1) ||
                 resized;
     }
     if (use_fofc) {
@@ -707,7 +726,9 @@ bool Hydro::ResizeMeshBlockStorage(int nmb, bool exact, bool allow_shrink) {
     }
   }
 
-  if (resized_fofc) {
+  // With preallocation nothing is ever reallocated, so the flags are cleared on every
+  // topology change, exactly as a reallocation does in the default mode.
+  if (resized_fofc || (use_fofc && time_evolving && MeshBlockStorageReserve() > 0)) {
     Kokkos::deep_copy(fofc, false);
   }
   return resized;

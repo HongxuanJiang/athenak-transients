@@ -101,6 +101,7 @@ int bh_force_refine_level_offset_global = 0;
 bool unbound_refine_global = false;
 int unbound_refine_level_offset_global = 3;
 Real unbound_refine_rho_min_global = -1.0;
+Real unbound_refine_fill_frac_global = 0.01;
 bool stream_shell_enable_global = false;
 Real stream_shell_dr_global = -1.0;
 int stream_shell_level_offset_global = 0;
@@ -535,14 +536,6 @@ void RefineBHPosition(MeshBlockPack *pmbp) {
   // Combine the TDE-specific AMR requests with the standard criteria rather than
   // overwriting them outright.  Refinement requests dominate, while derefinement
   // only applies when no other criterion has already asked to refine the block.
-  auto request_refine_to_level = [&](const int gid, const int level,
-                                     const int target_level) {
-    if (level < target_level) {
-      refine_flag.h_view(gid) = 1;
-    } else if (refine_flag.h_view(gid) < 0) {
-      refine_flag.h_view(gid) = 0;
-    }
-  };
   auto request_exact_level = [&](const int gid, const int level,
                                  const int target_level) {
     int &flag = refine_flag.h_view(gid);
@@ -705,6 +698,8 @@ void RefineBHPosition(MeshBlockPack *pmbp) {
   const Real bh_vz = bh_vz_global;
   const bool do_stream = stream_shell_enable_global;
   const bool do_unbound = unbound_refine_global;
+  const int unbound_min_cells = std::max(1, static_cast<int>(
+      std::ceil(unbound_refine_fill_frac_global * static_cast<Real>(nkji))));
 
   DvceArray1D<Real> block_rho_max_d("tde_amr_block_rho_max", nmb_alloc);
   DvceArray1D<int> block_unbound_d("tde_amr_block_unbound", nmb_alloc);
@@ -805,7 +800,7 @@ void RefineBHPosition(MeshBlockPack *pmbp) {
           if (eps_orb >= 0.0) lcnt += 1;
         }, nunbound);
         Kokkos::single(Kokkos::PerTeam(tmember), [&]() {
-          unbound_(m) = (nunbound > 0) ? 1 : 0;
+          unbound_(m) = (nunbound >= unbound_min_cells) ? 1 : 0;
         });
       }
     });
@@ -937,53 +932,43 @@ void RefineBHPosition(MeshBlockPack *pmbp) {
       intersects_bh_sink =
           (dxmin*dxmin + dymin*dymin + dzmin*dzmin) <= bh_refine_r2;
     }
+    // Each rule that applies to this block proposes a target level, and the block is
+    // steered to the finest of them: refined if below, derefined if above (unless another
+    // criterion asked to refine it).  With stream shells on, a block no rule selects
+    // derefines.
+    int target_level = -1;
     if (bh_force_refine_global && intersects_bh_sink) {
-      request_refine_to_level(gid, level, bh_target_level);
-      continue;
+      target_level = std::max(target_level, bh_target_level);
     }
-
     if (unbound_refine_global && block_unbound_h(m) != 0) {
-      request_exact_level(gid, level, unbound_target_level);
-      continue;
+      target_level = std::max(target_level, unbound_target_level);
     }
-    if (!stream_shell_enable_global) continue;
-    if (block_rho_max_h(m) < derefine_floor) {
-      request_derefine(gid);
-      continue;
-    }
-    Real dxmin = distance_to_interval(bhx, x1min, x1max);
-    Real dymin = distance_to_interval(bhy, x2min, x2max);
-    Real dzmin = distance_to_interval(bhz, x3min, x3max);
-    Real drmin = std::sqrt(dxmin*dxmin + dymin*dymin + dzmin*dzmin);
-    if (stream_shell_r_max_global > 0.0 && drmin >= stream_shell_r_max_global) {
-      request_derefine(gid);
-      continue;
-    }
-
-    int ncells_block = nkji;
-    bool selected = false;
-    int best_target_level = pmesh->root_level;
-    if (block_peak_level_h(m) >= 0) {
-      // The device pass already took the max of the tier target levels over the
-      // shell-peak cells of this block.
-      selected = true;
-      best_target_level = std::max(best_target_level, block_peak_level_h(m));
-    }
-    if (!selected) {
-      for (int tier = 0; tier < nzone; ++tier) {
-        Real fill = static_cast<Real>(block_cover_h(m*nzone + tier)) /
-                    static_cast<Real>(std::max(1, ncells_block));
-        if (fill >= zone_fill_fracs[tier]) {
-          selected = true;
-          best_target_level = std::max(
-              best_target_level,
-              std::max(pmesh->root_level, pmesh->max_level - zone_offsets[tier]));
+    if (stream_shell_enable_global && block_rho_max_h(m) >= derefine_floor) {
+      Real dxmin = distance_to_interval(bhx, x1min, x1max);
+      Real dymin = distance_to_interval(bhy, x2min, x2max);
+      Real dzmin = distance_to_interval(bhz, x3min, x3max);
+      Real drmin = std::sqrt(dxmin*dxmin + dymin*dymin + dzmin*dzmin);
+      if (!(stream_shell_r_max_global > 0.0 && drmin >= stream_shell_r_max_global)) {
+        if (block_peak_level_h(m) >= 0) {
+          // The device pass already took the max of the tier target levels over the
+          // shell-peak cells of this block.
+          target_level = std::max(target_level,
+                                  std::max(pmesh->root_level, block_peak_level_h(m)));
+        } else {
+          for (int tier = 0; tier < nzone; ++tier) {
+            Real fill = static_cast<Real>(block_cover_h(m*nzone + tier)) /
+                        static_cast<Real>(std::max(1, nkji));
+            if (fill >= zone_fill_fracs[tier]) {
+              target_level = std::max(target_level,
+                  std::max(pmesh->root_level, pmesh->max_level - zone_offsets[tier]));
+            }
+          }
         }
       }
     }
-    if (selected) {
-      request_refine_to_level(gid, level, best_target_level);
-    } else {
+    if (target_level >= 0) {
+      request_exact_level(gid, level, target_level);
+    } else if (stream_shell_enable_global) {
       request_derefine(gid);
     }
   }
@@ -3302,6 +3287,14 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
               << std::endl;
     std::exit(EXIT_FAILURE);
   }
+  unbound_refine_fill_frac_global =
+      pin->GetOrAddReal("problem", "unbound_amr_fill_frac", 0.01);
+  if (!(unbound_refine_fill_frac_global >= 0.0 &&
+        unbound_refine_fill_frac_global <= 1.0)) {
+    std::cout << "### FATAL ERROR in ProblemGenerator::TDEExternal" << std::endl
+              << "problem/unbound_amr_fill_frac must be in [0, 1]." << std::endl;
+    std::exit(EXIT_FAILURE);
+  }
   stream_shell_enable_global =
       pin->DoesParameterExist("problem", "stream_shell_dr") ||
       pin->DoesParameterExist("problem", "stream_shell_level_offset") ||
@@ -4018,6 +4011,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       << " (max_level - " << unbound_refine_level_offset_global << ")"
       << std::endl
       << "Unbound rho min        = " << unbound_refine_rho_min_global
+      << std::endl
+      << "Unbound fill frac      = " << unbound_refine_fill_frac_global
       << std::endl
       << "Stream shell AMR       = " << (stream_shell_enable_global ? "true" : "false")
       << std::endl

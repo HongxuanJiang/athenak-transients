@@ -189,9 +189,10 @@ bool CheckFluxes(MeshBlockPack *pack) {
       Kokkos::deep_copy(flux, -321.0);
       hyd->CalculateFluxes<Hydro_RSolver::hlle>(nullptr, 1);
       auto hf = Kokkos::create_mirror_view_and_copy(HostMemSpace(), flux);
-      const int i = ind.is + (axis == 0 ? 2 : 0);
-      const int j = ind.js + (axis == 1 ? 2 : 0);
-      const int k = ind.ks + (axis == 2 ? 2 : 0);
+      // the register is stored on a band of the block: global index minus its origin
+      const int i = ind.is + (axis == 0 ? 2 : 0) - hyd->flux_io;
+      const int j = ind.js + (axis == 1 ? 2 : 0) - hyd->flux_jo;
+      const int k = ind.ks + (axis == 2 ? 2 : 0) - hyd->flux_ko;
       for (int m = 0; m < nmb; ++m) {
         const int channels = hyd->use_dual_energy ? 2 : 1;
         for (int channel = 0; channel < channels; ++channel) {

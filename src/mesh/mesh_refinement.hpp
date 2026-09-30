@@ -77,6 +77,7 @@ class MeshRefinement {
 
   // following View is dimensioned [nmb_total]
   DualArray1D<int> refine_flag;    // refinement flag for each MeshBlock
+  DualArray1D<int> refine_hold;    // 1: a criterion wants the block kept at its level
   DualArray1D<int> fc_amr_repair;  // +1 refined, -1 derefined by the last AMR pass
   HostArray1D<int> ncyc_since_ref; // # of cycles since MB last refined/derefined
 

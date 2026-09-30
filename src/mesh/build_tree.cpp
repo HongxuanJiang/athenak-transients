@@ -18,6 +18,7 @@
 #include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh.hpp"
+#include "mb_storage.hpp"
 #include "coordinates/cell_locations.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
@@ -387,6 +388,11 @@ void Mesh::BuildTreeFromScratch(ParameterInput *pin) {
         << std::endl;
       std::exit(EXIT_FAILURE);
     }
+  }
+  // Opt-in: size every per-MeshBlock device array once for nmb_maxperrank blocks
+  if ((adaptive || multilevel) &&
+      pin->GetOrAddBoolean("mesh_refinement", "preallocate", false)) {
+    SetMeshBlockStorageReserve(nmb_maxperrank);
   }
 #if MPI_PARALLEL_ENABLED
   if (nmb_maxperrank > (1 << (NUM_BITS_LID))) {
@@ -942,6 +948,12 @@ void Mesh::BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
         << std::endl;
       std::exit(EXIT_FAILURE);
     }
+  }
+
+  // Opt-in: size every per-MeshBlock device array once for nmb_maxperrank blocks
+  if ((adaptive || multilevel) &&
+      pin->GetOrAddBoolean("mesh_refinement", "preallocate", false)) {
+    SetMeshBlockStorageReserve(nmb_maxperrank);
   }
 
   // set remaining parameters, output diagnostics

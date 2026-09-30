@@ -35,13 +35,23 @@
 //! blocks of slack and keeps small AMR jitter from touching the allocation at all.
 constexpr int kMBStorageGrain = 16;
 
+//! Opt-in preallocation (<mesh_refinement>/preallocate = true).  When positive, every
+//! per-MeshBlock array is sized once for this many blocks and is never shrunk.  Zero
+//! (the default) leaves the policy below untouched.
+inline int g_mb_storage_reserve = 0;
+inline void SetMeshBlockStorageReserve(int nmb) {
+  g_mb_storage_reserve = std::max(nmb, 0);
+}
+inline int MeshBlockStorageReserve() { return g_mb_storage_reserve; }
+
 //----------------------------------------------------------------------------------------
 //! \fn int MeshBlockStorageCapacity(int nmb_needed)
 //! \brief block extent to allocate in order to hold nmb_needed blocks
 
 inline int MeshBlockStorageCapacity(int nmb_needed) {
   const int n = std::max(nmb_needed, 1);
-  return ((n + kMBStorageGrain - 1)/kMBStorageGrain)*kMBStorageGrain;
+  return std::max(((n + kMBStorageGrain - 1)/kMBStorageGrain)*kMBStorageGrain,
+                  g_mb_storage_reserve);
 }
 
 //----------------------------------------------------------------------------------------
@@ -53,6 +63,7 @@ inline int MeshBlockStorageCapacity(int nmb_needed) {
 //! has to keep the outgoing blocks addressable for PackAndSendAMR.
 
 inline bool MeshBlockStorageShouldResize(int have, int need, bool allow_shrink) {
+  if (g_mb_storage_reserve > 0) return have < std::max(need, g_mb_storage_reserve);
   if (need > have) return true;
   if (!allow_shrink) return false;
   // Shrink as soon as two grains of dead block storage exist (~17 MB per 32^3 hydro

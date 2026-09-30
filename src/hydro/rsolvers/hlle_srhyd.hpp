@@ -31,7 +31,7 @@ void HLLE_SR(const EOS_Data &eos,
              const int is, const int js, const int ks,
              const DvceArray5D<Real> &wl,
              const DvceArray5D<Real> &wr,
-             const DvceArray5D<Real> &flx) {
+             const BandView5D<Real> &flx) {
   constexpr int ivy = IVX + ((ivx-IVX)+1)%3;
   constexpr int ivz = IVX + ((ivx-IVX)+2)%3;
   const Real gm1 = (eos.gamma - 1.0);

@@ -124,7 +124,25 @@ class Hydro {
   DvceArray5D<Real> coarse_u1;  // LAT start-state restriction for fine-to-coarse bvals
   DvceArray5D<Real> lat_u_stage1;  // RK2 stage-1 endpoint for LAT dense bvals
   bool lat_dense_output_enabled = false;
+  // The face fluxes and dual_vf live on a band of the block, not on the ghost-extended
+  // layout: without FOFC the active cells plus the ie+1 face along each normal, with
+  // FOFC one further cell on each side (as MHD, mhd.hpp), so x1f is
+  // (nmb, nvars, nx3[+2], nx2[+2], nx1[+2]+1) with origin (ks[-1], js[-1], is[-1]).  A
+  // degenerate dimension keeps its single cell at origin 0.  Kernels index the band with
+  // the global (m,n,k,j,i) through FluxBand(); the exchange takes FluxOrigin().  Faces
+  // outside the band (ghost faces written by the excision flux replacement without
+  // FOFC) are skipped.
   DvceFaceFld5D<Real> uflx;   // fluxes of conserved quantities on cell faces
+  int flux_ko = 0;
+  int flux_jo = 0;
+  int flux_io = 0;
+  BandView5D<Real> FluxBand(const DvceArray5D<Real> &a) const {
+    return BandView5D<Real>{a, flux_ko, flux_jo, flux_io};
+  }
+  BandFaceFld5D<Real> FluxBand(const DvceFaceFld5D<Real> &f) const {
+    return BandFaceFld5D<Real>{FluxBand(f.x1f), FluxBand(f.x2f), FluxBand(f.x3f)};
+  }
+  FaceFldOrigin FluxOrigin() const { return FaceFldOrigin{flux_ko, flux_jo, flux_io}; }
   DvceFaceFld5D<Real> lat_reflux;  // delayed LAT fine/coarse flux correction
   DvceFaceFld5D<Real> lat_dual_vf_reflux;  // delayed LAT dual-energy div(v) correction
   DvceFaceFld5D<Real> lat_reflux_theta;  // admissible fraction of the pending reflux

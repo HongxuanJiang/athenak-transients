@@ -2200,14 +2200,26 @@ void Driver::InitBoundaryValuesAndPrimitives(Mesh *pm, bool repair_amr_fc,
   // which nothing reads and which is not put back.  A dynamical-GR step re-inverts u0
   // before its first flux and its inversion keeps no such cache, so there the
   // continuation is exact regardless.
+  // Restart scratch copies cover only the live MeshBlocks: the storage extent may exceed
+  // nmb_thispack (capacity padding or preallocation) and no kernel reads past it.
+  const int nmb_live_rst = pm->pmb_pack->nmb_thispack;
+  auto live_blocks = [nmb_live_rst](auto &view) {
+    if constexpr (std::decay_t<decltype(view)>::rank == 5) {
+      return Kokkos::subview(view, std::make_pair(0, nmb_live_rst), Kokkos::ALL,
+                             Kokkos::ALL, Kokkos::ALL, Kokkos::ALL);
+    } else {
+      return Kokkos::subview(view, std::make_pair(0, nmb_live_rst), Kokkos::ALL,
+                             Kokkos::ALL, Kokkos::ALL);
+    }
+  };
   auto recover_primitives = [&](DvceArray5D<Real> &u, auto &&con_to_prim) {
     if (!restart_verbatim) {
       con_to_prim();
       return;
     }
-    DvceArray5D<Real> u_saved("restart_u0_saved", u.extent(0), u.extent(1),
+    DvceArray5D<Real> u_saved("restart_u0_saved", nmb_live_rst, u.extent(1),
                               u.extent(2), u.extent(3), u.extent(4));
-    Kokkos::deep_copy(u_saved, u);
+    Kokkos::deep_copy(u_saved, live_blocks(u));
     // Cold means cold: anything that ran since the restart read may have published roots
     // -- the multilevel coarse-register rebuild below applies the physical/user BCs, and
     // a user BC inverts the u0/w0 ghost bands.  Recovering those ghosts warm put them off
@@ -2216,7 +2228,7 @@ void Driver::InitBoundaryValuesAndPrimitives(Mesh *pm, bool repair_amr_fc,
       (void) pm->pmb_pack->pmhd->peos->ResetC2PWarmStart();
     }
     con_to_prim();
-    Kokkos::deep_copy(u, u_saved);
+    Kokkos::deep_copy(live_blocks(u), u_saved);
   };
 
   // A user boundary function writes the fine ghost cells only; each module's Prolongate
@@ -2296,13 +2308,13 @@ void Driver::InitBoundaryValuesAndPrimitives(Mesh *pm, bool repair_amr_fc,
   const bool rebuild_coarse = restart_verbatim && narrow_blocks;
   auto rebuild_coarse_ghosts = [&](DvceArray5D<Real> &u, auto &&exchange_u,
                                    auto &&prolongate_u) {
-    DvceArray5D<Real> u_saved("restart_fine_saved", u.extent(0), u.extent(1),
+    DvceArray5D<Real> u_saved("restart_fine_saved", nmb_live_rst, u.extent(1),
                               u.extent(2), u.extent(3), u.extent(4));
-    Kokkos::deep_copy(u_saved, u);
+    Kokkos::deep_copy(u_saved, live_blocks(u));
     exchange_u();
-    Kokkos::deep_copy(u, u_saved);
+    Kokkos::deep_copy(live_blocks(u), u_saved);
     prolongate_u();
-    Kokkos::deep_copy(u, u_saved);
+    Kokkos::deep_copy(live_blocks(u), u_saved);
   };
 
   // Initialize Z4c
@@ -2407,21 +2419,21 @@ void Driver::InitBoundaryValuesAndPrimitives(Mesh *pm, bool repair_amr_fc,
     // state with the ordinary startup exchange and then put the checkpointed u0/b0
     // ghost zones back, so the fine arrays stay verbatim.
     if (restart_verbatim && pm->multilevel) {
-      DvceArray5D<Real> u_ghosts("restart_mhd_u0", pmhd->u0.extent(0),
+      DvceArray5D<Real> u_ghosts("restart_mhd_u0", nmb_live_rst,
                                  pmhd->u0.extent(1), pmhd->u0.extent(2),
                                  pmhd->u0.extent(3), pmhd->u0.extent(4));
-      DvceFaceFld4D<Real> b_ghosts("restart_mhd_b0", pmhd->b0.x1f.extent(0),
+      DvceFaceFld4D<Real> b_ghosts("restart_mhd_b0", nmb_live_rst,
                                    pmhd->b0.x1f.extent(1), pmhd->b0.x1f.extent(2),
                                    pmhd->b0.x2f.extent(3));
-      Kokkos::deep_copy(u_ghosts, pmhd->u0);
-      Kokkos::deep_copy(b_ghosts.x1f, pmhd->b0.x1f);
-      Kokkos::deep_copy(b_ghosts.x2f, pmhd->b0.x2f);
-      Kokkos::deep_copy(b_ghosts.x3f, pmhd->b0.x3f);
+      Kokkos::deep_copy(u_ghosts, live_blocks(pmhd->u0));
+      Kokkos::deep_copy(b_ghosts.x1f, live_blocks(pmhd->b0.x1f));
+      Kokkos::deep_copy(b_ghosts.x2f, live_blocks(pmhd->b0.x2f));
+      Kokkos::deep_copy(b_ghosts.x3f, live_blocks(pmhd->b0.x3f));
       auto put_back = [&]() {
-        Kokkos::deep_copy(pmhd->u0, u_ghosts);
-        Kokkos::deep_copy(pmhd->b0.x1f, b_ghosts.x1f);
-        Kokkos::deep_copy(pmhd->b0.x2f, b_ghosts.x2f);
-        Kokkos::deep_copy(pmhd->b0.x3f, b_ghosts.x3f);
+        Kokkos::deep_copy(live_blocks(pmhd->u0), u_ghosts);
+        Kokkos::deep_copy(live_blocks(pmhd->b0.x1f), b_ghosts.x1f);
+        Kokkos::deep_copy(live_blocks(pmhd->b0.x2f), b_ghosts.x2f);
+        Kokkos::deep_copy(live_blocks(pmhd->b0.x3f), b_ghosts.x3f);
       };
       (void) pmhd->InitRecv(this, -1);
       (void) pmhd->SendU(this, 0);

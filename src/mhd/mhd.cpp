@@ -734,7 +734,7 @@ bool MHD::ResizeMeshBlockStorage(int nmb, bool exact, bool allow_shrink) {
       const bool resized_lat_correction_mask = resize5(
           lat_correction_mask, nmb, 1, ncells3, ncells2, ncells1);
       resized = resized_lat_correction_mask || resized;
-      if (resized_lat_correction_mask) {
+      if (resized_lat_correction_mask || MeshBlockStorageReserve() > 0) {
         Kokkos::deep_copy(lat_correction_mask, 0.0);
       }
     }
@@ -742,7 +742,9 @@ bool MHD::ResizeMeshBlockStorage(int nmb, bool exact, bool allow_shrink) {
       const bool resized_coarse_fofc = resize5(
           coarse_fofc_mask, nmb, 1, n_ccells3, n_ccells2, n_ccells1);
       resized = resized_coarse_fofc || resized;
-      if (resized_coarse_fofc) Kokkos::deep_copy(coarse_fofc_mask, 0.0);
+      if (resized_coarse_fofc || MeshBlockStorageReserve() > 0) {
+        Kokkos::deep_copy(coarse_fofc_mask, 0.0);
+      }
     }
     resized = resize4(e3x1, nmb, nband3, nband2, nbandf1) || resized;
     resized = resize4(e2x1, nmb, nband3, nband2, nbandf1) || resized;
@@ -789,7 +791,8 @@ bool MHD::ResizeMeshBlockStorage(int nmb, bool exact, bool allow_shrink) {
     wbcc_saved_dt.template modify<DevExeSpace>();
   }
 
-  if (resized_fofc) {
+  // With preallocation nothing is reallocated, so clear on every call instead.
+  if (resized_fofc || (use_fofc && time_evolving && MeshBlockStorageReserve() > 0)) {
     Kokkos::deep_copy(fofc, false);
     if (nscalars > 0) {
       Kokkos::deep_copy(fofc_scal, false);

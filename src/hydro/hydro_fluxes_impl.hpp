@@ -56,7 +56,7 @@ Real SolveFace(const EOS_Data &eos, const RegionIndcs &indcs,
                const int is, const int js, const int ks,
                const DvceArray5D<Real> &wl,
                const DvceArray5D<Real> &wr,
-               const DvceArray5D<Real> &flx) {
+               const BandView5D<Real> &flx) {
   if constexpr (rsolver_method_ == Hydro_RSolver::advect) {
     Advect<ivx>(eos, m, mb, k, j, i, is, js, ks, wl, wr, flx);
   } else if constexpr (rsolver_method_ == Hydro_RSolver::llf) {
@@ -87,8 +87,8 @@ void SetDualEnergyFluxAt(const EOS_Data &eos, const int dual_idx,
                          const int m, const int mb, const int k, const int j, const int i,
                          const DvceArray5D<Real> &wl,
                          const DvceArray5D<Real> &wr,
-                         const DvceArray5D<Real> &flx,
-                         const DvceArray5D<Real> &vf) {
+                         const BandView5D<Real> &flx,
+                         const BandView5D<Real> &vf) {
   const Real mass_flux = flx(m, IDN, k, j, i);
   if (mass_flux > 0.0) {
     const Real dens = fmax(wl(mb, IDN, k, j, i), eos.dfloor);
@@ -186,9 +186,9 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
   auto &w0_ = w0;
   auto wl_ = wl3d;
   auto wr_ = wr3d;
-  auto vf1_ = dual_vf.x1f;
-  auto vf2_ = dual_vf.x2f;
-  auto vf3_ = dual_vf.x3f;
+  auto vf1_ = FluxBand(dual_vf.x1f);
+  auto vf2_ = FluxBand(dual_vf.x2f);
+  auto vf3_ = FluxBand(dual_vf.x3f);
 
   const int chunk_nmb = std::max(1, std::min(split_recon_chunk_nmb, nwork1 + 1));
   for (int work_start = 0; work_start <= nwork1; work_start += chunk_nmb) {
@@ -197,7 +197,7 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
   //------------------------------------------------------------------------------------
   // x1 direction
   {
-    auto &flx1 = uflx.x1f;
+    auto flx1 = FluxBand(uflx.x1f);
     // Reconstruction over cells i in [il1-1, iu1], j in [jtl, jtu], k in [ktl, ktu]
     if (lat_enabled) {
       ReconDispatchActiveChunk<IVX>(recon_method_, "hflux_x1_recon_lat",
@@ -271,7 +271,7 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
   //------------------------------------------------------------------------------------
   // x2 direction
   if (pmy_pack->pmesh->multi_d) {
-    auto &flx2 = uflx.x2f;
+    auto flx2 = FluxBand(uflx.x2f);
     // Reconstruction over cells j in [jl2-1, ju2], i in [itl, itu], k in [ktl, ktu]
     if (lat_enabled) {
       ReconDispatchActiveChunk<IVY>(recon_method_, "hflux_x2_recon_lat",
@@ -344,7 +344,7 @@ void Hydro::CalculateFluxes(Driver *pdriver, int stage) {
   //------------------------------------------------------------------------------------
   // x3 direction
   if (pmy_pack->pmesh->three_d) {
-    auto &flx3 = uflx.x3f;
+    auto flx3 = FluxBand(uflx.x3f);
     // Reconstruction over cells k in [kl3-1, ku3], j in [jtl, jtu], i in [itl, itu]
     if (lat_enabled) {
       ReconDispatchActiveChunk<IVZ>(recon_method_, "hflux_x3_recon_lat",

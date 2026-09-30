@@ -132,7 +132,11 @@ analysis scripts read it from there (see
 
 The keys below add TDE-specific refinement requests on top of the standard AMR
 criteria.  The generator installs its user refinement function whenever `bh_max_amr`,
-`unbound_amr`, or any `stream_shell_*` key is active (`src/pgen/tde_external.cpp`).  The example decks
+`unbound_amr`, or any `stream_shell_*` key is active (`src/pgen/tde_external.cpp`).
+Each of the rules below that applies to a block gives a target level, and the block is
+moved toward the finest of them: refined if it is coarser, derefined if it is finer and
+no standard criterion asks to refine it.  With stream shells on, a block that no rule
+selects is derefined.  The example decks
 combine it with `<amr_criterion0>` (a density criterion) and a user criterion,
 `<amr_criterion1> method = user`.
 
@@ -140,18 +144,19 @@ combine it with `<amr_criterion0>` (a density criterion) and a user criterion,
 
 | Key | Type | Default | Meaning | Source |
 |---|---|---|---|---|
-| `problem/bh_max_amr` | bool | `false` | Forces refinement of every block that touches the excision sphere (or contains the BH) to level `max_level - bh_max_amr_level_offset`. | `src/pgen/tde_external.cpp` |
+| `problem/bh_max_amr` | bool | `false` | Target level `max_level - bh_max_amr_level_offset` for every block that touches the excision sphere (or contains the BH). | `src/pgen/tde_external.cpp` |
 | `problem/bh_max_amr_level_offset` | int | `0` | Offset below the finest level for the request above. Must be `>= 0`. | `src/pgen/tde_external.cpp` |
-| `problem/unbound_amr` | bool | `false` | Sets blocks that contain gas unbound from the BH (positive kinetic plus softened BH potential energy, and `rho > unbound_amr_rho_min`) to exactly level `max_level - unbound_amr_level_offset`. This keeps the outgoing debris at a chosen, coarser level. | `src/pgen/tde_external.cpp` |
+| `problem/unbound_amr` | bool | `false` | Target level `max_level - unbound_amr_level_offset` for blocks in which at least a fraction `unbound_amr_fill_frac` of the cells hold gas unbound from the BH (positive kinetic plus softened BH potential energy, and `rho > unbound_amr_rho_min`). | `src/pgen/tde_external.cpp` |
 | `problem/unbound_amr_level_offset` | int | `3` | Offset below the finest level for unbound gas. Must be `>= 0`. | `src/pgen/tde_external.cpp` |
 | `problem/unbound_amr_rho_min` | real | `-1.0` | Density threshold for the unbound-gas test. `-1` chooses `max(hydro/dfloor, frame_rho_min, bh_grav_rho_min)`. Other negative values are refused. | `src/pgen/tde_external.cpp` |
+| `problem/unbound_amr_fill_frac` | real | `0.01` | Minimum fraction of the cells of a block that must pass the unbound-gas test. Must be in `[0, 1]`; at least one cell is always required. | `src/pgen/tde_external.cpp` |
 
 ### Stream shells
 
 Stream-shell refinement follows the dense stream in spherical shells around the BH.  It
 is switched on automatically when any `stream_shell_*` key (including the tier keys
 below) is present.  For each shell the peak density is found, and blocks near that peak
-are refined to the shell's target level, `max_level - level_offset`.  Blocks whose
+get the shell's target level, `max_level - level_offset`.  Blocks whose
 maximum density lies below `stream_shell_derefine_dfloor_mult * dfloor` are derefined.
 
 | Key | Type | Default | Meaning | Source |
@@ -280,7 +285,8 @@ radius plus the ghost width of the BH, and for their neighbors (`src/pgen/tde_ex
 | `mesh_refinement/num_levels` | int | none | Number of levels including the root. | 8 to 10 | core |
 | `mesh_refinement/ncycle_check` | int | `1` | Cycles between AMR checks. With LAT use a value at least as large as a LAT window. | `10` to `512` | `src/pgen/tde_external.cpp` |
 | `mesh_refinement/refinement_interval` | int | `5` | Minimum cycles between refinements. | `10` to `512` | `src/pgen/tde_external.cpp` |
-| `mesh_refinement/max_nmb_per_rank` | int | none | Cap on the number of MeshBlocks per rank, which bounds device memory. | `720` to `750` | `src/mesh/load_balance.cpp` |
+| `mesh_refinement/max_nmb_per_rank` | int | none | Cap on the number of MeshBlocks per rank, which bounds device memory. | `520` | `src/mesh/load_balance.cpp` |
+| `mesh_refinement/preallocate` | bool | `false` | Allocate the per-MeshBlock device arrays once for `max_nmb_per_rank` blocks. AMR then never reallocates them, and a cap that does not fit in device memory fails at startup. | not set | `src/mesh/mb_storage.hpp` |
 | `<amr_criterionN>` | block | none | `method = min_max` with `variable = hydro_w_d`, `value_max`, `derefine_value_max` sets the density criterion. `method = user` hands the block to the TDE refinement function. | see decks | core |
 | `<refined_regionN>` | block | none | Minimum refinement level inside a box. | see decks | core |
 

@@ -25,6 +25,7 @@
 #include "mhd/mhd.hpp"
 #include "ismcooling.hpp"
 #include "mesh/mesh.hpp"
+#include "mesh/mb_storage.hpp"
 #include "parameter_input.hpp"
 #include "radiation/radiation.hpp"
 #include "radiation/radiation_tetrad.hpp"
@@ -324,7 +325,7 @@ SourceTerms::~SourceTerms() {
 }
 
 bool SourceTerms::ResizeMeshBlockStorage(int nmb, bool exact) {
-  const int target = std::max(1, nmb);
+  const int target = std::max(std::max(1, nmb), MeshBlockStorageReserve());
   const bool need = exact ?
       (static_cast<int>(dtnew_eachmb.extent(0)) != target) :
       (static_cast<int>(dtnew_eachmb.extent(0)) < target);
@@ -906,12 +907,12 @@ void SourceTerms::Gravity(const DvceArray5D<Real> &w0, const EOS_Data &eos_data,
 
   // Get Godunov density fluxes (Hydro or MHD), used in the energy source term
   // following Mullen, Hanawa & Gammie 2020.
-  // Hydro's register is ghost-extended (origin 0); MHD's lives on its flux band.
+  // Each module's register lives on its own flux band.
   BandView5D<Real> flx1, flx2, flx3;
   if (pmy_pack->phydro != nullptr) {
-    flx1 = BandView5D<Real>{pmy_pack->phydro->uflx.x1f, 0, 0, 0};
-    flx2 = BandView5D<Real>{pmy_pack->phydro->uflx.x2f, 0, 0, 0};
-    flx3 = BandView5D<Real>{pmy_pack->phydro->uflx.x3f, 0, 0, 0};
+    flx1 = pmy_pack->phydro->FluxBand(pmy_pack->phydro->uflx.x1f);
+    flx2 = pmy_pack->phydro->FluxBand(pmy_pack->phydro->uflx.x2f);
+    flx3 = pmy_pack->phydro->FluxBand(pmy_pack->phydro->uflx.x3f);
   } else if (pmy_pack->pmhd != nullptr) {
     flx1 = pmy_pack->pmhd->FluxBand(pmy_pack->pmhd->uflx.x1f);
     flx2 = pmy_pack->pmhd->FluxBand(pmy_pack->pmhd->uflx.x2f);
@@ -1249,9 +1250,9 @@ void SourceTerms::SinkGravity(const DvceArray5D<Real> &w0, const EOS_Data &eos_d
 
   // Godunov density fluxes used in the energy source term.  Hydro-only by construction:
   // MeshBlockPack::AddPhysics refuses <sink_particles> without <hydro>.
-  DvceArray5D<Real> flx1 = pmy_pack->phydro->uflx.x1f;
-  DvceArray5D<Real> flx2 = pmy_pack->phydro->uflx.x2f;
-  DvceArray5D<Real> flx3 = pmy_pack->phydro->uflx.x3f;
+  BandView5D<Real> flx1 = pmy_pack->phydro->FluxBand(pmy_pack->phydro->uflx.x1f);
+  BandView5D<Real> flx2 = pmy_pack->phydro->FluxBand(pmy_pack->phydro->uflx.x2f);
+  BandView5D<Real> flx3 = pmy_pack->phydro->FluxBand(pmy_pack->phydro->uflx.x3f);
 
   // x1-direction momentum and energy source terms
   par_for("sink_gravity_x1",DevExeSpace(),0,nwork1,ks,ke,js,je,is,ie,

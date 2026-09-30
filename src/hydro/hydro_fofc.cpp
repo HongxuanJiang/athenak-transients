@@ -71,6 +71,17 @@ inline bool BlockMayReachExcisionSphere(const RegionSize &size, const Real x,
 }
 
 //----------------------------------------------------------------------------------------
+//! \brief Whether the global face index (k,j,i) lies on the band a flux register is
+//! stored on (BandView5D).  Faces outside it are not stored.
+
+KOKKOS_INLINE_FUNCTION
+bool InFluxBand(const BandView5D<Real> &f, const int k, const int j, const int i) {
+  return (k >= f.ko) && (k - f.ko < static_cast<int>(f.data.extent(2))) &&
+         (j >= f.jo) && (j - f.jo < static_cast<int>(f.data.extent(3))) &&
+         (i >= f.io) && (i - f.io < static_cast<int>(f.data.extent(4)));
+}
+
+//----------------------------------------------------------------------------------------
 //! \brief The FOFC trial state: the stage update of the conserved variables built from
 //! the current face fluxes, on the cells [kl,ku]x[jl,ju]x[il,iu] of the active blocks.
 
@@ -81,9 +92,9 @@ void Hydro::BuildFOFCTrial(Driver *pdriver, int stage, int il, int iu, int jl, i
   if (nwork <= 0) return;
   const bool multi_d = pmy_pack->pmesh->multi_d;
   const bool three_d = pmy_pack->pmesh->three_d;
-  auto flx1 = uflx.x1f;
-  auto flx2 = uflx.x2f;
-  auto flx3 = uflx.x3f;
+  auto flx1 = FluxBand(uflx.x1f);
+  auto flx2 = FluxBand(uflx.x2f);
+  auto flx3 = FluxBand(uflx.x3f);
   auto &size = pmy_pack->pmb->mb_size;
   const bool lat_per_block_dt = pmy_pack->lat_per_block_timestep;
   auto lat_step_dt = pmy_pack->lat_step_dt.d_view;
@@ -160,9 +171,9 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
   bool &three_d = pmy_pack->pmesh->three_d;
 
   int nmb = pmy_pack->nmb_thispack;
-  auto flx1 = uflx.x1f;
-  auto flx2 = uflx.x2f;
-  auto flx3 = uflx.x3f;
+  auto flx1 = FluxBand(uflx.x1f);
+  auto flx2 = FluxBand(uflx.x2f);
+  auto flx3 = FluxBand(uflx.x3f);
   auto &size = pmy_pack->pmb->mb_size;
   const bool lat_enabled = pmy_pack->lat_active_mask_enabled;
   auto active_indices = pmy_pack->lat_active_indices.d_view;
@@ -201,7 +212,8 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
     // The edge cells whose flags were decided without the pending fine flux estimate
     // (StashFOFCEdgeFlags) take them back.
     pbval_u->ReconcilePendingEdgeFOFCFlags(fofc, nullptr, 0, uflx,
-                                           dual_energy_pdv ? &dual_vf : nullptr);
+                                           dual_energy_pdv ? &dual_vf : nullptr,
+                                           FluxOrigin());
   }
 
   auto &coord = pmy_pack->pcoord->coord_data;
@@ -216,9 +228,9 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
   // auxiliary has its own flux and face velocity.
   const bool dual_enabled = dual_energy_pdv;
   int &dual_idx_ = dual_energy_idx;
-  auto &vf1_ = dual_vf.x1f;
-  auto &vf2_ = dual_vf.x2f;
-  auto &vf3_ = dual_vf.x3f;
+  auto vf1_ = FluxBand(dual_vf.x1f);
+  auto vf2_ = FluxBand(dual_vf.x2f);
+  auto vf3_ = FluxBand(dual_vf.x3f);
   auto &use_excise = pmy_pack->pcoord->coord_data.bh_excise;
   auto &excision_flux_ = pmy_pack->pcoord->excision_flux;
   auto &w0_ = w0;
@@ -290,16 +302,8 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
 
     // Apply FOFC
     if (fofc_flag || fofc_excision) {
-      // replace x1-flux at i
-      // load left state
-      HydPrim1D wim1;
-      wim1.d  = w0_(m,IDN,k,j,i-1);
-      wim1.vx = w0_(m,IVX,k,j,i-1);
-      wim1.vy = w0_(m,IVY,k,j,i-1);
-      wim1.vz = w0_(m,IVZ,k,j,i-1);
-      if (eos.use_e) {wim1.e  = w0_(m,IEN,k,j,i-1);}
-
-      // load right state
+      // right state of the face at i, left state of the face at i+1, and the flux
+      // scratch shared by the six face replacements below
       HydPrim1D wi;
       wi.d  = w0_(m,IDN,k,j,i);
       wi.vx = w0_(m,IVX,k,j,i);
@@ -307,110 +311,117 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
       wi.vz = w0_(m,IVZ,k,j,i);
       if (eos.use_e) {wi.e = w0_(m,IEN,k,j,i);}
 
-      // compute new 1st-order LLF flux
       HydCons1D flux;
-      if (is_gr) {
-        Real &x1min = size.d_view(m).x1min;
-        Real &x1max = size.d_view(m).x1max;
-        Real x1v = LeftEdgeX(i-is, nx1, x1min, x1max);
 
-        Real &x2min = size.d_view(m).x2min;
-        Real &x2max = size.d_view(m).x2max;
-        Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
+      // Only faces on the flux band are replaced.  Without FOFC (sink excision only) the
+      // outermost ring of cells reaches ghost faces outside it, which nothing reads.
+      if (InFluxBand(flx1, k, j, i)) {
+        // replace x1-flux at i
+        // load left state
+        HydPrim1D wim1;
+        wim1.d  = w0_(m,IDN,k,j,i-1);
+        wim1.vx = w0_(m,IVX,k,j,i-1);
+        wim1.vy = w0_(m,IVY,k,j,i-1);
+        wim1.vz = w0_(m,IVZ,k,j,i-1);
+        if (eos.use_e) {wim1.e  = w0_(m,IEN,k,j,i-1);}
 
-        Real &x3min = size.d_view(m).x3min;
-        Real &x3max = size.d_view(m).x3max;
-        Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
-        SingleStateLLF_GRHyd(wim1, wi, x1v, x2v, x3v, IVX, coord, eos, flux);
-      } else if (is_sr) {
-        SingleStateLLF_SRHyd(wim1, wi, eos, flux);
-      } else {
-        SingleStateLLF_Hyd(wim1, wi, eos, flux);
-      }
+        // compute new 1st-order LLF flux
+        if (is_gr) {
+          Real &x1min = size.d_view(m).x1min;
+          Real &x1max = size.d_view(m).x1max;
+          Real x1v = LeftEdgeX(i-is, nx1, x1min, x1max);
 
-      // store 1st-order fluxes
-      flx1(m,IDN,k,j,i) = flux.d;
-      flx1(m,IM1,k,j,i) = flux.mx;
-      flx1(m,IM2,k,j,i) = flux.my;
-      flx1(m,IM3,k,j,i) = flux.mz;
-      if (eos.use_e) {flx1(m,IEN,k,j,i) = flux.e;}
-      if (nvars_ > nhyd_) {
-        for (int n=nhyd_; n<nvars_; ++n) {
-          if (dual_enabled && n == dual_idx_) continue;
-          if (flx1(m,IDN,k,j,i) >= 0.0) {
-            flx1(m,n,k,j,i) = flx1(m,IDN,k,j,i)*w0_(m,n,k,j,i-1);
-          } else {
-            flx1(m,n,k,j,i) = flx1(m,IDN,k,j,i)*w0_(m,n,k,j,i);
+          Real &x2min = size.d_view(m).x2min;
+          Real &x2max = size.d_view(m).x2max;
+          Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
+
+          Real &x3min = size.d_view(m).x3min;
+          Real &x3max = size.d_view(m).x3max;
+          Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
+          SingleStateLLF_GRHyd(wim1, wi, x1v, x2v, x3v, IVX, coord, eos, flux);
+        } else if (is_sr) {
+          SingleStateLLF_SRHyd(wim1, wi, eos, flux);
+        } else {
+          SingleStateLLF_Hyd(wim1, wi, eos, flux);
+        }
+
+        // store 1st-order fluxes
+        flx1(m,IDN,k,j,i) = flux.d;
+        flx1(m,IM1,k,j,i) = flux.mx;
+        flx1(m,IM2,k,j,i) = flux.my;
+        flx1(m,IM3,k,j,i) = flux.mz;
+        if (eos.use_e) {flx1(m,IEN,k,j,i) = flux.e;}
+        if (nvars_ > nhyd_) {
+          for (int n=nhyd_; n<nvars_; ++n) {
+            if (dual_enabled && n == dual_idx_) continue;
+            if (flx1(m,IDN,k,j,i) >= 0.0) {
+              flx1(m,n,k,j,i) = flx1(m,IDN,k,j,i)*w0_(m,n,k,j,i-1);
+            } else {
+              flx1(m,n,k,j,i) = flx1(m,IDN,k,j,i)*w0_(m,n,k,j,i);
+            }
           }
         }
-      }
-      if (dual_enabled) {
-        SetDualEnergyFOFCFlux(eos, flx1(m,IDN,k,j,i), wim1.d, wi.d,
-                              w0_(m,dual_idx_,k,j,i-1), w0_(m,dual_idx_,k,j,i),
-                              flx1(m,dual_idx_,k,j,i), vf1_(m,0,k,j,i));
-      }
-
-      // replace x1-flux at i+1
-      // load right state (left state just wi from above)
-      HydPrim1D wip1;
-      wip1.d  = w0_(m,IDN,k,j,i+1);
-      wip1.vx = w0_(m,IVX,k,j,i+1);
-      wip1.vy = w0_(m,IVY,k,j,i+1);
-      wip1.vz = w0_(m,IVZ,k,j,i+1);
-      if (eos.use_e) {wip1.e = w0_(m,IEN,k,j,i+1);}
-
-      // compute new 1st-order LLF flux
-      if (is_gr) {
-        Real &x1min = size.d_view(m).x1min;
-        Real &x1max = size.d_view(m).x1max;
-        Real x1v = LeftEdgeX(i+1-is, nx1, x1min, x1max);
-
-        Real &x2min = size.d_view(m).x2min;
-        Real &x2max = size.d_view(m).x2max;
-        Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
-
-        Real &x3min = size.d_view(m).x3min;
-        Real &x3max = size.d_view(m).x3max;
-        Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
-        SingleStateLLF_GRHyd(wi, wip1, x1v, x2v, x3v, IVX, coord, eos, flux);
-      } else if (is_sr) {
-        SingleStateLLF_SRHyd(wi, wip1, eos, flux);
-      } else {
-        SingleStateLLF_Hyd(wi, wip1, eos, flux);
-      }
-
-      // store 1st-order fluxes
-      flx1(m,IDN,k,j,i+1) = flux.d;
-      flx1(m,IM1,k,j,i+1) = flux.mx;
-      flx1(m,IM2,k,j,i+1) = flux.my;
-      flx1(m,IM3,k,j,i+1) = flux.mz;
-      if (eos.use_e) {flx1(m,IEN,k,j,i+1) = flux.e;}
-      if (nvars_ > nhyd_) {
-        for (int n=nhyd_; n<nvars_; ++n) {
-          if (dual_enabled && n == dual_idx_) continue;
-          if (flx1(m,IDN,k,j,i+1) >= 0.0) {
-            flx1(m,n,k,j,i+1) = flx1(m,IDN,k,j,i+1)*w0_(m,n,k,j,i);
-          } else {
-            flx1(m,n,k,j,i+1) = flx1(m,IDN,k,j,i+1)*w0_(m,n,k,j,i+1);
-          }
+        if (dual_enabled) {
+          SetDualEnergyFOFCFlux(eos, flx1(m,IDN,k,j,i), wim1.d, wi.d,
+                                w0_(m,dual_idx_,k,j,i-1), w0_(m,dual_idx_,k,j,i),
+                                flx1(m,dual_idx_,k,j,i), vf1_(m,0,k,j,i));
         }
       }
-      if (dual_enabled) {
-        SetDualEnergyFOFCFlux(eos, flx1(m,IDN,k,j,i+1), wi.d, wip1.d,
-                              w0_(m,dual_idx_,k,j,i), w0_(m,dual_idx_,k,j,i+1),
-                              flx1(m,dual_idx_,k,j,i+1), vf1_(m,0,k,j,i+1));
+
+      if (InFluxBand(flx1, k, j, i+1)) {
+        // replace x1-flux at i+1
+        // load right state (left state just wi from above)
+        HydPrim1D wip1;
+        wip1.d  = w0_(m,IDN,k,j,i+1);
+        wip1.vx = w0_(m,IVX,k,j,i+1);
+        wip1.vy = w0_(m,IVY,k,j,i+1);
+        wip1.vz = w0_(m,IVZ,k,j,i+1);
+        if (eos.use_e) {wip1.e = w0_(m,IEN,k,j,i+1);}
+
+        // compute new 1st-order LLF flux
+        if (is_gr) {
+          Real &x1min = size.d_view(m).x1min;
+          Real &x1max = size.d_view(m).x1max;
+          Real x1v = LeftEdgeX(i+1-is, nx1, x1min, x1max);
+
+          Real &x2min = size.d_view(m).x2min;
+          Real &x2max = size.d_view(m).x2max;
+          Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
+
+          Real &x3min = size.d_view(m).x3min;
+          Real &x3max = size.d_view(m).x3max;
+          Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
+          SingleStateLLF_GRHyd(wi, wip1, x1v, x2v, x3v, IVX, coord, eos, flux);
+        } else if (is_sr) {
+          SingleStateLLF_SRHyd(wi, wip1, eos, flux);
+        } else {
+          SingleStateLLF_Hyd(wi, wip1, eos, flux);
+        }
+
+        // store 1st-order fluxes
+        flx1(m,IDN,k,j,i+1) = flux.d;
+        flx1(m,IM1,k,j,i+1) = flux.mx;
+        flx1(m,IM2,k,j,i+1) = flux.my;
+        flx1(m,IM3,k,j,i+1) = flux.mz;
+        if (eos.use_e) {flx1(m,IEN,k,j,i+1) = flux.e;}
+        if (nvars_ > nhyd_) {
+          for (int n=nhyd_; n<nvars_; ++n) {
+            if (dual_enabled && n == dual_idx_) continue;
+            if (flx1(m,IDN,k,j,i+1) >= 0.0) {
+              flx1(m,n,k,j,i+1) = flx1(m,IDN,k,j,i+1)*w0_(m,n,k,j,i);
+            } else {
+              flx1(m,n,k,j,i+1) = flx1(m,IDN,k,j,i+1)*w0_(m,n,k,j,i+1);
+            }
+          }
+        }
+        if (dual_enabled) {
+          SetDualEnergyFOFCFlux(eos, flx1(m,IDN,k,j,i+1), wi.d, wip1.d,
+                                w0_(m,dual_idx_,k,j,i), w0_(m,dual_idx_,k,j,i+1),
+                                flx1(m,dual_idx_,k,j,i+1), vf1_(m,0,k,j,i+1));
+        }
       }
 
       if (multi_d) {
-        // replace x2-flux at j
-        // load left state, permutting components of vectors
-        HydPrim1D wjm1;
-        wjm1.d  = w0_(m,IDN,k,j-1,i);
-        wjm1.vx = w0_(m,IVY,k,j-1,i);
-        wjm1.vy = w0_(m,IVZ,k,j-1,i);
-        wjm1.vz = w0_(m,IVX,k,j-1,i);
-        if (eos.use_e) {wjm1.e = w0_(m,IEN,k,j-1,i);}
-
         // load right state, permutting components of vectors
         HydPrim1D wj;
         wj.d  = w0_(m,IDN,k,j,i);
@@ -419,111 +430,115 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
         wj.vz = w0_(m,IVX,k,j,i);
         if (eos.use_e) {wj.e = w0_(m,IEN,k,j,i);}
 
-        // compute new first-order flux
-        if (is_gr) {
-          Real &x1min = size.d_view(m).x1min;
-          Real &x1max = size.d_view(m).x1max;
-          Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
+        if (InFluxBand(flx2, k, j, i)) {
+          // replace x2-flux at j
+          // load left state, permutting components of vectors
+          HydPrim1D wjm1;
+          wjm1.d  = w0_(m,IDN,k,j-1,i);
+          wjm1.vx = w0_(m,IVY,k,j-1,i);
+          wjm1.vy = w0_(m,IVZ,k,j-1,i);
+          wjm1.vz = w0_(m,IVX,k,j-1,i);
+          if (eos.use_e) {wjm1.e = w0_(m,IEN,k,j-1,i);}
 
-          Real &x2min = size.d_view(m).x2min;
-          Real &x2max = size.d_view(m).x2max;
-          Real x2v = LeftEdgeX(j-js, nx2, x2min, x2max);
+          // compute new first-order flux
+          if (is_gr) {
+            Real &x1min = size.d_view(m).x1min;
+            Real &x1max = size.d_view(m).x1max;
+            Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
 
-          Real &x3min = size.d_view(m).x3min;
-          Real &x3max = size.d_view(m).x3max;
-          Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
-          SingleStateLLF_GRHyd(wjm1, wj, x1v, x2v, x3v, IVY, coord, eos, flux);
-        } else if (is_sr) {
-          SingleStateLLF_SRHyd(wjm1, wj, eos, flux);
-        } else {
-          SingleStateLLF_Hyd(wjm1, wj, eos, flux);
-        }
+            Real &x2min = size.d_view(m).x2min;
+            Real &x2max = size.d_view(m).x2max;
+            Real x2v = LeftEdgeX(j-js, nx2, x2min, x2max);
 
-        // store 1st-order fluxes, permutting indices
-        flx2(m,IDN,k,j,i) = flux.d;
-        flx2(m,IM2,k,j,i) = flux.mx;
-        flx2(m,IM3,k,j,i) = flux.my;
-        flx2(m,IM1,k,j,i) = flux.mz;
-        if (eos.use_e) {flx2(m,IEN,k,j,i) = flux.e;}
-        if (nvars_ > nhyd_) {
-          for (int n=nhyd_; n<nvars_; ++n) {
-            if (dual_enabled && n == dual_idx_) continue;
-            if (flx2(m,IDN,k,j,i) >= 0.0) {
-              flx2(m,n,k,j,i) = flx2(m,IDN,k,j,i)*w0_(m,n,k,j-1,i);
-            } else {
-              flx2(m,n,k,j,i) = flx2(m,IDN,k,j,i)*w0_(m,n,k,j,i);
+            Real &x3min = size.d_view(m).x3min;
+            Real &x3max = size.d_view(m).x3max;
+            Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
+            SingleStateLLF_GRHyd(wjm1, wj, x1v, x2v, x3v, IVY, coord, eos, flux);
+          } else if (is_sr) {
+            SingleStateLLF_SRHyd(wjm1, wj, eos, flux);
+          } else {
+            SingleStateLLF_Hyd(wjm1, wj, eos, flux);
+          }
+
+          // store 1st-order fluxes, permutting indices
+          flx2(m,IDN,k,j,i) = flux.d;
+          flx2(m,IM2,k,j,i) = flux.mx;
+          flx2(m,IM3,k,j,i) = flux.my;
+          flx2(m,IM1,k,j,i) = flux.mz;
+          if (eos.use_e) {flx2(m,IEN,k,j,i) = flux.e;}
+          if (nvars_ > nhyd_) {
+            for (int n=nhyd_; n<nvars_; ++n) {
+              if (dual_enabled && n == dual_idx_) continue;
+              if (flx2(m,IDN,k,j,i) >= 0.0) {
+                flx2(m,n,k,j,i) = flx2(m,IDN,k,j,i)*w0_(m,n,k,j-1,i);
+              } else {
+                flx2(m,n,k,j,i) = flx2(m,IDN,k,j,i)*w0_(m,n,k,j,i);
+              }
             }
           }
-        }
-        if (dual_enabled) {
-          SetDualEnergyFOFCFlux(eos, flx2(m,IDN,k,j,i), wjm1.d, wj.d,
-                                w0_(m,dual_idx_,k,j-1,i), w0_(m,dual_idx_,k,j,i),
-                                flx2(m,dual_idx_,k,j,i), vf2_(m,0,k,j,i));
-        }
-
-        // replace x2-flux at j+1
-        // load left state, permutting components of vectors (just wj from above)
-        // load right state, permutting components of vectors
-        HydPrim1D wjp1;
-        wjp1.d  = w0_(m,IDN,k,j+1,i);
-        wjp1.vx = w0_(m,IVY,k,j+1,i);
-        wjp1.vy = w0_(m,IVZ,k,j+1,i);
-        wjp1.vz = w0_(m,IVX,k,j+1,i);
-        if (eos.use_e) {wjp1.e = w0_(m,IEN,k,j+1,i);}
-
-        // compute new first-order flux
-        if (is_gr) {
-          Real &x1min = size.d_view(m).x1min;
-          Real &x1max = size.d_view(m).x1max;
-          Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
-
-          Real &x2min = size.d_view(m).x2min;
-          Real &x2max = size.d_view(m).x2max;
-          Real x2v = LeftEdgeX(j+1-js, nx2, x2min, x2max);
-
-          Real &x3min = size.d_view(m).x3min;
-          Real &x3max = size.d_view(m).x3max;
-          Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
-          SingleStateLLF_GRHyd(wj, wjp1, x1v, x2v, x3v, IVY, coord, eos, flux);
-        } else if (is_sr) {
-          SingleStateLLF_SRHyd(wj, wjp1, eos, flux);
-        } else {
-          SingleStateLLF_Hyd(wj, wjp1, eos, flux);
-        }
-
-        // store 1st-order fluxes, permutting indices
-        flx2(m,IDN,k,j+1,i) = flux.d;
-        flx2(m,IM2,k,j+1,i) = flux.mx;
-        flx2(m,IM3,k,j+1,i) = flux.my;
-        flx2(m,IM1,k,j+1,i) = flux.mz;
-        if (eos.use_e) {flx2(m,IEN,k,j+1,i) = flux.e;}
-        if (nvars_ > nhyd_) {
-          for (int n=nhyd_; n<nvars_; ++n) {
-            if (dual_enabled && n == dual_idx_) continue;
-            if (flx2(m,IDN,k,j+1,i) >= 0.0) {
-              flx2(m,n,k,j+1,i) = flx2(m,IDN,k,j+1,i)*w0_(m,n,k,j,i);
-            } else {
-              flx2(m,n,k,j+1,i) = flx2(m,IDN,k,j+1,i)*w0_(m,n,k,j+1,i);
-            }
+          if (dual_enabled) {
+            SetDualEnergyFOFCFlux(eos, flx2(m,IDN,k,j,i), wjm1.d, wj.d,
+                                  w0_(m,dual_idx_,k,j-1,i), w0_(m,dual_idx_,k,j,i),
+                                  flx2(m,dual_idx_,k,j,i), vf2_(m,0,k,j,i));
           }
         }
-        if (dual_enabled) {
-          SetDualEnergyFOFCFlux(eos, flx2(m,IDN,k,j+1,i), wj.d, wjp1.d,
-                                w0_(m,dual_idx_,k,j,i), w0_(m,dual_idx_,k,j+1,i),
-                                flx2(m,dual_idx_,k,j+1,i), vf2_(m,0,k,j+1,i));
+
+        if (InFluxBand(flx2, k, j+1, i)) {
+          // replace x2-flux at j+1
+          // load left state, permutting components of vectors (just wj from above)
+          // load right state, permutting components of vectors
+          HydPrim1D wjp1;
+          wjp1.d  = w0_(m,IDN,k,j+1,i);
+          wjp1.vx = w0_(m,IVY,k,j+1,i);
+          wjp1.vy = w0_(m,IVZ,k,j+1,i);
+          wjp1.vz = w0_(m,IVX,k,j+1,i);
+          if (eos.use_e) {wjp1.e = w0_(m,IEN,k,j+1,i);}
+
+          // compute new first-order flux
+          if (is_gr) {
+            Real &x1min = size.d_view(m).x1min;
+            Real &x1max = size.d_view(m).x1max;
+            Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
+
+            Real &x2min = size.d_view(m).x2min;
+            Real &x2max = size.d_view(m).x2max;
+            Real x2v = LeftEdgeX(j+1-js, nx2, x2min, x2max);
+
+            Real &x3min = size.d_view(m).x3min;
+            Real &x3max = size.d_view(m).x3max;
+            Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
+            SingleStateLLF_GRHyd(wj, wjp1, x1v, x2v, x3v, IVY, coord, eos, flux);
+          } else if (is_sr) {
+            SingleStateLLF_SRHyd(wj, wjp1, eos, flux);
+          } else {
+            SingleStateLLF_Hyd(wj, wjp1, eos, flux);
+          }
+
+          // store 1st-order fluxes, permutting indices
+          flx2(m,IDN,k,j+1,i) = flux.d;
+          flx2(m,IM2,k,j+1,i) = flux.mx;
+          flx2(m,IM3,k,j+1,i) = flux.my;
+          flx2(m,IM1,k,j+1,i) = flux.mz;
+          if (eos.use_e) {flx2(m,IEN,k,j+1,i) = flux.e;}
+          if (nvars_ > nhyd_) {
+            for (int n=nhyd_; n<nvars_; ++n) {
+              if (dual_enabled && n == dual_idx_) continue;
+              if (flx2(m,IDN,k,j+1,i) >= 0.0) {
+                flx2(m,n,k,j+1,i) = flx2(m,IDN,k,j+1,i)*w0_(m,n,k,j,i);
+              } else {
+                flx2(m,n,k,j+1,i) = flx2(m,IDN,k,j+1,i)*w0_(m,n,k,j+1,i);
+              }
+            }
+          }
+          if (dual_enabled) {
+            SetDualEnergyFOFCFlux(eos, flx2(m,IDN,k,j+1,i), wj.d, wjp1.d,
+                                  w0_(m,dual_idx_,k,j,i), w0_(m,dual_idx_,k,j+1,i),
+                                  flx2(m,dual_idx_,k,j+1,i), vf2_(m,0,k,j+1,i));
+          }
         }
       }
 
       if (three_d) {
-        // replace x3-flux at k
-        // load left state, permutting components of vectors
-        HydPrim1D wkm1;
-        wkm1.d  = w0_(m,IDN,k-1,j,i);
-        wkm1.vx = w0_(m,IVZ,k-1,j,i);
-        wkm1.vy = w0_(m,IVX,k-1,j,i);
-        wkm1.vz = w0_(m,IVY,k-1,j,i);
-        if (eos.use_e) {wkm1.e = w0_(m,IEN,k-1,j,i);}
-
         // load right state, permutting components of vectors
         HydPrim1D wk;
         wk.d  = w0_(m,IDN,k,j,i);
@@ -532,98 +547,111 @@ void Hydro::FOFC(Driver *pdriver, int stage) {
         wk.vz = w0_(m,IVY,k,j,i);
         if (eos.use_e) {wk.e = w0_(m,IEN,k,j,i);}
 
-        // compute new first-order flux
-        if (is_gr) {
-          Real &x1min = size.d_view(m).x1min;
-          Real &x1max = size.d_view(m).x1max;
-          Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
+        if (InFluxBand(flx3, k, j, i)) {
+          // replace x3-flux at k
+          // load left state, permutting components of vectors
+          HydPrim1D wkm1;
+          wkm1.d  = w0_(m,IDN,k-1,j,i);
+          wkm1.vx = w0_(m,IVZ,k-1,j,i);
+          wkm1.vy = w0_(m,IVX,k-1,j,i);
+          wkm1.vz = w0_(m,IVY,k-1,j,i);
+          if (eos.use_e) {wkm1.e = w0_(m,IEN,k-1,j,i);}
 
-          Real &x2min = size.d_view(m).x2min;
-          Real &x2max = size.d_view(m).x2max;
-          Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
+          // compute new first-order flux
+          if (is_gr) {
+            Real &x1min = size.d_view(m).x1min;
+            Real &x1max = size.d_view(m).x1max;
+            Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
 
-          Real &x3min = size.d_view(m).x3min;
-          Real &x3max = size.d_view(m).x3max;
-          Real x3v = LeftEdgeX(k-ks, nx3, x3min, x3max);
-          SingleStateLLF_GRHyd(wkm1, wk, x1v, x2v, x3v, IVZ, coord, eos, flux);
-        } else if (is_sr) {
-          SingleStateLLF_SRHyd(wkm1, wk, eos, flux);
-        } else {
-          SingleStateLLF_Hyd(wkm1, wk, eos, flux);
-        }
+            Real &x2min = size.d_view(m).x2min;
+            Real &x2max = size.d_view(m).x2max;
+            Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
 
-        // store 1st-order fluxes, permutting indices
-        flx3(m,IDN,k,j,i) = flux.d;
-        flx3(m,IM3,k,j,i) = flux.mx;
-        flx3(m,IM1,k,j,i) = flux.my;
-        flx3(m,IM2,k,j,i) = flux.mz;
-        if (eos.use_e) {flx3(m,IEN,k,j,i) = flux.e;}
-        if (nvars_ > nhyd_) {
-          for (int n=nhyd_; n<nvars_; ++n) {
-            if (dual_enabled && n == dual_idx_) continue;
-            if (flx3(m,IDN,k,j,i) >= 0.0) {
-              flx3(m,n,k,j,i) = flx3(m,IDN,k,j,i)*w0_(m,n,k-1,j,i);
-            } else {
-              flx3(m,n,k,j,i) = flx3(m,IDN,k,j,i)*w0_(m,n,k,j,i);
+            Real &x3min = size.d_view(m).x3min;
+            Real &x3max = size.d_view(m).x3max;
+            Real x3v = LeftEdgeX(k-ks, nx3, x3min, x3max);
+            SingleStateLLF_GRHyd(wkm1, wk, x1v, x2v, x3v, IVZ, coord, eos, flux);
+          } else if (is_sr) {
+            SingleStateLLF_SRHyd(wkm1, wk, eos, flux);
+          } else {
+            SingleStateLLF_Hyd(wkm1, wk, eos, flux);
+          }
+
+          // store 1st-order fluxes, permutting indices
+          flx3(m,IDN,k,j,i) = flux.d;
+          flx3(m,IM3,k,j,i) = flux.mx;
+          flx3(m,IM1,k,j,i) = flux.my;
+          flx3(m,IM2,k,j,i) = flux.mz;
+          if (eos.use_e) {flx3(m,IEN,k,j,i) = flux.e;}
+          if (nvars_ > nhyd_) {
+            for (int n=nhyd_; n<nvars_; ++n) {
+              if (dual_enabled && n == dual_idx_) continue;
+              if (flx3(m,IDN,k,j,i) >= 0.0) {
+                flx3(m,n,k,j,i) = flx3(m,IDN,k,j,i)*w0_(m,n,k-1,j,i);
+              } else {
+                flx3(m,n,k,j,i) = flx3(m,IDN,k,j,i)*w0_(m,n,k,j,i);
+              }
             }
           }
-        }
-        if (dual_enabled) {
-          SetDualEnergyFOFCFlux(eos, flx3(m,IDN,k,j,i), wkm1.d, wk.d,
-                                w0_(m,dual_idx_,k-1,j,i), w0_(m,dual_idx_,k,j,i),
-                                flx3(m,dual_idx_,k,j,i), vf3_(m,0,k,j,i));
-        }
-
-        // replace x3-flux at k+1
-        // load left state, permutting components of vectors (just wk from above)
-        // load right state, permutting components of vectors
-        HydPrim1D wkp1;
-        wkp1.d  = w0_(m,IDN,k+1,j,i);
-        wkp1.vx = w0_(m,IVZ,k+1,j,i);
-        wkp1.vy = w0_(m,IVX,k+1,j,i);
-        wkp1.vz = w0_(m,IVY,k+1,j,i);
-        if (eos.use_e) {wkp1.e = w0_(m,IEN,k+1,j,i);}
-
-        // compute new first-order flux
-        if (is_gr) {
-          Real &x1min = size.d_view(m).x1min;
-          Real &x1max = size.d_view(m).x1max;
-          Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
-
-          Real &x2min = size.d_view(m).x2min;
-          Real &x2max = size.d_view(m).x2max;
-          Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
-
-          Real &x3min = size.d_view(m).x3min;
-          Real &x3max = size.d_view(m).x3max;
-          Real x3v = LeftEdgeX(k+1-ks, nx3, x3min, x3max);
-          SingleStateLLF_GRHyd(wk, wkp1, x1v, x2v, x3v, IVZ, coord, eos, flux);
-        } else if (is_sr) {
-          SingleStateLLF_SRHyd(wk, wkp1, eos, flux);
-        } else {
-          SingleStateLLF_Hyd(wk, wkp1, eos, flux);
-        }
-
-        // store 1st-order fluxes, permutting indices
-        flx3(m,IDN,k+1,j,i) = flux.d;
-        flx3(m,IM3,k+1,j,i) = flux.mx;
-        flx3(m,IM1,k+1,j,i) = flux.my;
-        flx3(m,IM2,k+1,j,i) = flux.mz;
-        if (eos.use_e) {flx3(m,IEN,k+1,j,i) = flux.e;}
-        if (nvars_ > nhyd_) {
-          for (int n=nhyd_; n<nvars_; ++n) {
-            if (dual_enabled && n == dual_idx_) continue;
-            if (flx3(m,IDN,k+1,j,i) >= 0.0) {
-              flx3(m,n,k+1,j,i) = flx3(m,IDN,k+1,j,i)*w0_(m,n,k,j,i);
-            } else {
-              flx3(m,n,k+1,j,i) = flx3(m,IDN,k+1,j,i)*w0_(m,n,k+1,j,i);
-            }
+          if (dual_enabled) {
+            SetDualEnergyFOFCFlux(eos, flx3(m,IDN,k,j,i), wkm1.d, wk.d,
+                                  w0_(m,dual_idx_,k-1,j,i), w0_(m,dual_idx_,k,j,i),
+                                  flx3(m,dual_idx_,k,j,i), vf3_(m,0,k,j,i));
           }
         }
-        if (dual_enabled) {
-          SetDualEnergyFOFCFlux(eos, flx3(m,IDN,k+1,j,i), wk.d, wkp1.d,
-                                w0_(m,dual_idx_,k,j,i), w0_(m,dual_idx_,k+1,j,i),
-                                flx3(m,dual_idx_,k+1,j,i), vf3_(m,0,k+1,j,i));
+
+        if (InFluxBand(flx3, k+1, j, i)) {
+          // replace x3-flux at k+1
+          // load left state, permutting components of vectors (just wk from above)
+          // load right state, permutting components of vectors
+          HydPrim1D wkp1;
+          wkp1.d  = w0_(m,IDN,k+1,j,i);
+          wkp1.vx = w0_(m,IVZ,k+1,j,i);
+          wkp1.vy = w0_(m,IVX,k+1,j,i);
+          wkp1.vz = w0_(m,IVY,k+1,j,i);
+          if (eos.use_e) {wkp1.e = w0_(m,IEN,k+1,j,i);}
+
+          // compute new first-order flux
+          if (is_gr) {
+            Real &x1min = size.d_view(m).x1min;
+            Real &x1max = size.d_view(m).x1max;
+            Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
+
+            Real &x2min = size.d_view(m).x2min;
+            Real &x2max = size.d_view(m).x2max;
+            Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
+
+            Real &x3min = size.d_view(m).x3min;
+            Real &x3max = size.d_view(m).x3max;
+            Real x3v = LeftEdgeX(k+1-ks, nx3, x3min, x3max);
+            SingleStateLLF_GRHyd(wk, wkp1, x1v, x2v, x3v, IVZ, coord, eos, flux);
+          } else if (is_sr) {
+            SingleStateLLF_SRHyd(wk, wkp1, eos, flux);
+          } else {
+            SingleStateLLF_Hyd(wk, wkp1, eos, flux);
+          }
+
+          // store 1st-order fluxes, permutting indices
+          flx3(m,IDN,k+1,j,i) = flux.d;
+          flx3(m,IM3,k+1,j,i) = flux.mx;
+          flx3(m,IM1,k+1,j,i) = flux.my;
+          flx3(m,IM2,k+1,j,i) = flux.mz;
+          if (eos.use_e) {flx3(m,IEN,k+1,j,i) = flux.e;}
+          if (nvars_ > nhyd_) {
+            for (int n=nhyd_; n<nvars_; ++n) {
+              if (dual_enabled && n == dual_idx_) continue;
+              if (flx3(m,IDN,k+1,j,i) >= 0.0) {
+                flx3(m,n,k+1,j,i) = flx3(m,IDN,k+1,j,i)*w0_(m,n,k,j,i);
+              } else {
+                flx3(m,n,k+1,j,i) = flx3(m,IDN,k+1,j,i)*w0_(m,n,k+1,j,i);
+              }
+            }
+          }
+          if (dual_enabled) {
+            SetDualEnergyFOFCFlux(eos, flx3(m,IDN,k+1,j,i), wk.d, wkp1.d,
+                                  w0_(m,dual_idx_,k,j,i), w0_(m,dual_idx_,k+1,j,i),
+                                  flx3(m,dual_idx_,k+1,j,i), vf3_(m,0,k+1,j,i));
+          }
         }
       }
 

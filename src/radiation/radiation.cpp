@@ -112,6 +112,7 @@ Radiation::Radiation(MeshBlockPack *ppack, ParameterInput *pin) :
 
   // Total number of MeshBlocks on this rank to be used in array dimensioning
   int nmb = ppack->nmb_thispack;
+  if (MeshBlockStorageReserve() > 0) nmb = MeshBlockStorageCapacity(nmb);
   auto &indcs = pmy_pack->pmesh->mb_indcs;
   {
   int ncells1 = indcs.nx1 + 2*(indcs.ng);

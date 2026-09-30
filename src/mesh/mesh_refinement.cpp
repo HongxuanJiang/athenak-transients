@@ -27,6 +27,7 @@
 #include "parameter_input.hpp"
 #include "mesh.hpp"
 #include "mesh_refinement.hpp"
+#include "mesh/mb_storage.hpp"
 #include "refinement_criteria.hpp"
 
 #include "hydro/hydro.hpp"
@@ -858,6 +859,7 @@ void ApplyUserRefinementCriterion(Mesh *pm, MeshBlockPack* pmbp) {
 MeshRefinement::MeshRefinement(Mesh *pm, ParameterInput *pin) :
   pmy_mesh(pm),
   refine_flag("rflag",pm->nmb_total),
+  refine_hold("rhold",pm->nmb_total),
   fc_amr_repair("fc_amr_repair",pm->nmb_total),
   ncyc_since_ref("cyc_since_ref",pm->nmb_total),
   nmb_created(0),
@@ -1125,11 +1127,17 @@ void MeshRefinement::CheckForRefinement(MeshBlockPack* pmbp) {
   if (static_cast<int>(refine_flag.extent(0)) != pmy_mesh->nmb_total) {
     Kokkos::realloc(refine_flag, pmy_mesh->nmb_total);
   }
+  if (static_cast<int>(refine_hold.extent(0)) != pmy_mesh->nmb_total) {
+    Kokkos::realloc(refine_hold, pmy_mesh->nmb_total);
+  }
   for (int m = 0; m < nmb; ++m) {
     refine_flag.h_view(m + mbs) = 0;
+    refine_hold.h_view(m + mbs) = 0;
   }
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
+  refine_hold.template modify<HostMemSpace>();
+  refine_hold.template sync<DevExeSpace>();
 
   pmrc->ResizeMeshBlockStorage(nmb);
   pmrc->SetRefinementData(pmbp, false, false);
@@ -1175,11 +1183,25 @@ void MeshRefinement::CheckForRefinement(MeshBlockPack* pmbp) {
     // override derefine requests made by later generic criteria.
     ApplyUserRefinementCriterion(pmy_mesh, pmbp);
   }
+  // A criterion that would refine a block but cannot, because the block is already at
+  // that criterion's maximum level, leaves the flag at 0.  Do not let another criterion
+  // or the user hook turn that into a derefinement.
+  refine_flag.template sync<HostMemSpace>();
+  refine_hold.template sync<HostMemSpace>();
+  for (int m = 0; m < nmb; ++m) {
+    if (refine_hold.h_view(m + mbs) != 0 && refine_flag.h_view(m + mbs) < 0) {
+      refine_flag.h_view(m + mbs) = 0;
+    }
+  }
+  refine_flag.template modify<HostMemSpace>();
+  refine_flag.template sync<DevExeSpace>();
   // Every criterion has been evaluated; drop the derived-variable array until the next
   // check instead of keeping 0.37 MB per block resident.  Kept resident when AMR runs
   // every few cycles (per-cycle device free/alloc churn is what the grow-only policies in
   // this file guard against).
-  if (refinement_interval >= 16) pmrc->ReleaseMeshBlockStorage();
+  if (refinement_interval >= 16 && MeshBlockStorageReserve() == 0) {
+    pmrc->ReleaseMeshBlockStorage();
+  }
 
   long long pre_filter_refine = 0;
   long long pre_filter_derefine = 0;
@@ -2593,7 +2615,9 @@ void MeshRefinement::RedistAndRefineMeshBlocks(ParameterInput *pin, int nnew, in
   // persistent buffer); otherwise return its >= 64 MiB to the device.  It only exists in
   // an MPI build -- a serial AMR transaction moves blocks without ever packing them.
 #if MPI_PARALLEL_ENABLED
-  if (refinement_interval >= 16) lb_stage = DvceArray1D<Real>();
+  if (refinement_interval >= 16 && MeshBlockStorageReserve() == 0) {
+    lb_stage = DvceArray1D<Real>();
+  }
 #endif
 
   return;
@@ -3576,6 +3600,10 @@ void MeshRefinement::RestrictCC(DvceArray5D<Real> &u, DvceArray5D<Real> &cu,
     bool is_z4c, bool lat_active_only, bool owned_source) {
   int nmb  = u.extent_int(0);  // TODO(@user): 1st index from L of in array must be NMB
   int nvar = u.extent_int(1);  // TODO(@user): 2nd index from L of in array must be NVAR
+  // The block extent is the storage capacity, which can exceed the live block count.
+  if (pmy_mesh->pmb_pack != nullptr) {
+    nmb = std::min(nmb, pmy_mesh->pmb_pack->nmb_thispack);
+  }
 
   auto &indcs = pmy_mesh->mb_indcs;
   auto &cis = indcs.cis, &cie = indcs.cie;
@@ -3657,6 +3685,10 @@ void MeshRefinement::RestrictCC(DvceArray5D<Real> &u, DvceArray5D<Real> &cu,
 
 void MeshRefinement::RestrictFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb) {
   int nmb  = b.x1f.extent_int(0);  // TODO(@user): 1st idx from L of in array must be NMB
+  // The block extent is the storage capacity, which can exceed the live block count.
+  if (pmy_mesh->pmb_pack != nullptr) {
+    nmb = std::min(nmb, pmy_mesh->pmb_pack->nmb_thispack);
+  }
 
   auto &cis = pmy_mesh->mb_indcs.cis;
   auto &cie = pmy_mesh->mb_indcs.cie;
