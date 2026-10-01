@@ -1,237 +1,152 @@
 # Tabulated EOS: implementation notes
 
-Developer-level detail for [Tabulated EOS](Tabulated-EOS). Start there for usage and
-parameters.
+Back to [Tabulated EOS](Tabulated-EOS). This page explains how the tabulated EOS is put
+together in the code, for someone who has to change it. Usage and keys are on the main page.
 
-## Contents
+## The big picture
 
-- [Code map](#code-map)
-- [Table container and loader](#table-container-and-loader)
-- [Inversion and interpolation](#inversion-and-interpolation)
-- [Temperature unit](#temperature-unit)
-- [Run-time sequence](#run-time-sequence)
-- [Restart provenance](#restart-provenance)
-- [Interactions in code](#interactions-in-code)
-- [Memory cost](#memory-cost)
-- [Known issues](#known-issues)
-- [Tests](#tests)
-- [How the keys were found](#how-the-keys-were-found)
+The EOS does its expensive work once, at startup, so that each time step stays cheap.
 
-## Code map
+```
+table file --read--> loader --check--> build on the host --upload--> device arrays
+                                                                         |
+   raw table (rho, T) | inverse table (rho, eps) | floor curve | ceiling curve
+                                                                         |
+          conversion kernels, once per substep  <------------------------+
+```
+
+The inverse table holds temperature, pressure and the other fields on a grid in density and
+specific internal energy. It exists because the code evolves energy, but the file is indexed by
+temperature.
 
 | file | role |
 | --- | --- |
-| `src/eos/eos.hpp` | `EOS_Data` (table storage, device and host interpolation kernels, `ThermoState`), `HydroEOSModel::{saha_table, lte_table}`, `SahaBoundsMode`, and the `SahaTableHydro`, `SahaTableMHD`, `LTETableHydro`, `LTETableMHD` classes. |
-| `src/eos/eos.cpp` | `EquationOfState` base constructor: reads `dfloor`, `pfloor`, `tfloor`, `sfloor`, `cs_ceil`, `vceil` and sets the default (ideal-EOS) unit scales, including the temperature unit that the table loaders override. |
-| `src/eos/saha_table_utils.hpp` | H-only Saha loader (`InitializeSahaTableEOS`), QA checks, restart-provenance helpers, startup summary. |
-| `src/eos/lte_table_utils.hpp` | H+He loader (`InitializeLTETableEOS`), the `eos` string to `table_type` map (`ExpectedTableTypeForEosName`), the same QA, restart and summary machinery. |
-| `src/eos/saha_table_hyd.cpp`, `saha_table_mhd.cpp` | Class constructors, `ConsToPrim` and `PrimToCons` for both families (excision, dual energy, LAT active-block filtering, FOFC-flag path). The MHD file adds the cell-centred B reconstruction and floor/ceiling event counters. |
-| `src/eos/general_c2p_hyd.hpp`, `general_c2p_mhd.hpp` | EOS-agnostic single-cell conversions (`SingleC2P_GeneralHyd[Dual]`, floors, atmosphere reset, velocity ceiling), shared with the ideal-gas MHD path through a template. |
-| `src/utils/tr_table.hpp`, `tr_table.cpp` | Generic table reader, shared with opacity and other microphysics tables. |
-| `scripts/generate_lte_table.py` | Offline generator for every `lte_table_*` table, with the hard-coded job list `LTE_TABLE_JOBS`. |
-| `scripts/chabrier2021_eos.py`, `scripts/scvh95_eos.py` | Chemistry backends for the dense-fluid and SCvH branches. |
-| `src/pgen/tde_external.cpp`, `src/pgen/tests/polytropic_star.cpp` | Hydrostatic stellar structure integrated against the active EOS (`eos_balanced` mode), with pressure and composition floors for initial conditions. |
-| `src/pgen/tests/tabulated_eos_homologous.cpp` | Regression generator for the dual-energy update under a tabulated EOS. |
-| `src/reconstruct/specific_energy_recon.hpp` | Specific-energy face-state helper. |
+| `src/eos/eos.hpp` | `EOS_Data`: table storage and the interpolation kernels, on device and host. |
+| `src/eos/saha_table_utils.hpp`, `lte_table_utils.hpp` | The two loaders, with the load-time checks and restart helpers. |
+| `src/eos/saha_table_hyd.cpp`, `saha_table_mhd.cpp` | The per-substep conversion kernels. |
+| `src/eos/general_c2p_hyd.hpp` | Single-cell conversion with floors and the atmosphere reset. |
+| `src/utils/tr_table.cpp` | The table reader, shared with opacity and other tables. |
 
-## Table container and loader
+## Reading the table
 
-The format is read by `src/utils/tr_table.{hpp,cpp}` (`ExtractBlock`, `ParseBlock`):
+The reader parses the four header blocks and then the raw float64 data: each axis array, then
+each field flattened in C order, so the index is `ir*ntemp + it`. The loader requires:
 
-```
-<metadatabegin> key = value ... <metadataend>
-<scalarsbegin>  key = value ... <scalarsend>
-<pointsbegin>   axis_name = npoints ... <pointsend>
-<fieldsbegin>   field_name ... <fieldsend>
-```
+- Natural-log axes. The metadata key `log_axis_base` is optional but, if present, must be `e`.
+- The first two axes are `logrho` and `logtemp`, in that order, uniformly spaced to 1e-10
+  relative tolerance.
+- For `lte_table_*`, X + Y = 1 to 1e-10, with X and Y from the scalars `x_h` and `y_he`
+  (default 0.70 and 0.30).
 
-followed by raw `float64` blocks: each axis array, then each field flattened in C order
-(`ir*ntemp+it`).
+A byte order that differs from the host's is swapped for the whole payload. The `t13` and
+union jobs also write diagnostic fields for offline plotting (17 beyond the 11 required ones in
+the `chabrier2021` tables). The reader loads every field in the file, but the EOS loader uses
+only the required ones, so the diagnostic columns sit in host memory until the loader returns
+and are then discarded.
 
-- The axes are natural log. The metadata key `log_axis_base = e` is optional but, if present,
-  must equal `"e"`. The generator always writes it.
-- `endianness = little/big` is checked against the host. A mismatch byte-swaps the whole payload.
-- The loader requires `point_info[0] = ("logrho", nrho)` and `point_info[1] = ("logtemp", ntemp)`
-  in that order, and uniform spacing on both axes to 1e-10 relative tolerance
-  (`GetUniformSpacing`).
-- Scalars `x_h` and `y_he` (default 0.70 and 0.30) set `eos_data.lte_h_mass_fraction` and
-  `lte_he_mass_fraction`. The loader requires X + Y = 1 to 1e-10.
-- The `saha_table` fields `mu`, `beta_rad`, `xh2`, `xhe1`, `xhe2` are synthesized on load
-  (`mu = 1/(1+xion)`, the others zero).
-- The t13 and union jobs write about 20 diagnostic fields (`eps_physical`, `pgas`, `prad`,
-  `chi_rho`, `chi_t`, `cv`, `cp`, `entropy`, `grad_ad`, `union_valid`, `source_*`, and others)
-  for offline plotting. `ReadTable` loads every listed field, but the EOS loader queries only
-  the required names by string, so the diagnostic columns are read into host memory and
-  discarded when the local table goes out of scope at the end of `InitializeLTETableEOS` or
-  `InitializeSahaTableEOS`.
-- The table metadata records `chabrier_mixing_additive_volume` when the additive-volume mixing
-  law (`chabrier_mixing = "additive_volume"` in the job) was used. The generator's
-  `validate_job` enforces X + Y = 1.
-- `table_type` families the loader recognizes: `IsSimpleLTETableType` (`lte_hhe_lte`,
-  `lte_hhe_prad_lte`), `IsHybridLTETableType` (`lte_hybrid_hhe_t13_lte`,
-  `lte_hybrid_hhe_t13_prad_lte`), and a 12-member masked-union set
-  (`IsMaskedUnionLTETableType`).
+## Building the inverse table
 
-## Inversion and interpolation
+The loader builds three curves on the host and uploads them once.
 
-For each table density row `ir` and a uniform grid in log(eps) of size
-`saha_neps = cache_eps_factor * ntemp`, the loader binary-searches the monotonic `logeps(logT)`
-row (`InvertMonotonicFieldAtRow`) and stores `T, p, cs2, gamma1, gamma3m1, xh2, xion, xhe1,
-xhe2, mu, beta_rad` on that (log_rho, log_eps) grid. This is the `saha_thermo_cache` device
-array, `EOS_Data::saha_cache_nvars = 11` fields.
+1. **The inverse table** (`saha_thermo_cache`). For each density row it lays out a uniform
+   grid in log(eps) with `cache_eps_factor * ntemp` points. For each energy on that grid it
+   searches the monotonic `logeps(logT)` row (`InvertMonotonicFieldAtRow`) and stores T, p, cs2,
+   gamma1, gamma3m1, xh2, xion, xhe1, xhe2, mu and beta_rad.
+2. **The energy floor** (`saha_logeps_floor`). It is the energy at the floor temperature, at
+   each point of the floor grid. `tfloor_kelvin` enters here. `pfloor` raises the floor
+   temperature through a search of the monotonic `logpress(logT)` row.
+3. **The energy ceiling** (`saha_logeps_ceil`), one value per density row: the energy at which
+   cs2 first exceeds `cs_ceil` squared. With `cs_ceil` off, it is the top of the row.
 
-At run time `EvalThermoStateFromRhoEint`, `PressureFromRhoEint`,
-`HydroInternalEnergyDensityFloor` and related functions convert (d, eint) to cgs, take
-`log_rho` and `log_eps`, and do one lookup with `SahaCacheWeightsFromLogRhoEps` and
-`SahaCacheEvalFieldFromWeights`.
+## Looking things up at run time
 
-- A second path interpolates the raw table in (log_rho, log_T) for (rho, T) queries
-  (`SahaEvalThermoStateFromLogRhoTemp`).
-- `TemperatureFromRhoP` binary-searches the monotonic `logpress(logT)` row at run time
-  (`SahaTemperatureFromMonotonicField`), since pressure is not tabulated on a uniform axis.
-- Out-of-range queries follow `SahaBoundsMode`. `error` calls `Kokkos::abort` on the device
-  (`SahaAbortIfOutOfBounds`) or `std::exit` on the host. `clamp` clamps at the cold edge and in
-  density. Above the last temperature row, `log p`, `log eps` and `log cs2` continue as the power
-  law of the last temperature interval, and every bounded field holds its top value.
-- A (rho, eps) query above the rho-interpolated top of the table bypasses the inverse cache,
-  whose eps axis ends at the largest row top. The weight of the last interval's `log eps(log T)`
-  line at the query scales `T`, `p` and `cs2` from the cache values at that top by the
-  interval's power laws. So neither `T(rho, eps)` nor `p(rho, eps)` saturates at the table edge,
-  and neither jumps where the query leaves the cache.
-- Every interpolation routine has a `Host*` twin (`HostSahaRhoWeights`, `HostSahaEvalField`,
-  and others in `eos.hpp`) for pgen-time host code, such as star and TDE structure integration,
-  that cannot run inside a `KOKKOS_LAMBDA`.
-- `pfloor` raises the effective temperature floor through `floor_temp_from_monotonic`.
-  `tfloor_kelvin` is folded into the precomputed `saha_logeps_floor` curve. `cs_ceil` builds a
-  per-density `saha_logeps_ceil` curve, the energy at which `cs2` first exceeds `cs_ceil^2`.
+A conversion takes density and internal-energy density, converts them to cgs, takes the logs,
+and does one lookup in the inverse table (`SahaCacheWeightsFromLogRhoEps`). Queries that start
+from (rho, T) use a second path that interpolates the raw table.
 
-## Temperature unit
+- With `error`, an out-of-range query calls `Kokkos::abort` on the device or `std::exit` on the
+  host. `clamp` is described on the main page under
+  [Outside the table](Tabulated-EOS#outside-the-table).
+- The energy axis of the inverse table ends at the largest energy of any row. In `clamp` mode,
+  a (rho, eps) query above the density-interpolated top of the table therefore skips it. In the
+  last temperature interval, log eps is a straight line in log T, so the query gets a weight
+  beyond that interval. T, p and cs2 are their values at the top, scaled by the power laws of
+  that interval. So neither T(rho, eps) nor p(rho, eps) saturates at the table edge, and
+  neither jumps where the query leaves the inverse table.
 
-The base constructor sets `eos_data.temp_unit_cgs = pp->punit->temperature_cgs()` for every EOS
-(`src/eos/eos.cpp`), with `Units::temperature_cgs() = v_code^2 * mu * m_u / k_B`
-(`src/units/units.cpp`, `mu` from `<units>/mu`, default 1). Both table loaders then override it
-with `v_code^2 * m_H / k_B`, that is `length_cgs^2/time_cgs^2 * (1.6735575e-24 / 1.380649e-16)`.
-New code that needs a temperature scale must call `MeshBlockPack::TemperatureUnitCGS()`. A
-direct read of `punit->temperature_cgs()` is wrong by mu m_u / m_H under a tabulated EOS. The
-`dyn_grmhd` and PrimitiveSolver (CompOSE) tables carry their own MeV-based convention outside
-`EOS_Data`, and the accessor does not cover them.
+## Starting up and each substep
 
-## Run-time sequence
+At startup:
 
-1. **Dispatch.** `<hydro>/eos` or `<mhd>/eos` is matched against `saha_table` or the
-   `lte_table_*` names. A match constructs `SahaTableHydro`, `LTETableHydro` (or the MHD
-   classes), calls the base constructor, then `InitializeSahaTableEOS` or
-   `InitializeLTETableEOS` (`src/hydro/hydro.cpp`, `src/mhd/mhd.cpp`).
-2. **Load.** `TableReader::Table::ReadTable` parses the header, allocates one flat `double[]`
-   for every axis and field, and reads and byte-swaps the payload. The loader validates shape,
-   required fields and `table_type`, and runs `RunTableQAChecks`: finite, positive,
-   `xh2+xion<=1`, `xhe1+xhe2<=1`, `beta_rad` in [0,1], and `eps` strictly increasing in `T` at
-   fixed `rho`. With `*_debug_checks = true` it adds the `Gamma1 == rho*cs2/p` cross-check and a
-   `logeps` inversion round trip to 5e-6 relative error.
-3. **Device upload.** Axes and the raw (nrho, ntemp) table go to `DvceArray1D` and
-   `DvceArray3D`, followed by the `saha_thermo_cache`, `saha_logeps_floor` and `saha_logeps_ceil`
-   curves, all built on the host and uploaded once.
-4. **Per-substep conversion.** `TabulatedHydroConsToPrim` and `TabulatedMHDConsToPrim` run one
-   `par_for` or `parallel_reduce` over the pack. Per cell: optional sink or BH excision
-   (`problem_runtime::GetExcisionState`), atmosphere reset if `d < dfloor`
-   (`NeedsHydroAtmosphereReset`), then the dual-energy or single-energy inversion through
-   `eos_general::SingleC2P_GeneralHyd[Dual]` or the MHD equivalent, which is the cache lookup.
-   When `only_testfloors` is set (the FOFC probe pass), the kernel only checks whether a floor
-   or ceiling would fire and sets `fofc_(m,k,j,i) = true` without writing state.
-5. **LAT.** Both kernels honour `pmy_pack->lat_active_mask_enabled`. With the active-block mask
-   on, the loops iterate only `lat_nactive_thispack` blocks through `lat_active_indices`.
-6. **MPI and GPU.** Table load, QA and cache build run identically on every rank, each reading
-   its own copy of the file. The `saha_thermo_cache` is allocated per `MeshBlockPack` and
-   depends only on (rho, eps), so it is not a per-block cost. All interpolation kernels are
-   `KOKKOS_INLINE_FUNCTION` and run on the device. Only the pgen-time structure integration
-   (`Host*` variants, `tde_external`) runs on the host.
+1. `<hydro>/eos` or `<mhd>/eos` is matched against `saha_table` and the `lte_table_*` names
+   (`src/hydro/hydro.cpp`, `src/mhd/mhd.cpp`). A match builds `SahaTableHydro`, `LTETableHydro`
+   or the MHD equivalent, whose constructor calls `InitializeSahaTableEOS` or
+   `InitializeLTETableEOS`.
+2. `TableReader::Table::ReadTable` reads the file into one flat `double[]`. The loader
+   validates the shape, the required fields and `table_type`, and runs `RunTableQAChecks`.
+3. The raw table and the three curves go to device arrays. Every rank does steps 2 and 3 for
+   itself. The inverse table depends only on (rho, eps), so it is not a per-block cost.
+
+In each substep, `TabulatedHydroConsToPrim` and `TabulatedMHDConsToPrim` run one parallel loop
+over the pack. For each cell:
+
+1. If sink or black-hole excision is on and the cell is inside it, the cell is reset to the
+   excision state.
+2. If the density is below `dfloor`, the cell is reset to the atmosphere.
+3. Otherwise `eos_general::SingleC2P_GeneralHyd` (or its dual-energy or MHD version) converts
+   conserved to primitive variables. This is the inverse-table lookup, followed by the floors
+   and ceilings.
+
+When `only_testfloors` is set (the probe pass of first-order flux correction, FOFC), the kernel
+only tests whether a floor or ceiling would act and sets the flag `fofc_(m,k,j,i)`. With local
+adaptive time stepping ([LAT](Local-Adaptive-Time-Stepping)) on, the loops visit only the
+active blocks.
+
+## Where other modules meet the EOS
+
+- **Temperature unit.** The base constructor sets the unit to `Units::temperature_cgs()`,
+  which is `v_code^2 * mu * m_u / k_B` with `mu` from `<units>/mu`. Both table loaders then
+  override it with `v_code^2 * m_H / k_B`. New code must call
+  `MeshBlockPack::TemperatureUnitCGS()`, because reading `punit->temperature_cgs()` directly is
+  wrong by mu m_u / m_H under a tabulated EOS.
+- **AMR.** A tabulated EOS sets `pmr->prolong_prims = true`, as dual energy does, and
+  `src/bvals/prolong_prims.cpp` then uses the general conversion instead of the gamma-law one.
+- **Face states.** `src/reconstruct/specific_energy_recon.hpp` limits `eps = eint/rho` with the
+  run's own reconstruction, forms `eint_face = rho_face * eps_face`, and applies the EOS floors
+  and ceiling. In MHD the Riemann solver builds the face total energy from the corrected
+  internal energy.
+- **Dual energy.** `ApplyHydroThermalFloors` skips the generic `tfloor` check for a tabulated
+  EOS, because the inverse table already enforces it.
 
 ## Restart provenance
 
-Every `.rst` write stores the active EOS's provenance in a synthetic `<saha_runtime>` block:
-`<block>_table_runtime`, `<block>_table_type_runtime` (from `ExpectedTableTypeForEosName`) and
-`<block>_lte_{x,y,prad,h2,zpe}_runtime` (`store_eos_restart_metadata`, `src/outputs/restart.cpp`).
-On the next launch `main.cpp` reads these keys from the restart file's own parameter block,
-before the new input file and command-line overrides are applied, into `..._from_restart`
-locals, and republishes them under `<saha_runtime>/<block>_*_from_restart`. At EOS construction,
-`PrintStartupSummary` compares them with the EOS being built (`lte_table_utils.hpp`,
-`saha_table_utils.hpp`). A mismatch in EOS name, table path, table type, X, Y, radiation, H2 or
-ZPE is fatal unless `allow_reinterpretive_restart = true`, which proceeds with a
-`WARNING: restart is reinterpretive` line. Both loaders are fatal if `pp->punit == nullptr`.
-
-## Interactions in code
-
-- **AMR/SMR.** A tabulated EOS sets `pmr->prolong_prims = true` for its fluid, as dual energy
-  does (`src/hydro/hydro.cpp`, and the analogous check for MHD in `src/mesh/mesh_refinement.cpp`).
-  `src/bvals/prolong_prims.cpp` branches on `eos.UsesTabulatedLTE()` to call
-  `eos_general::SingleC2P_GeneralHyd[Dual]`, `SingleP2C_GeneralHyd` and the MHD versions in
-  place of the gamma-law fast path.
-- **Face states.** `src/reconstruct/specific_energy_recon.hpp` limits `eps = eint/rho` with the
-  run's own reconstruction (PLM, PPM4, PPMX or WENOZ) on its own stencil, forms
-  `eint_face = rho_face * eps_face` and applies the EOS thermal floors and ceiling. In MHD the
-  Riemann solver assembles the face total energy from the corrected internal energy. Density,
-  velocity, field and tracer reconstruction and the conservative total-energy update are unchanged.
-- **Dual energy.** `ApplyHydroThermalFloors` skips the generic `tfloor` check for a tabulated
-  EOS, because the cached table closure already enforces it. The same guard is in
-  `src/reconstruct/thermal_floors.hpp`.
-- **Remap** (`src/remap/remap_load.cpp`). The source and target must agree on `is_ideal` and
-  `UsesTabulatedLTE()`. Otherwise the conserved variables would be decoded against a different
-  closure, which is fatal.
-- **Cooling** (`src/srcterms/srcterms.cpp`). ISM, relativistic and disk cooling are refused.
-- **Outputs** (`src/outputs/basetype_output.cpp`). Each derived variable requires
-  `eos.UsesTabulatedLTE()`.
-
-## Memory cost
-
-`saha_table` costs `saha_nvars(11) * nrho * ntemp * 8` bytes. `saha_thermo_cache` costs
-`saha_cache_nvars(11) * nrho * (cache_eps_factor*ntemp) * 8` bytes, which is `cache_eps_factor`
-times the raw table by construction. For 640 x 640 at the default factor 8 (no deck overrides
-it), the raw table is about 34.4 MiB and the cache about 275.0 MiB, so about 310 MiB on the
-device plus an equal host mirror (`saha_table_h`, `saha_thermo_cache_h`) that is never freed. It
-is per fluid block and per rank, and assumes `Real = double` (`src/athena.hpp`).
+Every restart file records which EOS produced it, in a `<saha_runtime>` block of its parameter
+header (`store_eos_restart_metadata` in `src/outputs/restart.cpp`). On the next launch,
+`main.cpp` reads these values from the restart file's own parameter block, before the new input
+file and command-line overrides are applied. `PrintStartupSummary` then compares them with the
+EOS being built. A difference is fatal unless `allow_reinterpretive_restart = true`.
 
 ## Known issues
 
-- **Loader accepts families the generator cannot produce.** Of the 12 masked-union types, only
-  `lte_scvh_t13_cp_helm_union[_prad]` and `lte_chabrier2021_t13_helm_union[_prad]` have a
-  matching generator `model`. The other eight, `lte_scvh1995_hhe[_prad]`,
-  `lte_scvh_t13_union[_prad]`, `lte_scvh_t13_helm_union[_prad]` (no `cp`) and
-  `lte_scvh_t13_cp_union[_prad]` (no `helm`), do not. `hydro.cpp` and `mhd.cpp` still construct
-  an `LTETableHydro` or `LTETableMHD` for any of these `eos` names through
-  `ExpectedTableTypeForEosName`. `validate_job` accepts only `model` in `{t13,
-  scvh_t13_cp_helm_union, chabrier2021_t13_helm_union}`, and a grep finds no other `table_type`
-  string under `scripts/`. The simple `lte_hhe` and hybrid families have no generator job
-  either. None of them is used by a shipped table. Treat `eos = lte_table_hhe`,
-  `lte_table_scvh1995_hhe*`, `lte_table_scvh_t13_union*`, `lte_table_scvh_t13_helm_union*`,
-  `lte_table_scvh_t13_cp_union*` and `lte_table_hybrid_hhe_t13*` as unmaintained.
-- **X + Y = 1 only.** Both the loader and `validate_job` enforce Z = 0.
-- **Temperature-unit split.** See above.
-- **No entropy floor.** `sfloor` is refused and nothing substitutes for it.
-- **Diagnostic columns** cost load-time host memory and disk, with no run-time benefit.
-- **Redundant per-rank load.** Every rank re-reads and re-checks the file.
+- **The loader accepts families the generator cannot build.** `validate_job` accepts only the
+  models `t13`, `scvh_t13_cp_helm_union` and `chabrier2021_t13_helm_union`. The loader also
+  accepts the simple `lte_hhe` types, the hybrid `lte_hybrid_hhe_t13` types, and eight of the
+  twelve masked-union types: `lte_scvh1995_hhe[_prad]`, `lte_scvh_t13_union[_prad]`,
+  `lte_scvh_t13_helm_union[_prad]` (no `cp`) and `lte_scvh_t13_cp_union[_prad]` (no `helm`).
+  Treat these `eos` names as unmaintained.
+- **Redundant work.** Every rank re-reads and re-checks the file, and the diagnostic columns
+  cost load-time host memory with no run-time benefit.
 
 ## Tests
 
-No input under `tst/` uses a tabulated EOS, so there is no dedicated regression harness.
+The tests that use a tabulated EOS are listed on the main page under
+[Tests](Tabulated-EOS#tests). They check the physics, and none tests the loader's refusals or
+the restart check. Two more checks sit outside the suite:
 
-- `src/pgen/tests/tabulated_eos_homologous.cpp`: a homologous-expansion regression for the
-  dual-energy update. `UserProblem` is fatal unless `eos.UsesTabulatedLTE()` and
-  `hydro.use_dual_energy` hold, and it supports non-relativistic 3-D hydro only. It seeds a
-  uniform (rho, T) state in homologous expansion, `u = H(t) x` with `H(t) = H0/(1+H0 t)`, applies
-  the same profile as a user boundary condition every step, and reports `rho_vol`, `uaux_vol`,
-  `temp_vol`, `pressure_vol`, `uth_vol`, `rho2_vol`, `uaux2_vol` and `volume` as history output.
-  No input deck ships for it. Set `<problem>/pgen_name = tabulated_eos_homologous` and the
-  `<problem>` keys `expansion_rate`, `density_cgs` and `temperature_kelvin` (all `GetOrAddReal`)
-  against any `<hydro>` block with a tabulated EOS and `dual_energy = true`.
-- `RunTableQAChecks`: the load-time self-check described above.
-- `scripts/generate_lte_table.py` calls `validate_lte_table(...)` before writing each job. This
-  is an offline check, not run by the AthenaK binary.
-- The five-step TDE chain `inputs/TDE_examples/*.athinput` exercises the EOS in production use.
-
-## How the keys were found
-
-A grep for `GetOrAddReal|GetOrAddInteger|GetOrAddBoolean|GetOrAddString|GetReal|GetInteger|GetBoolean|GetString|DoesParameterExist`
-over `src/eos/lte_table_utils.hpp`, `saha_table_utils.hpp`, `saha_table_hyd.cpp`,
-`saha_table_mhd.cpp`, `eos.cpp` and `eos.hpp`, plus a follow-up for `eos ==` and
-`ExpectedTableTypeForEosName` in `src/hydro/hydro.cpp` and `src/mhd/mhd.cpp`, and for
-`dual_energy` in `src/hydro/hydro.cpp`.
+- `scripts/generate_lte_table.py` calls `validate_lte_table(...)` before it writes each job.
+  This is an offline check, not run by the AthenaK binary.
+- `src/pgen/tests/tabulated_eos_homologous.cpp` is a regression generator for the dual-energy
+  update, with no input deck. Build with `-D PROBLEM=tabulated_eos_homologous`, and use a 3-D
+  non-relativistic `<hydro>` block with a tabulated EOS and `dual_energy = true`. It starts a
+  uniform (rho, T) state in homologous expansion, `u = H(t) x` with `H(t) = H0/(1+H0 t)`. The
+  `<problem>` keys are `expansion_rate`, `density_cgs` and `temperature_kelvin`.

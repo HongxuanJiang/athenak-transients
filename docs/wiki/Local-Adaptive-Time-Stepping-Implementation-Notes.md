@@ -1,294 +1,131 @@
 # Local Adaptive Time Stepping: implementation notes
 
-Developer-level detail for [Local Adaptive Time Stepping (LAT)](Local-Adaptive-Time-Stepping).
-Start there for usage, parameters and guidance. This page records the mechanics: how the
-factors are chosen, the tick loop, the partition, the interaction with other modules, edge
-cases and known issues. LAT in this release covers hydrodynamics only.
+How [Local Adaptive Time Stepping (LAT)](Local-Adaptive-Time-Stepping) works inside. Start on that page for parameters and practical advice. This page explains the ideas behind them in words, for hydrodynamics, which is what this release supports.
 
-## Contents
+## Overview
 
-- [How the factors are chosen](#how-the-factors-are-chosen)
-- [The window and tick loop](#the-window-and-tick-loop)
-- [Ghost zones and conservation](#ghost-zones-and-conservation)
-- [Rank distribution and rebalance](#rank-distribution-and-rebalance)
-- [Log lines](#log-lines)
-- [Restart](#restart)
-- [Module interactions](#module-interactions)
-- [Known issues and design choices](#known-issues-and-design-choices)
-- [Code map](#code-map)
-- [Tests and references](#tests-and-references)
+LAT cuts the run into *windows*. Inside a window each block takes steps of its own length, and at the end every block is at the same time again. Everything that needs one common time (regridding, outputs, the sink operator, the gravity solve) happens at window boundaries.
+
+```
+ global step --> step limit of each block --> factors (bins) --> window of F ticks
+                                                                       |
+ tick 0 ... F-1:  refresh ghosts of due blocks -> update them -> book flux mismatch
+                                                                       |
+ window end:  sink operator, outputs, regrid check, new step and factors, rebalance
+```
 
 ## How the factors are chosen
 
-`Mesh::UpdateHydroLATMetadata` (`src/mesh/mesh.cpp`) gathers every block's own admissible
-step $\Delta t_m = \mathrm{cfl}\cdot\min(\Delta t^{\rm fluid}_m,\Delta t^{\rm src}_m)$ with
-`MPI_Allgatherv`. The factor $f$ is the largest power of two with
-$2f \le \Delta t_m/\Delta t_{\rm global} + \varepsilon$, where $\varepsilon = 64\,\epsilon_{\rm mach}$, capped at 2^lat_levels.
+The factors are recomputed at every synchronized point: at startup, at each window end and after a regrid. The work is done in `Mesh::UpdateHydroLATMetadata`.
 
-The raw ladder is then narrowed in this order:
+1. Each block reports the largest step it can take alone: the CFL number times the smaller of its fluid limit and its source-term limit. All ranks share the values.
+2. The raw factor is the largest power of two that does not exceed $\Delta t_m/\Delta t$, where $\Delta t_m$ is the block's step and $\Delta t$ the global step. It is capped at `2^lat_levels`.
+3. The rules below then lower factors where a large one would be unsafe. They run in this order.
 
-1. **Problem cap.** The hook `user_hydro_lat_factor_cap_func`, re-rounded down to a power of two.
-2. **Sink pinning.** Every block whose bounding box, grown by its own ghost band, intersects a
-   `SinkParticles::LATPinRegions()` sphere is forced to factor 1.
-3. **AMR-level collapse.** Unless `lat_same_level = true`, every block on an AMR level gets that
-   level's minimum factor, because the conservative fallback only corrects coarse/fine
-   interfaces.
-4. **Minimum bin population.** A bin holding fewer than `hydro_lat_min_bin_count` blocks is
-   merged into the next-faster bin, iterated to a fixed point.
-5. **Neighbour limiter.** A fixed-point iteration over all 56 geometric neighbour slots that
-   enforces the 2:1 coarse/fine time-step staircase and, for same-level mixed bins, a ratio of
-   at most `lat_same_level_max_ratio`. Edge and corner neighbours participate because the
-   prolongation stencil reads them, and `lat_neighbor_limiter` chooses how much of that
-   envelope is used. Non-convergence after `nmb_total` iterations is fatal.
+- **Problem cap.** A problem generator may install a cap. The TDE generator forces factor 1 near the excised black hole.
+- **Density pin.** Optional (`lat_pin_density_contrast`, `lat_pin_density`). Blocks with a sharp density jump or a very dense cell go to factor 1 with their neighbours, because a delayed reflux can briefly put dense gas into an ambient cell, and sources and floors acting before the mass is refunded then leave an irreversible thermal residue.
+- **Sink pinning.** A block whose bounding box, grown by its own ghost-zone width, touches a sink's pin sphere goes to factor 1. The sink operator rewrites the gas there, and that gas must be at the common time.
+- **Level collapse.** Unless `lat_same_level = true`, all blocks of a refinement level take the smallest factor on that level, because the standard flux correction only handles interfaces between levels.
+- **Minimum population.** A bin above factor 1 with fewer than `hydro_lat_min_bin_count` blocks is merged into the next bin down, repeatedly. A sparse bin costs more in task-list launches and boundary exchange than it saves. "Sparse" is a per-rank notion, so the default `4*nranks` scales with the rank count.
+- **Neighbour limiter.** Neighbouring factors must stay close. Across a refinement interface the finer block never has a larger factor than the coarser one, and the coarser factor is at most twice the finer one per level of difference. Between same-level neighbours (with `lat_same_level`) the ratio is at most `lat_same_level_max_ratio`. Edge and corner neighbours count too, because the prolongation stencil reads their data, and `lat_neighbor_limiter` chooses how many are used. The limiter repeats until nothing changes. It stops with an error if it needs more passes than there are blocks.
 
-The surviving maximum is `hydro_lat_sync_factor_current`. Per-factor populations are cached in
-`hydro_lat_bin_count`.
+The largest factor left sets the window length. The factors are computed right after the global step, from the same per-block limits.
 
-**Where the bins are decided.** Not in `Mesh::NewTimeStep`, which computes the global `dt` from
-the per-block `dtnew_eachmb` arrays. The factors are computed right afterwards by
-`Driver::RebuildHydroLATMetadata`, which calls
-`Mesh::UpdateHydroLATMetadata(hydro_subcycle_factor)`, on the ratio $\Delta t_m/\Delta t$.
-Under LAT the driver also calls each module's own `NewTimeStep` explicitly before that,
-because the task-list versions short-circuit under an active mask and would otherwise freeze
-the per-block slots.
+## The window and the tick loop
 
-## The window and tick loop
+The window length F, in finest steps, starts at the largest factor present. It is halved while any of these holds: it would pass `tlim` or `nlim`; with self-gravity it exceeds `gravity/solve_dt`; with sinks a sink could move farther than `lat_window_motion_cells` allows.
 
-**Window length.** `Driver::Execute` recomputes it every cycle (`src/driver/driver.cpp`).
-`lat_sync_factor` starts at 2^lat_levels, is clamped by `hydro_lat_sync_factor_current` and by
-`outer_substeps`, and is then halved until the window fits below `tlim` under two tests: the
-window length, and "only the last tick may be clamped". Self-gravity halves it further so a
-window never exceeds `gravity/solve_dt`. A run with sinks halves it so a sink moves at most
-`lat_window_motion_cells` cells per window.
+For each window:
 
-**Per cycle.**
+1. Fix the finest step and the window length F.
+2. With self-gravity, solve for the potential first if it is invalid, due, or would be passed during the window. The potential then stays frozen for the whole window.
+3. Save every block's start state and reset the block clocks.
+4. Run the ticks. A tick at which no block is due is skipped.
+5. At the window end, with all blocks at one time, run the sink operator, make outputs and restart files, check for a regrid, compute the new global step and factors, and rebalance the ranks if due.
 
-1. Compute `lat_fine_dt = pmesh->dt` and `lat_sync_factor`.
-2. Apply gravity and sink window shortening, and the `user_hydro_lat_window_func` hook.
-3. Window setup: `ClearHydroLAT`, `CopyCons` into the `u1` start register (skipped when the
-   union predictor will write it), and `ResetLATBlockTimes`.
-4. Run the tick loop, `substep = 0 ... lat_sync_factor-1`, in strides of
-   `hydro_lat_tick_stride` (the smallest factor actually present, so empty phases are skipped).
-5. Per tick: due mask, `RefreshHydroLATBoundaries`, union or factor-by-factor integration,
-   then time advance by `completed_ticks` fine steps.
-6. At `end_outer_step` only: history, outputs, restarts, AMR check, `NewTimeStep`,
-   `RebuildHydroLATMetadata`, the LAT rebalance and the sink operator.
+For each tick:
 
-**Each tick.**
-
-- `MeshBlockPack::SetActiveMeshBlocksByLATDueFactors(sync, tick_phase, true)` builds the due
-  mask, the compact `lat_active_indices` list, the per-edge `lat_send_nghbr` flags and the
-  three flux flags (`src/mesh/meshblock_pack.cpp`).
-- `Driver::RefreshHydroLATBoundaries` brings every due block's ghost band to the common tick
-  time. Restriction happens only from blocks that must feed a due coarser neighbour,
-  prolongation only into due blocks with a coarser neighbour, followed by a ghost-band-only
-  conserved-to-primitive conversion.
-- The due bins are then integrated. With `lat_union_stage1`, the RK2 predictors of all due
-  bins run as one union kernel with per-block `dt` (`lat_step_dt`), followed by the correctors
-  slowest to fastest, so a faster bin sees a completed slower dense history. Otherwise each due
-  factor runs its own full RK2 in the same slow-to-fast order.
+1. Find the due blocks. A block with factor f is due when the tick number is a multiple of f, and it computes its whole step at the start of its interval.
+2. Refresh the ghost zones of the due blocks to the current time, including restriction and prolongation across refinement levels. Blocks that are not due but must send data to a due neighbour still take part in the exchange.
+3. Update the due blocks with the two-stage (RK2) scheme. By default the first stage of all due bins runs as one kernel, each block using its own step. The second stage then runs bin by bin from the largest factor to the smallest, so a faster bin sees the finished state of the slower ones. With `lat_union_stage1 = false` each bin runs both stages in turn, again from slowest to fastest.
+4. Apply the flux corrections that fall due, and advance the global time by the finest steps completed.
 
 ## Ghost zones and conservation
 
-**Ghosts across a bin boundary.** An inactive sender does not hand over its raw array but a
-value interpolated to the receiver's `target_time`, using the block's own bracket
-$[u^1@t_0, u^0@t_1]$. The interpolation is linear, or the SSPRK2 dense-output polynomial when
-a validated stage-1 state exists (`src/bvals/bvals_cc.cpp`). The chord fallback is decided
-once per cell over all components. `lat_theta` is clamped to the range 0 to 1. A value above
-1 is reachable on the factor-by-factor path, and the clamp publishes the sender's end-of-span
-state, so the clamp is load-bearing, not diagnostic.
+**Ghost data from a block in mid-step.** A block that is not due does not hand over its stored array. It hands over a value interpolated to the receiver's time between its own start and end states. The interpolation is linear, or the dense-output polynomial of the RK2 step when the stage-1 state is available.
 
-**Where the stage-1 snapshot comes from.** On the union-predictor path the driver captures it
-after each factor's endpoint refresh. On the factor-by-factor path the fluid saves its own as
-the last task of the stage: the graph queues `Hydro::SaveLATDenseOutput` in `after_stagen`. A
-graph that queues none of this still runs, but silently falls back to the linear chord at every
-mixed-cadence face, because `lat_dense_stage1_valid` is never set.
+**Conservation.** Every active block accumulates the time integral of the flux through its slow-side faces and subtracts the integral received from finer or faster neighbours. When the block's step completes, the net difference is applied as a surface correction. This is Berger-Colella refluxing generalised to LAT bins, including same-level factor mismatches. The same correction refunds the gravitational work on the mass that moved, for self-gravity, the external black hole and sinks.
 
-**Conservation.** Every active block accumulates the time integral of its own slow-side face
-flux and subtracts the integral received from finer or faster neighbours. When the bin's step
-completes, the hydro update (`src/hydro/hydro_update.cpp`) applies the signed surface
-correction to `u0`. This is Berger-Colella refluxing generalised to LAT bins, including
-same-level factor mismatches. The receiver condition deliberately does not require the
-receiver to be due this tick, because the fine neighbour may have taken several substeps
-(`src/mesh/meshblock_pack.cpp`).
+**Dual energy.** The auxiliary internal-energy field gets a matching delayed correction, and it is re-synchronised from the corrected total energy where the dual-energy rules allow (see [Dual Energy](Dual-Energy)).
 
-## Rank distribution and rebalance
+**First-order flux correction (FOFC).** It runs on the active blocks like any other kernel. At an interface where a slower bin's pending flux estimate meets a same-level neighbour of the same cadence, the two blocks could test one edge cell on different fluxes and flag it differently. The code reconciles the flags at those cells, so each cell is updated with the fluxes it was tested on, and the reflux books the flux that was used.
 
-**Objective.** `ApplyHydroLATLoadBalanceCosts` gives each block a window cost
-$(F_{\rm sync}/f_m)\times w_m$, where $w_m$ is the measured per-step work
-(`hydro_lat_work_eachmb`, a stiff-cell census, with 1 where nothing was measured).
-`BuildHydroLATGIDMap` then interleaves: the s-th rank-sized chunk of the final GID order
-receives the s-th slice of every bin. Inside a bin the heavy blocks are dealt heaviest-first
-onto the least-loaded slice (longest-processing-time on the work excess), and the plain blocks
-fill the rest in Z-order. On a static mesh the rank cuts are pinned to equal block counts (the
-cap equals `min_cap`), so the order inside each bin is the only lever the partition has.
+## Rank layout and rebalance
 
-**Cut search.** It minimises, lexicographically: `sum_tick_max_work` (the critical path over the
-window), `max_tick_work`, `idle_slots` (rank and tick pairs with no work), `bin_idle_slots`,
-`sum_bin_max_blocks`, `max_blocks`, `block_imbalance`, then the plain scalar cost
-(`better_objective`). Only log2(F_sync)+1 distinct due sets exist, so one prefix per phase
-class times its multiplicity replaces one prefix per fine tick.
+Ticks run bin by bin, and a rank that holds no block of a due bin sits idle. The partition therefore aims at work on every rank in every tick, not only at equal total cost.
 
-**Rebalance trigger.** All of the following must hold: `hydro_lat_post_amr_rebalance`,
-`multilevel`, valid metadata, `!HydroLATLoadBalanceCurrent()`, `topology_stable` (at least
-`kHydroLATRebalanceStableWindows * sync_factor` cycles since the last topology change), and
-`topology_changed_since_rebalance`. The attempt is stamped where the repartition happens, not
-only on the early returns.
+1. Each bin is sorted in Z-order. The bins are then merged into one list in which every bin is spread evenly along the whole list.
+2. The list is cut into one contiguous range of blocks per rank. The search prefers the cut with the shortest estimated window (the sum over ticks of the busiest rank's work). Ties go to the smaller worst tick, then to fewer idle rank-tick pairs, and further criteria follow down to an even block count.
+3. On adaptive meshes a rank holds at most `mesh_refinement/max_nmb_per_rank` blocks. On a static mesh the cap is the block count divided by the rank count, rounded up.
 
-**AMR.** Regrids run only at window ends (`amr_due` in the `end_outer_step` gate). After a
-regrid the factor of a new block is estimated: carried over by logical location for a
-surviving block, halved per refinement level from the nearest old ancestor for a new child,
-and the minimum descendant factor for a derefined parent. On a cold start with no metadata the
-fallback is level-based, with the finest level at factor 1 and doubling per coarser level.
-`mesh_refinement/sticky_load_balance` exists for LAT and is ignored without it.
+A block's cost for a window is its number of steps in the window times its work per step. In this release the work per step is taken as 1 for every block.
 
-**MPI and GPU.** No collective may run from inside a rank-local bin, because one rank with no
-due block would deadlock it. `lat_host::PendingLATStateSendClear()`
-(`src/utils/lat_host_fast.hpp`) latches the refresh's `ClearSend` so the host does not sit in
-an `MPI_Wait` while the GPU idles. `Mesh::UpdateHydroLATMetadata` refuses to run with that
-latch still set, because a metadata bump frees the persistent requests the latched clear is
-waiting on.
+At startup the layout is the ordinary Z-order one, so a LAT run and a non-LAT run begin from identical data. The LAT layout comes later. It is applied at every regrid (when at least two bins exist), and by a rebalance at a window end that needs all of these: `hydro_lat_post_amr_rebalance` on, a refined mesh, more than one rank, a largest factor above 1, a mesh unchanged for four windows, and a startup or regrid since the last attempt. The rebalance moves blocks between ranks without changing the mesh. It is carried out only if it is predicted to improve the window time or the worst tick by at least 5%, or if the current layout breaks the block cap.
 
-## Log lines
+After a regrid the factors of the new blocks are only estimated for the partition. A surviving block keeps its factor. A new child takes the factor of its nearest old ancestor, halved for each level of refinement. A derefined parent takes the smallest factor of its former descendants, doubled for each level of coarsening. On a cold start with no information the estimate is by level: the finest level gets factor 1 and each coarser level doubles. The real factors are recomputed at the next window end.
 
-```
-Mesh: HD LAT per-bin rank distribution f1=[a0,a1,...] f2=[b0,b1,...] util%=[u0,u1,...]
-```
-
-For each populated bin `fN`, the number of factor-N blocks landing on each rank under the
-chosen cuts. `util%` is each rank's predicted busy fraction over the window, its summed tick
-work divided by the chosen critical path `sum_tick_max_work`. This is the number to compare a
-measured per-rank GPU utilisation against.
-
-```
-Driver: LAT union stage-1 predictor enabled/disabled (<reason>)
-```
-
-The reason names which of six capabilities refused it. When applicable it is followed by
-`Driver: LAT sink cadence = window boundary, ...`. With `lat_diagnostics = true`,
-`Mesh: HD LAT <label> bins f1=... f2=...` is printed after each narrowing pass, together with
-`Mesh: HD LAT same-level status ...` and `Mesh: HD LAT AMR-interface status ...`.
+No MPI collective may run inside a bin. A rank with no due block would never reach it, and the other ranks would wait forever. Operations with collectives, such as the sink operator, therefore run only at window boundaries.
 
 ## Restart
 
-LAT requires a single global restart file. `single_file_per_rank` with `lat = true` is fatal
-(`src/mesh/build_tree.cpp`), because arbitrary GID reordering cannot read rank-local payloads
-without a global map. `BuildTreeFromRestart` therefore keeps a current-GID to file-GID map,
-composed with any startup LAT interleave (`docs/lat_implementation_note.tex`, section
-Restart Semantics).
+1. LAT needs one global restart file. With per-rank files the data of a block cannot be found once blocks have been reordered, so `single_file_per_rank` with LAT is fatal.
+2. Restart files are written at window ends, when every block is at one time.
+3. The file stores blocks in the order of the run that wrote it. On adaptive meshes the restart rebuilds the ordinary Z-order. If that differs from the order in the file, it keeps a map from the new block number to the number in the file, and reads each block through it with independent reads, so ranks need not read in the same order. The map is dropped afterwards. On non-adaptive meshes the checkpoint's block order is kept, with its saved rank boundaries when the rank count is unchanged.
+4. Bins are not stored. They are recomputed at the first step after the restart. With the default `hydro_lat_min_bin_count`, a restart on a different rank count is valid and conservative but follows a different trajectory.
 
-Checkpoints are written only at window ends, and `restart.cpp` enforces this: a dump requested
-while any LAT reflux accumulator is non-zero is fatal.
+## How LAT works with other modules
 
-Bin assignment is not checkpointed. It is recomputed from the local CFL on the first
-`NewTimeStep` after the restart. With the default `hydro_lat_min_bin_count = 4*nranks`, a
-restart on a different rank count is conservative and valid but follows a different
-trajectory.
-
-## Module interactions
-
-**Self-gravity.** The potential is frozen inside a window and `gravity/solve_dt > 0` is
-mandatory. The window is shortened to at most `solve_dt`, and the solve is pulled forward
-rather than the window truncated, which avoids a pathological 128/16/4/1/1-tick descent.
-
-**Sink particles.** The operator runs once per window from `Driver::Execute`, not from the
-per-bin task list, because it does MPI collectives. Every block within a pin sphere grown by
-its own ghost band is forced to factor 1, and a warning fires if `SinkStep` is ever reached at
-a fine-tick boundary. The window-end reflux refunds the sink potential's work on the replaced
-face mass flux (`lat_apply_sink_reflux_x{1,2,3}` in `src/hydro/hydro_update.cpp`), as it does
-for self-gravity and the analytic black hole. The potential is
-`sinkparticles::SinkPotentialSum`, frozen over the window.
-
-**Integrator.** Only `rk1` and rk2-equivalent tableaux (`rk2`, `imex2`) are admitted. The
-delayed-reflux weights are derived for those (`driver.cpp`, weights in
-`src/driver/lat_weights.hpp`). `imex3` is unanalysed under LAT.
-
-**`<remap>`.** Mutually exclusive with LAT, refused in two places (`src/remap/remap.cpp`,
-`src/main.cpp`).
-
-**First-order flux correction (FOFC).** It runs under the LAT active list like any other
-kernel (`src/hydro/hydro_fofc.cpp`). A slower bin's corrector installs the pending fine flux
-estimate (`MeshBoundaryValuesCC::AddPendingFineFluxMismatchCC`) before its first FOFC pass,
-and that pass also tests the ghost ring. A same-level neighbour of the same cadence cannot add
-the estimate, so along the edges where a pending coarse/fine face meets their shared face the
-two blocks can test one cell on different fluxes. `Hydro::FOFC` installs the same estimate but
-exchanges no flags, so there the flag both sides can form is the one on the fluxes before the
-estimate. It tests those edge cells first (`Hydro::StashFOFCEdgeFlags`), and after the first
-pass the cells take those flags back (`MeshBoundaryValuesCC::StashPendingEdgeFOFCFlags` and
-`ReconcilePendingEdgeFOFCFlags`, `src/bvals/flux_correct_cc.cpp`). Where the test with the
-estimate flagged something the test without it did not, the estimate is taken off that cell's
-faces for the stage, so its update is the one it was tested on, and the window-end reflux books
-the flux it used. Where the two tests agree nothing changes. A cold shear wave on three SMR
-levels (`tst/inputs/hydro_lat_fofc_edges.athinput`) holds the mass drift in the slowest bin's
-first window to 1e-16.
-
-**Module guards.** All guards are in `src/driver/driver.cpp` unless noted.
-
-| module | guard |
+| module | what LAT does |
 | --- | --- |
-| hydro | `src/driver/driver.cpp` |
-| `srcterms` self-gravity and external BH gravity | `src/srcterms/srcterms.cpp`, `driver.cpp` (active list and per-block `dt`) |
-| turbulence driving | `src/srcterms/turb_driver.cpp` and `driver.cpp` |
-| legacy `<radiation>` | `pmbp->prad != nullptr` |
-| multigrid / gravity | `mg_gravity.cpp`, work reflux in `src/hydro/hydro_update.cpp` |
-| `<remap>` | `src/remap/remap.cpp`, `src/main.cpp` |
-| z4c | `pmbp->pz4c != nullptr` for dynamical coordinates |
-| particles | `pmbp->ppart != nullptr` (there is no LAT code in the module) |
-| sink particles | `driver.cpp`, `src/mesh/mesh.cpp` |
+| self-gravity | Freezes the potential in each window. `gravity/solve_dt > 0` is mandatory. A solve that falls due is pulled forward to the window start instead of cutting the window, which avoids a long descent of ever shorter windows. See [Multigrid Self-Gravity](Multigrid-Self-Gravity). |
+| sink particles | The operator runs once per window, not per bin, because it uses MPI collectives. Blocks near a sink are at factor 1. The reflux refunds the sink potential's work. |
+| external black hole | The source acts only on active blocks. For a translating frame or a live black hole, the TDE generator advances the frame once per window, at the common start time. |
+| integrators | Only `rk1` and the rk2-equivalent tableaux (`rk2`, `imex2`) are allowed, because the delayed-reflux weights are derived for them. |
+| `<remap>` | Refused, in two places. See [Remapping](Remapping). |
+| other modules | Refused ones are listed on the [main page](Local-Adaptive-Time-Stepping#what-is-supported-and-refused). |
 
-## Known issues and design choices
+## Known limitations
 
-- **The default bin floor makes the trajectory rank-dependent.** `hydro_lat_min_bin_count`
-  defaults to `4*nranks`. The comment in `src/mesh/mesh.cpp` argues that no rank-independent
-  constant can be right at both ends of the range, so the dependence is deliberate. Rank 0
-  warns.
-- **A window may not be truncated.** Leaving a window midway abandons every pending reflux
-  accumulator, so `src/driver/driver.cpp` turns that into a fatal error instead of a silent
-  conservation loss. Three guarantees make it unreachable: the `nlim` clamp, the `tlim`
-  pre-shrink of `lat_sync_factor`, and the once-per-window wall-clock refresh. The window-length
-  test has a second condition that rejects a window whose first tick already lands on `tlim`.
-- **No endpoint snap.** `pmesh->time` at a window end is `sync_factor` successive additions of
-  `lat_fine_dt`, while a factor-F block's `lat_time_end` is a partial sum plus
-  F times the fine step. The two disagree by $O(\texttt{sync}\cdot\epsilon\cdot|t|)$, about
-  2e-7 of one fine tick. Endpoint selection is integer, so a reflux endpoint can never be
-  mis-selected. Revisit only if the fine step over $|t|$ drops below 1e-9.
-- **Same-level mixed bins are a physics-validation risk at large ratios.** The interpolation is
-  dense RK2 between start and end conserved states (`docs/lat_implementation_note.tex`, section
-  Limitations).
-- **`time/hydro_lat_max_nmb_per_rank` is dead and fatal.** It is read by no code path and is
-  refused via `ParameterInput::RetireDeadParameter`. A separate lower LAT cap could not be
-  honoured once AMR filled the blocks between the two caps.
-- **Performance.** The dominant remaining cost is communication and task-list launch overhead
-  for the per-tick refresh at large sync factors (`docs/lat_implementation_note.tex`, section
-  Performance Notes).
-- **Defer-final-exchange.** What is dropped is the chain SendU, RecvU, Prolongate, BCs and C2P.
-  Because `hydro_lat_min_bin_count` defaults to `4*nranks`, bin membership, and hence whether
-  anything is ever deferred, depends on the rank count. The key's presence is tested before it
-  is read.
-- **Key discovery.** The key list was found with a grep over `src/` for the parameter getters
-  matching `lat`, plus targeted greps for `max_nmb_per_rank`, `solve_dt` and
-  `sticky_load_balance`.
+- The default bin floor makes the trajectory depend on the rank count. This is deliberate: no rank-independent constant is right at both ends of the range. Rank 0 warns.
+- A window may not be cut short, because that would abandon every pending flux correction. The driver turns an attempt into a fatal error. Three guarantees keep it from happening: the `nlim` clamp, the shrinking of the window before `tlim`, and the wall clock being read once per window.
+- Same-level mixed bins are a physics-validation risk at large ratios, because the interpolation is dense RK2 between start and end conserved states.
+- With `lat_same_level = true` and self-gravity or an external black hole, `lat_neighbor_limiter = face` is refused.
+- The time at a window end and a block's own end time can differ by round-off. Endpoints are chosen by integer tick counts, so this cannot select the wrong reflux endpoint.
+- The remaining cost is communication and task-list launch overhead for the per-tick refresh at large factors.
 
-## Code map
+## Tests
+
+Run from the `tst` directory, for example `python run_test_suite.py --cpu --test test_suite/nr/test_nr_hydro_lat_fofc_edges_cpu.py`. Use `--mpicpu` for the restart test.
+
+| test file in `tst/test_suite/nr/` | what it checks | deck |
+| --- | --- | --- |
+| `test_nr_hydro_lat_fofc_edges_cpu.py` | FOFC at the edges of SMR levels keeps the total mass to round-off | `tst/inputs/hydro_lat_fofc_edges.athinput` |
+| `test_nr_hydro_lat_grav_reflux_gate_cpu.py` | The gravitational-work refund closes the energy budget and matches a non-LAT run | `tst/inputs/hydro_lat_grav_reflux_gate.athinput` |
+| `test_nr_amr_restart_bitwise_lat_mpicpu.py` | A LAT run on an adaptive mesh, restarted from a checkpoint, equals the uninterrupted run | `tst/inputs/linear_wave_amr_restart_lat.athinput` |
+
+The example deck is `inputs/TDE_examples/tde_05_fallback_lat.athinput`. The design note is `docs/lat_implementation_note.tex`.
+
+## Key files
 
 | file | role |
 | --- | --- |
-| `src/parameter_input.cpp` | `IsLATEnabled()`, the canonical `<time>/lat` switch with the `hydro_lat` legacy fallback, and the legacy-name map |
-| `src/mesh/mesh.cpp` | `UpdateHydroLATMetadata`: per-block CFL gather, factor ladder, all narrowing passes, diagnostics lines |
-| `src/mesh/load_balance.cpp` | `ApplyHydroLATLoadBalanceCosts` (window cost, min-bin-count re-clamp, per-rank block cap), `BuildHydroLATGIDMap` (bin-interleaved GID order), the cost partition and the `per-bin rank distribution` line |
-| `src/mesh/meshblock_pack.cpp` | block time registers, `ConfigureLATUnionStage1`, `SetLATFluxCorrectionByCompletionPhase`, `BuildLATFactorCache`, `BuildLATDueFactorCache`, `SetActiveMeshBlocksByLATFactor`, `...ByLATDueFactors`, `SelectLATDueUpdateFluxReceivers` |
-| `src/driver/driver.cpp` | admissibility checks, `ConfigureHydroLATSubstep`, `RebalanceHydroLATMesh`, `RefreshHydroLATBoundaries`, the window and tick loop, gravity and sink cadence, endpoint work, AMR and rebalance triggers |
-| `src/driver/lat_weights.hpp` | `lat::FinalFluxWeight`, `FluxFaceCount`, `FluxFaceNeighborIndex` |
-| `src/utils/lat_host_fast.hpp` | `PendingLATStateSendClear()` |
-| `src/bvals/bvals_cc.cpp` | send gating on `lat_send_nghbr`, `LATInterpolateCC`, `LATDensePolyCC` |
-| `src/bvals/flux_correct_cc.cpp` | LAT-gated flux-correction packing and delayed accumulation |
-| `src/mesh/mesh_refinement.cpp` | post-AMR redistribution honouring the LAT ordering, sticky load balance |
-| `src/hydro/hydro_update.cpp` | window-end reflux, gravity and sink work refunds |
-
-## Tests and references
-
-- Example deck: `inputs/TDE_examples/tde_05_fallback_lat.athinput`.
-- Regression input: `tst/inputs/hydro_lat_fofc_edges.athinput` (FOFC at SMR edges).
-- Design note: `docs/lat_implementation_note.tex` / `.pdf`.
-- Berger and Colella (1989), *J. Comput. Phys.* **82**, 64.
-- Gottlieb (2009), the SSPRK(2,2) tableau used for mixed-cadence ghosts (`src/driver/driver.cpp`).
+| `src/mesh/mesh.cpp` | per-block limits, the factor rules |
+| `src/driver/driver.cpp` | refusal checks, window and tick loop, rebalance trigger |
+| `src/mesh/meshblock_pack.cpp` | due and active block lists, block clocks |
+| `src/mesh/load_balance.cpp` | cost model, interleaved block order, partition search |
+| `src/mesh/mesh_refinement.cpp` | regrid and rebalance with the LAT order |
+| `src/mesh/build_tree.cpp` | startup and restart layout, restart block map |
+| `src/bvals/bvals_cc.cpp` | time-interpolated ghost data |
+| `src/bvals/flux_correct_cc.cpp` | delayed flux-correction buffers |
+| `src/hydro/hydro_update.cpp` | applying the corrections, gravity and sink work refunds |
+| `src/parameter_input.cpp` | the LAT switch and the legacy key names |

@@ -1,190 +1,179 @@
-# Restart remap: user guide
+# Remap usage
+
+This page is the user guide for running a restart remap: keys, launching, examples, refusals and troubleshooting. [Remapping](Remapping) explains how the remap works and what it guarantees.
 
 ## Summary
 
-The remap module resamples the state of an existing restart file onto a **new mesh** (different
-domain, resolution, MeshBlock layout or refinement) at the start of a fresh run. It works with
-any problem generator and needs no pgen code. Use it to widen or shrink a domain, change the
-MeshBlock size for a different rank count, or add and move refinement. Do not use it when you
-need exact conservation of mass, momentum and energy: the transfer is second-order accurate and
-not conservative. See [Remapping](wiki/Remapping.md) for the overview and
-[the implementation notes](wiki/Remapping-Implementation-Notes.md) for the algorithms. The
-design document is `docs/remap_module_design.md`.
+The remap module resamples the state of an existing restart file onto a **new mesh** (different domain, resolution, MeshBlock layout or refinement) at the start of a fresh run. It works with any problem generator (pgen) and needs no pgen code.
+
+**Use it** to widen or shrink a domain, change the MeshBlock size for a different rank count, or add and move refinement. For a plain continuation on the same mesh, use an ordinary restart (`athena -r`).
+
+**Do not use it** when you need exact conservation of mass, momentum and energy: the transfer is second-order accurate and [not conservative](Remapping#guarantees-and-limits). It also cannot be used for a 2D run, with an evolved spacetime (`<z4c>`), or in the same run as [LAT](Local-Adaptive-Time-Stepping) (local adaptive time stepping). [What is refused](#what-is-refused) lists every case.
+
+The design background is in `docs/remap_module_design.md`.
 
 ## Quick start
 
-Add a `<remap>` block to the input of the new (target) run and launch it with `athena -i`
-(not `-r`):
+Add a `<remap>` block to the input deck of the new (target) run and launch it with `athena -i`, never `-r` (a restart never remaps):
 
-```
+```ini
 <remap>
-enable = true                    # keep the key explicit so the CLI can flip it
+enable = true                    # keep the key explicit so the command line can flip it
 source = rst/OldRun.00042.rst    # restart written by the OLD mesh configuration
 ```
 
-On a fresh start the module loads the source restart after the problem generator runs and
-overwrites the state:
+The `<mesh>`, `<meshblock>` and `<mesh_refinement>` blocks of the deck describe the new mesh. Any key can be overridden on the command line, for example `remap/source=rst/OtherRun.00010.rst` or `remap/enable=false`.
 
-- **Hydro or MHD conserved variables**, with passive scalars and the dual-energy auxiliary.
-  Cells are subsampled, with an optional transition band toward the ambient state where the new
-  domain extends beyond the old one. A target cell that coincides with a source cell (same width
-  and centre) is copied, so a same-grid remap is the identity. The gas energy travels as thermal
-  energy, so a remap never heats the gas with kinetic energy the target grid cannot represent.
-- **Face-centered B** (MHD sources), divergence-free to machine precision. The source faces
-  are restricted to the source root grid, inverted to an edge vector potential, interpolated with
-  a C1 Catmull-Rom scheme and curled on the target mesh, including the fine-neighbour edge
-  averaging needed on SMR and AMR targets. The new magnetic energy is added back with the same
-  blend weight the gas pass used.
-- **Radiation** angular-grid intensities `i0`, when both source and target carry the same module.
-- **Time, time step and cycle number**, and by default the `<outputN>` numbering, continue from
-  the source run. `time/nlim` is therefore an absolute cycle count.
+After the problem generator has built its own state on the new mesh, the module loads the source restart and overwrites:
 
-## Keys
+- the **gas**: hydro or MHD conserved variables, passive scalars and the dual-energy column;
+- the **face-centered B**, for MHD sources;
+- the radiation intensities `i0`, in `keep` mode only (see [`radiation_i0`](#parameters));
+- **time, time step and cycle number**, and by default the `<outputN>` file numbering.
+
+[Remapping](Remapping#how-it-works) describes how each part is resampled.
+
+Before the first run:
+
+- `time/nlim` and `time/tlim` in the new deck are **absolute**: the run continues from the source's `ncycle` and time. To run 500 more cycles after a source that stopped at cycle 1200, set `nlim = 1700`.
+- A remap cannot be combined with LAT. Remap with `time/lat = false`, let the run write a restart, then restart that file with `time/lat = true` (example below).
+- Re-measure mass, momentum and energy after the remap. They are not carried over exactly.
+- `source` must be a single global restart file. A truncated file, or a restart written as one file per MPI rank, is refused.
+- The physics must match the source: see the [checklist](#checklists).
+
+## Parameters
+
+All keys live in `<remap>`. The block only takes effect if it exists. This is the single parameter table; [Remapping](Remapping) links here.
 
 | key | type | default | meaning |
 | --- | --- | --- | --- |
-| `enable` | bool | true (when the block exists) | Master switch, overridable from the CLI. |
-| `source` | string | none | Source restart path. Required. |
-| `copy_output_state` | bool | true | Carry `<outputN>` `file_number` and `last_time` forward. |
-| `transition_band` | bool | true | Reconstruct a smooth taper toward the floor across the old domain boundary (TDE style). Set false for pure interpolation, for example in convergence tests. |
-| `band_mode` | string | `auto` | What the band does where the source does not cover the target. `floor` is the Newtonian floor-fade (the historical TDE behaviour), `keep` blends toward the state the pgen already wrote, `auto` gives `keep` in GR and `floor` in Newtonian. Ignored when `transition_band = false`. |
-| `b_coarsen_ok` | bool | false | Accept multi-level MHD sources. B is restricted to the source root grid (cell-centered fields keep full detail). Off by default because fine-level B structure is lost. |
-| `b_taper_root_cells` | int | 4 | Smoothstep taper width of the vector potential outside the source box, in source root cells. |
-| `b_report` | bool | true | Print the face-centered B diagnostics (inverse-curl residual, boundary-field warning). |
-| `radiation_i0` | bool | true | Remap the angular-grid intensities `i0` when both sides carry `radiation`. |
+| `enable` | bool | `true` | Master switch, overridable from the command line. |
+| `source` | string | `""` | Source restart path. Required: an empty value is fatal once the remap runs. |
+| `copy_output_state` | bool | `true` | Carry each `<outputN>` `file_number` and `last_time` of the source forward, matched by block name. |
+| `transition_band` | bool | `true` | Smooth the transition across the old domain boundary. `false` is pure interpolation, for example in convergence tests: no fade, a hard edge at the old box. It does not change the B taper. |
+| `band_mode` | string | `auto` | What a target cell outside the source box gets. `floor`: the ambient floor state (the Newtonian TDE behaviour). `keep`: the state the pgen already wrote. `auto`: `keep` for GR, `floor` for Newtonian. Case-insensitive; any other value is fatal. `floor` with a GR source is fatal. |
+| `b_coarsen_ok` | bool | `false` | Accept an MHD source that has mesh refinement. B is then restricted to the source root grid and fine-level B structure is lost. The gas keeps full detail. |
+| `b_taper_root_cells` | int | `4` | Width, in source root cells, of the smooth taper outside the source box. It is applied to the vector potential (hence to B) in every mode, and to the remapped gas in `keep` mode. `0` gives a hard cut-off. |
+| `b_report` | bool | `true` | Print the face-centered B diagnostics. Three warnings are printed regardless: an inverse-curl residual above 1e-8 of the maximum field strength, source B that does not vanish at the old boundary, and the keep-mode seam divergence. |
+| `radiation_i0` | bool | `true` | Remap the angular intensities `i0` when both sides carry `<radiation>`. Only the `keep` pass applies them. A `floor` remap leaves the target's own `i0` untouched even though the startup banner reports the group as loaded. |
 
-Consumer-private keys may live in the same block. `tde_external` reads `settle_steps` and
-`settle_passes` (its auto-settle remap passes) from here.
+Keys private to a problem generator may sit in the same block. `tde_external` reads `settle_steps` (int, default 20) and `settle_passes` (int, default 1), which control its repeated settle passes after the first remap; see `docs/TDE/parameters.md`.
 
-## Accuracy and conservation
+## Worked examples
 
-**The remap is second-order accurate and is not conservative.** Each target cell is the
-arithmetic mean of a few point samples of a trilinear interpolant of the source cell centres,
-with no cell-volume weighting and no donor/acceptor intersection volumes. Total mass, momentum
-and energy change by O(h^2) of whatever the source profile resolves, and by O(1) where the
-source structure is not resolved on the target grid, so any coarsening remap loses what it
-cannot represent. Re-measure the conserved totals after a remap rather than assuming they
-carried over.
+### Widen a domain: the TDE chain
 
-Making it conservative is a different algorithm, not a weighting fix. It needs the exact
-intersection volumes of two arbitrary AMR hierarchies (a supermesh), weighted by
-`sqrt(gamma)` in GR, and the B path would need a matching flux-conservative restriction. This is
-out of scope: the module transfers a state, not a budget.
+Steps 2 to 5 of `inputs/TDE_examples/` each carry a `<remap>` block that loads the last restart of the previous step. Steps 2, 3 and 5 enlarge the box (the README of that directory tabulates the sizes) and step 4 keeps it and converts to the black-hole rest frame. Step 3 (`tde_03_remap_box512.athinput`) reads:
 
-**Total energy is not conserved, by design.** The gas engine carries the source's thermal
-energy (the dual-energy auxiliary where the source has one, otherwise
-`max(E - 0.5 m^2/rho, floor_eint)` per source cell), interpolates it like `rho` and `m`, and
-rebuilds `E = e_int + 0.5|m|^2/rho` (plus the new magnetic energy for MHD). It does not
-interpolate `E`, because that would turn the grid-scale kinetic-energy variance the target cell
-cannot represent into heat. So `E` falls by the unrepresentable kinetic energy, while the
-thermal state, which sets the pressure, the temperature and any light curve, comes through
-unheated. Two caveats:
+```ini
+<remap>
+enable        = true
+source        = ../02_remap_box256/rst/TDEExternalLTEPrad.00008.rst
+settle_steps  = 10
+settle_passes = 1
+```
 
-- A cell that coincides with a source cell is copied verbatim, `E` included.
-- `band_mode = keep` has no thermal carry. It interpolates the conserved columns as stored,
-  because in GR they are densitized and C2P and FOFC own the thermodynamics. This applies to GR,
-  and to Newtonian runs only if you ask for `keep` explicitly.
+Each step runs in its own directory with `athena -i`, so the relative `source` path resolves. The pgen is `tde_external`, a Newtonian run, so `band_mode = auto` resolves to `floor`: the new outer region becomes ambient floor gas, with a transition band at the old boundary. Time, cycle and output numbers continue from the source. Step 5 remaps with `time/lat = false` and is continued with LAT on by a restart. `inputs/TDE_examples/README.md` has the full chain.
 
-Two things are exact:
+### Change the MeshBlock size or rank count
 
-- **Same-grid cells are copied.** A remap that only changes the MeshBlock decomposition or widens
-  the domain is the identity, and conserves exactly, on the overlap. Without this detection
-  the sampler would act as a smoothing filter and erase 87.5% of the grid-scale gas power in 3D.
-- **div(B) = 0 on every target block**, by construction (see the seam note under GR support).
+Copy the old deck and change only `<meshblock>` (and the rank count). Cell width and alignment are unchanged, so every target cell coincides with a source cell and is copied: the remap is the identity and conserves exactly. The same holds on the overlap when you also widen the domain by whole cells.
 
-## GR support
+One exception applies in `floor` mode (the Newtonian default). The transition band still acts at the boundary of the old domain, so cells within about 3 source cells of it are reconstructed, not copied. That changes the boundary layer unless its gas is already close to the floor. Set `transition_band = false` to keep the layer, at the price of a hard edge when the domain is widened.
 
-The module handles three relativity classes, decided from the source parameter dump and,
-independently, from the target runtime. The two classes must match, otherwise the run exits with
-a message naming both.
+### Add refinement to an MHD run
 
-| class | source signature | target signature | examples |
+Add `<mesh_refinement>` (or SMR regions) to the deck of an MHD run whose source is a single-level mesh. B is rebuilt as the curl of one potential, so it is divergence-free on every target block, also across fine/coarse boundaries; check `mhd_divb` after the first cycles. If the source itself is multi-level, set `b_coarsen_ok = true` and accept the loss of fine-level B.
+
+### Remap, then LAT
+
+```bash
+athena -i new.athinput time/lat=false           # remaps, runs, writes a restart
+athena -r rst/NewRun.00017.rst time/lat=true    # LAT on, from that restart
+```
+
+### A GR run
+
+A GR source can be remapped by the same block. With `band_mode = auto` (that is `keep`) a widening remap works: the new outer region keeps the torus or disk background the pgen just built, and the remapped state fades in over `b_taper_root_cells` source root cells outside the old box. Details are in [General relativity](#general-relativity).
+
+### A convergence test
+
+`pgen_name = remap_test` is a built-in 3D test problem (hydro or MHD). Run it without a `<remap>` block, with a restart output, to produce a source restart that holds a smooth analytic state. Then remap that restart with `transition_band = false`. It prints a line `remap_test_errors: divb_max= b_l1= b_max= rho_l1= eint_l1= b_far_max=` comparing the result with the analytic state.
+
+## General relativity
+
+The module classifies the source from its parameter dump and, independently, the target from the running code. The two classes must match, otherwise the run exits with a message naming both. The class is printed in the startup banner.
+
+| class (banner name) | source signature | target signature | typical use |
 | --- | --- | --- | --- |
-| `kNewtonian` | no `<coord>` relativity keys | no relativistic coordinates | tde_external, remap_test |
-| `kFixedGR` | `<coord> general_rel = true`, no `<adm>` | `pcoord->is_general_relativistic` | gr_torus |
-| `kDynGRAnalytic` | `<adm>` block present | `pmbp->padm != nullptr` | |
+| Newtonian | none of the below | no relativistic coordinates | `tde_external`, `remap_test` |
+| fixed-GR | `<coord> general_rel = true`, no `<adm>` block | general-relativistic `<coord>`, no `<adm>` | `gr_torus` on a fixed Kerr-Schild metric |
+| dynamical-GR | `<adm>` block (needs `<mhd>`) | `<adm>` active | dyn_grmhd runs with a prescribed metric |
 
-The target test for dynamical GR is on `padm`, because `pcoord->is_general_relativistic` is
-false for dyn-GR runs.
+- **Refused.** `<z4c>` and `<cce>` sources and `<z4c>` targets are refused permanently: a numerically evolved spacetime cannot be resampled by an interpolation that knows nothing about the constraints, and the result would be constraint-violating initial data. Special relativity is refused too.
+- **Consistency checks** compare the source parameter dump with the target input. For fixed-GR, a differing `<coord> a` or `minkowski` is fatal (a key set on one side only counts as differing) and the excision keys (`excise`, `dexcise`, `pexcise`, `flux_excise_r`) only warn. For dynamical-GR everything warns, and the target's value is used. Differences in `<units>` (`bhmass_msun`, `density_cgs`, `mu`) warn in both GR classes.
+- **Band mode.** `floor` assumes a Newtonian ambient state and is fatal in GR. `auto` gives `keep`. A Newtonian run can ask for `keep` explicitly, but then the gas energy is interpolated as stored (no thermal-energy carry), so it heats like a plain interpolation of `E`.
+- **Carried.** The gas, B (same vector-potential route, also inside horizons) and, with identical settings, `i0`. In the dynamical-GR class the stored ADM metric section of the restart is skipped and recomputed analytically at the source time, so the metric, lapse and excision masks match the restarted state. In-tree GR pgens such as `gr_torus` need no remap-specific code.
+- **Radiation.** With `<radiation>` on both sides, `nlevel`, `rotate_geo` and `angular_fluxes` must be identical (a mismatch is fatal). A group present only in the source is dropped with a warning. A group present only in the target keeps the pgen's own initialization.
+- **Expect** a short transient in the first cycles of a strongly magnetized run: see [troubleshooting](#troubleshooting).
 
-**Refused.** `<z4c>` or `<cce>` sources and targets are refused permanently: a numerically
-evolved spacetime cannot be resampled by an interpolation that knows nothing about the
-constraints, and the result would be constraint-violating initial data that looks fine and is
-wrong. Special relativity is refused too.
+## What is refused
 
-**Consistency checks** compare the two parameter dumps and only read the target pin (never
-`GetOrAdd`, which would pollute its dump). For `kFixedGR` a differing `<coord> a` or
-`minkowski` is fatal and excision keys only warn. For `kDynGRAnalytic` everything warns.
-`<units>` differences (`bhmass_msun`, `density_cgs`, `mu`) warn in both GR classes.
+The run exits with a message for the following. Floors (`dfloor`, `pfloor`, `tfloor`) and `<units>` differences only warn.
 
-**What is remapped in GR**
+### Run configuration
 
-- **Gas, un-densitized across the interpolation (`kDynGRAnalytic` only).** On the dyn-GR path
-  every conserved column is `sqrt(gamma)` times a fluid quantity, so the module divides it out at
-  each source cell centre, samples the undensitized state, and multiplies it back at the target
-  cell centre. This keeps the metric curvature, largest at the punctures, out of the
-  interpolation. The metric is evaluated at the source time, which needs a prescribed metric
-  (`padm` still holds the pgen's `t = 0` metric while the remap runs). `kFixedGR` does not
-  densitize, so nothing is divided out there. The Newtonian magnetic-energy round trip is
-  Newtonian-only, because in GR the O(h^2) E-versus-B inconsistency is absorbed by C2P, FOFC and
-  the excision reset. No Newtonian floors and no dual-energy preparation run on the GR path.
-- **Face-centered B** through the same metric-free vector-potential route, so div(B) = 0 holds
-  to machine precision, including inside horizons. Horizon cells are deliberately not skipped,
-  because excision never touches `b0` and skipping would break the discrete curl identity.
-  In `keep` mode, faces the remap does not reach (outside the source box plus taper) keep the
-  field the target's own pgen built. Two divergence-free fields meeting face to face are not
-  divergence-free at the seam, so the outer taper layer can carry div(B) of order `|B_pgen|/h`.
-  This is measured and reported (`max |div(B)|*h` against `max |B|`, never suppressed by
-  `b_report`). A same-domain remap has no seam and prints nothing.
-- **Radiation.** `i0` requires identical `radiation/nlevel`, `rotate_geo` and `angular_fluxes`
-  on both sides (a mismatch is fatal). A group in the source but not the target is skipped with a
-  warning. The reverse is reported in the summary and left to the pgen.
-- **Skipped.** The ADM metric section of the payload is recomputed analytically, so the loader
-  identifies it by residual byte count and steps over it.
+- `time/lat = true` in the same run. The check is in the module and in `main.cpp`, so it fires for every pgen.
+- A 1D or 2D mesh on either end: both must be 3D, whether or not there is a B field.
+- The retired `<problem>` keys `remap`, `remap_restart_source`, `remap_interpolation`, `remap_settle_steps` and `remap_settle_passes`. On a fresh start `tde_external` refuses `problem/remap = true` and prints the `<remap>` block to write instead. Otherwise, and always on a restart, whose own dump may carry the dead keys, they only warn.
 
-**Band mode in GR.** Newtonian floor-fade thermodynamics is invalid in GR (there is no ambient
-floor state to relax to), so `band_mode = floor` in a GR class is fatal. `auto` resolves to
-`keep`: a target cell with band weight `w` gets `w * u_sampled + (1-w) * u_pgen`, with `w = 0`
-leaving the pgen state untouched. This makes a widening GR remap work, because the new outer
-region keeps the torus or disk background the pgen just built.
+### Source and target physics
 
-Unlike the Newtonian band, which begins inside the source boundary because the loader floors the
-source's outer ghost zones there, the keep fade lives entirely outside the source box:
-`w = 1` everywhere the source covers, then the clamped boundary value decays to zero across
-`b_taper_root_cells` source root cells, the same geometry as the vector-potential taper. The
-face-centered pass uses the same weight, evaluated at the cell centre, to decide which faces it
-owns and to weight the Newtonian magnetic-energy add-back. The `(1-w)` fraction that kept the
-pgen's total energy already carries the pgen's magnetic energy, so only the remapped fraction
-takes the new one.
+- A source with `<z4c>`, `<cce>`, `<turbulence>`, `<turb_driving>`, `<sink_particles>` or `<shearing_box>`, and a `<z4c>` target.
+- Special-relativistic ends; a relativity-class mismatch; `band_mode = floor` in GR.
+- A hydro source into an MHD target or the reverse, and any run carrying both `<hydro>` and `<mhd>`.
+- An `isothermal` EOS on either end (there is no energy column to carry).
+- A different fluid closure: the gas column count, tabulated versus analytic EOS, and for a gamma-law gas `gamma` to 1e-12. Only the kind of closure is compared, not the table file: use the same table on both ends.
+- A different number of passive scalars (`nscalars`), or a source with a dual-energy column into a target with `dual_energy = false`. The reverse is allowed: the target's column is then built from the remapped state.
 
-**No pgen code for `gr_torus`.** Add a `<remap>` block to a `gr_torus` input and it works. The
-orchestrator refreshes the analytic metric by calling `padm->SetADMVariables(pmbp)` at the source
-time before the pgen post hook runs, so dyn-GR pgens see the metric, the lapse and the excision
-masks of the moment they restart into.
+### Source file
 
-## Restrictions (clean fatal errors)
+- A multi-level MHD source without `b_coarsen_ok = true`.
+- An MHD source whose B is not discretely divergence-free: the inverse-curl residual is a warning above 1e-8 and fatal above 1e-2 of the maximum field strength.
+- A truncated file, a per-rank restart, or a payload with an unrecognized trailing section.
 
-- The source must be hydro or MHD (not both) and free of step-3 internal state: no
-  `<z4c>`/`<cce>`, `<turb_driving>`, `<sink_particles>`, shearing box.
-- Special-relativistic sources and targets are refused. General-relativistic ones are supported.
-- Source and target relativity classes must match, and so must the CC module type (hydro to
-  hydro, mhd to mhd).
-- **The fluid EOS must match.** The source's own `<hydro|mhd>/eos` decides its conserved column
-  count, which must agree with the target's, as must tabulated versus analytic and, for a
-  gamma-law gas, `gamma` to 1e-12. Floors (`dfloor`, `pfloor`, `tfloor`) only warn.
-- An `isothermal` EOS (no energy column) is refused on either end.
-- Both ends must be 3D, whether or not there is a B field to remap.
-- `band_mode = floor` with a GR class.
-- `time/lat = true` cannot be combined with the remap. Remap first, then restart the remapped
-  run with LAT. The check lives in the remap module, so it fires for every pgen.
-- `<problem>/remap` and `<problem>/remap_restart_source` are retired spellings from before the
-  module existed. On a fresh start `tde_external` refuses to run when `problem/remap = true` and
-  prints the `<remap>` block to write instead. Otherwise (and always on a restart, whose own dump
-  may carry the dead keys) they are ignored with a warning.
+## Checklists
 
-## Pgen participation (optional)
+### Before the run
 
-A pgen may enroll hooks inside its pgen function. They run around the auto remap:
+- Same physics modules on both ends: hydro or MHD (not both), the same `eos`, `gamma` (or the same table), `nscalars`, `dual_energy` and `<radiation>` settings, and the same relativity class (for fixed-GR also the same `<coord>` spin `a`).
+- 3D mesh, `time/lat = false`, absolute `nlim` and `tlim`.
+- `<outputN>` blocks of the new deck use the same names as the source's if the numbering should continue.
+
+### After the run starts
+
+- Read the banner printed by rank 0: source path, relativity class, band mode, source time and cycle, blocks loaded, whether B and `i0` were applied. The `radiation i0 remap` line says the group was loaded; only `keep` mode applies it.
+- Read the warnings. The B diagnostics show the inverse-curl residual and the maximum field strength in the interior and on the boundary shell.
+- Check `mhd_divb`: it should be at round-off level. A same-domain remap has no seam.
+- Compare mass, momentum and energy totals before and after.
+
+## Troubleshooting
+
+| symptom | cause and fix |
+| --- | --- |
+| Fatal error about LAT | Remap with `time/lat = false`, then restart with LAT on. |
+| Run stops immediately after the remap | `nlim` or `tlim` is absolute. Add the wanted cycles or time to the source's final values. |
+| Output numbering does not continue from the source | `copy_output_state = false`, or the new deck has no `<outputN>` block of the same name. |
+| Fatal error on a multi-level MHD source | Set `b_coarsen_ok = true` and accept the loss of sub-root B structure. |
+| Fatal error on the inverse-curl residual | The source B is not divergence-free (not constrained-transport evolved), so the remapped field would not be the source's. |
+| Sheet-current warning | The source B does not vanish at the old boundary, so a widening remap creates taper currents outside the old box. This is physically unavoidable. |
+| Divergence reported at the taper edge (`keep` mode) | Two divergence-free fields meet at a seam. The outer taper layer can carry div(B) of order the pgen B over the cell size. A same-domain remap has no seam. |
+| Transient in the first cycles (GR, strong B) | Gas is remapped verbatim while B is rebuilt, so E and B are inconsistent at order h squared. C2P (primitive recovery), FOFC (first-order flux correction) and excision absorb it as a one-time transient. |
+| Total energy drops | By design: kinetic energy the new grid cannot represent is dropped, not heated. See [Remapping](Remapping#guarantees-and-limits). |
+
+## Writing a pgen that participates
+
+A pgen may enroll hooks inside its pgen function. They run around the automatic remap:
 
 ```cpp
 user_remap_skip_func   = [](Real x, Real y, Real z) { return inside_excision(...); };
@@ -193,9 +182,13 @@ user_remap_post_func   = [](const remap::RemapSummary &s) {
   /* frame switches, reseeds, banners */ };
 ```
 
-A pgen that fully initializes its own state should skip that work when
-`remap::IsAutoRemapEnabled(pin)` is true, since the remap would overwrite it anyway. See
-`src/pgen/tde_external.cpp` (excision, BH and frame metadata, settle passes) and
-`src/pgen/tests/remap_test.cpp` (error report) for the canonical patterns. The programmatic API
-`remap::LoadAndApplyRemap(...)` remains available for mid-run re-remaps (TDE settle passes).
-Mid-run callers must call `Driver::InitBoundaryValuesAndPrimitives` afterwards.
+`skip` marks cells that keep the ambient state (excision). `loaded` runs after the source parameters are read and before the state is applied. `post` runs last.
+
+In `floor` mode the remap overwrites every cell, so a pgen can skip its own initialization when `remap::IsAutoRemapEnabled(pin)` is true, as `tde_external` and `remap_test` do. In `keep` mode the pgen state is the ambient that the remap blends against, so the pgen must still build it. See `src/pgen/tde_external.cpp` (excision, black-hole and frame metadata, settle passes) and `src/pgen/tests/remap_test.cpp` (error report) for the canonical patterns. The programmatic API `remap::LoadAndApplyRemap(...)` also serves mid-run re-remaps (the TDE settle passes). Mid-run callers must call `Driver::InitBoundaryValuesAndPrimitives` afterwards.
+
+## Further reading
+
+- [Remapping](Remapping): how the remap works, what is exact and what is not.
+- [Implementation notes](Remapping-Implementation-Notes): the stages, known issues and how to test.
+- [Dual Energy](Dual-Energy) and [Tabulated EOS](Tabulated-EOS): the closures the remap must match.
+- `docs/remap_module_design.md`: the design document.
