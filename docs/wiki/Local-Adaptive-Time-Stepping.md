@@ -177,7 +177,7 @@ The remaining cost is mainly communication and task-list launch overhead for the
 ## Further reading
 
 - [Implementation notes](Local-Adaptive-Time-Stepping-Implementation-Notes): how the factors are chosen, the tick loop, rank layout, restart, module interactions, limitations and tests.
-- Example deck: `inputs/TDE_examples/tde_05_fallback_lat.athinput`. It has `lat = false` in the file, and `inputs/TDE_examples/README.md` turns LAT on from the command line for the second part of step 5.
+- Example deck: `inputs/TDE_examples/tde_05_fallback_lat.athinput`. It runs the remap, the settle steps and the fallback in one run: the settle steps run without LAT and LAT starts after the last remap pass.
 - Design note `docs/lat_implementation_note.tex`, with its `.pdf` built from it: scope, user controls, factor metadata, masks, boundary exchange, delayed flux correction, self-gravity, block ordering, load balance, AMR, restart, performance and invariants.
 - Berger and Colella (1989), *J. Comput. Phys.* **82**, 64: the refluxing generalised here to bin boundaries.
 - Gottlieb (2009): the SSPRK(2,2) tableau whose dense output is used for mixed-cadence ghosts.

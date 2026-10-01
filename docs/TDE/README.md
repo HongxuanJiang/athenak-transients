@@ -201,11 +201,9 @@ and file names.  Each step starts from the last restart file of the previous ste
 | 4 | `tde_04_bh_frame.athinput` | 40 to 70 | `512 x 512 x 256` | 8 | BH rest frame | conversion to the BH rest frame |
 | 5 | `tde_05_fallback_lat.athinput` | 70 to 440 | `1024 x 1280 x 256` | 8 | BH rest frame | fallback with LAT |
 
-Step 5 has two parts.  The deck ships with `time/lat = false`: it remaps, runs to
-`t = 71` and stops, and the run is then restarted with `time/lat=true`,
-`problem/bh_reciprocal_force=true`, and `time/tlim=440.2`.  A remap can also share a run
-with LAT: with `time/lat=true` on the command line of the first run, the settle steps run
-without LAT and LAT starts after the last remap pass.
+Step 5 runs with LAT on, together with `problem/bh_reciprocal_force=true`, to
+`time/tlim=440.2`.  The settle steps of its remap run without LAT, and LAT starts after
+the last remap pass.
 
 ```bash
 REPO=/path/to/athenak
@@ -219,9 +217,6 @@ for step in 01_disruption 02_remap_box256 03_remap_box512 04_bh_frame 05_fallbac
   mkdir -p $step
   (cd $step && mpirun -np 10 $ATHENA -i $DECKS/tde_$step.athinput)
 done
-
-(cd 05_fallback_lat && \
- mpirun -np 10 $ATHENA -r rst/TDEExternalLTEPrad.00017.rst time/lat=true problem/bh_reciprocal_force=true time/tlim=440.2)
 ```
 
 Run every step from its own directory, and keep the step directories next to each other,
@@ -266,8 +261,7 @@ steps 2 to 5 of the example chain (`bh_live = true`); in step 1 it starts outsid
 until the first remap.  Its inertial position and velocity are advanced
 with a leapfrog under the gas pull on it, sampled from the self-gravity potential, and in the
 LAT stage the equal and opposite of the BH force on the gas is used instead
-(`bh_reciprocal_force = true`, which needs LAT, so it is switched on on the command line
-in part (b) of step 5).  In the translating frame the BH moves with respect to the mesh
+(`bh_reciprocal_force = true`, which needs LAT, so it is on in step 5 only).  In the translating frame the BH moves with respect to the mesh
 because of both its own motion and the frame motion.  After the conversion of step 4 the
 frame is the inertial frame in which the BH is initially at rest, and the live BH moves in
 it.  Every remap carries the BH position, velocity, and acceleration from the source restart
@@ -427,10 +421,12 @@ shortened for the test.  Compare the debris energy distributions with
 
 The section "Production TDE benchmark" of the paper restarts one checkpoint twice, once
 with LAT and once without, with all other settings identical.  With the example
-decks, run part (a) of step 5, and restart from
+decks, run step 5 with `time/lat=false problem/bh_reciprocal_force=false time/tlim=71.0`
+to get a checkpoint at `t = 71`, and restart from
 `05_fallback_lat/rst/TDEExternalLTEPrad.00017.rst` in two separate copies of the
-directory.  Run one with `time/lat=true problem/bh_reciprocal_force=true` and one without both, and end both at the same
-time with `time/tlim`.  The paper uses five time units (`5 t0`) from a common
+directory.  Run one with `time/lat=true problem/bh_reciprocal_force=true time/tlim=...` and one with
+`time/lat=false problem/bh_reciprocal_force=false time/tlim=...`, ending both at the same
+time.  The paper uses five time units (`5 t0`) from a common
 checkpoint.  Compare the wall time, the number of cycles, and the density fields on the
 same grid.  The LAT schedule depends on `time/hydro_lat_min_bin_count`, whose default is
 `4 * nranks`, so use the same number of ranks in comparisons.

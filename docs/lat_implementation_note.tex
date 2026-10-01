@@ -533,10 +533,8 @@ The example deck \path{inputs/TDE_examples/tde_05_fallback_lat.athinput} uses:
   \item \texttt{mesh\_refinement/max\_nmb\_per\_rank=520},
   \item \texttt{gravity/solve\_dt=0.03}.
 \end{itemize}
-The file has \texttt{lat=false}, matching the earlier steps.  The paper runs it as
-a restart with \texttt{time/lat=true} on the command line.  A remap can also share a
-run with LAT: with \texttt{time/lat=true} on the command line of the first run, the
-settle steps run as plain steps of the global time step and LAT starts after the last
+The file has \texttt{lat=true} and \texttt{bh\_reciprocal\_force=true}.  Its remap
+settle steps run as plain steps of the global time step, and LAT starts after the last
 remap pass.  The exact factor distribution is runtime-dependent because it follows
 the local-CFL table and AMR topology.
 

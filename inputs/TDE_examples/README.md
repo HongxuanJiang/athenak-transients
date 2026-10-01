@@ -32,8 +32,7 @@ in it.  Step 4 is the conversion itself, a Galilean
 boost of the state by the frame velocity done by the remap.  Every remap carries the BH
 position, velocity, and acceleration from the source restart file.  The reciprocal force
 (the gas pull on the BH applied with the same stencil as the BH force on the gas) needs
-LAT, so it is off in steps 1 to 4 and part (a) of step 5, and it is switched on in part (b)
-of step 5.
+LAT, so it is off in steps 1 to 4 and on in step 5.
 
 ## Build
 
@@ -72,17 +71,12 @@ for step in 01_disruption 02_remap_box256 03_remap_box512 04_bh_frame 05_fallbac
   (cd $step && mpirun -np 10 $ATHENA -i $DECKS/tde_$step.athinput)
 done
 
-# step 5, second part: continue with LAT on to 5 P_mb
-(cd 05_fallback_lat && \
- mpirun -np 10 $ATHENA -r rst/TDEExternalLTEPrad.00017.rst time/lat=true problem/bh_reciprocal_force=true time/tlim=440.2)
 ```
 
-A remap never runs on a restart (`athena -r`).  Step 5 ships with LAT off: it remaps,
-runs to t = 71 and stops, and is then restarted with LAT on, together with the reciprocal
-force of the gas on the BH.  A remap can also share a run with LAT: with `time/lat=true`
-on the command line of the first run, the settle steps run without LAT and LAT starts after
-the last remap pass.  A step that stops early is continued the usual way, with
-`athena -r rst/<last file>.rst` inside its directory.
+A remap never runs on a restart (`athena -r`).  Step 5 remaps and runs with LAT on, together
+with the reciprocal force of the gas on the BH, to 5 P_mb (t = 440.2).  The settle steps of
+the remap run without LAT, and LAT starts after the last remap pass.  A step that stops
+early is continued the usual way, with `athena -r rst/<last file>.rst` inside its directory.
 
 The restart files used by the next step are
 
@@ -92,7 +86,6 @@ The restart files used by the next step are
 | step 2 | `02_remap_box256/rst/TDEExternalLTEPrad.00008.rst` | 24 |
 | step 3 | `03_remap_box512/rst/TDEExternalLTEPrad.00010.rst` | 40 |
 | step 4 | `04_bh_frame/rst/TDEExternalLTEPrad.00016.rst` | 70 |
-| step 5a | `05_fallback_lat/rst/TDEExternalLTEPrad.00017.rst` | 71 |
 
 Output numbers continue from the source restart file.  A different source can be
 given on the command line, for example `remap/source=../01_disruption/rst/<file>.rst`.
@@ -108,7 +101,8 @@ more ranks.
 
 * **Self-gravity cadence (Sec. 8.1).**  Steps 1 to 4 with `gravity/solve_dt=0.0025`
   added on the command line, compared with the value `solve_dt = 0.03` set in the input files.
-* **LAT benchmark (Sec. 7.4).**  Restart the fallback stage once with
+* **LAT benchmark (Sec. 7.4).**  Run step 5 with `time/lat=false problem/bh_reciprocal_force=false
+  time/tlim=71.0` to get a checkpoint at t = 71, then restart it once with
   `time/lat=true problem/bh_reciprocal_force=true` and once without both (the reciprocal force
   needs LAT), keeping every other setting identical.
 * **HR run.**  The high-resolution run of the paper continues from the step-4 restart

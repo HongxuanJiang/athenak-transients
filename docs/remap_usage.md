@@ -75,7 +75,7 @@ settle_steps  = 10
 settle_passes = 1
 ```
 
-Each step runs in its own directory with `athena -i`, so the relative `source` path resolves. The pgen is `tde_external`, a Newtonian run, so `band_mode = auto` resolves to `floor`: the new outer region becomes ambient floor gas, with a transition band at the old boundary. Time, cycle and output numbers continue from the source. Step 5 ships with `time/lat = false` and is continued with LAT on by a restart. With `time/lat=true` on the command line the whole step can run in one go, see [Remap with LAT](#remap-with-lat). `inputs/TDE_examples/README.md` has the full chain.
+Each step runs in its own directory with `athena -i`, so the relative `source` path resolves. The pgen is `tde_external`, a Newtonian run, so `band_mode = auto` resolves to `floor`: the new outer region becomes ambient floor gas, with a transition band at the old boundary. Time, cycle and output numbers continue from the source. Step 5 runs with LAT on: its settle steps run without LAT and LAT starts after the last pass, see [Remap with LAT](#remap-with-lat). `inputs/TDE_examples/README.md` has the full chain.
 
 ### Change the MeshBlock size or rank count
 
