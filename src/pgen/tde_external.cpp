@@ -268,7 +268,12 @@ inline void EvaluateBHAccelerationAtPoint(const Real x, const Real y, const Real
 }
 
 void UpdateAutoRemapAMRControls(Mesh *pm) {
-  if (pm == nullptr || pm->pmr == nullptr) return;
+  if (pm == nullptr) return;
+  // The settle steps and the remap pass that ends them are plain steps of the global time
+  // step: LAT is paused while a settle is pending and resumes by itself once the last
+  // pass has run (the driver rebuilds the LAT bins from the remapped state).
+  pm->hydro_lat_suspended = hydro_lat_enabled_global && remap_settle_active_global;
+  if (pm->pmr == nullptr) return;
   if (remap_settle_active_global) {
     pm->pmr->ncyc_check_amr = 1;
     pm->pmr->refinement_interval = 1;

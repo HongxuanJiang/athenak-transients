@@ -81,6 +81,13 @@ struct RemapOptions {
   // optional CC groups
   bool remap_radiation_i0 = true;           // remap radiation i0 intensities if both
                                             // sides carry the module (GR only)
+
+  // LAT (<time>/lat).  A remap replaces the state of every block at once, so it may only
+  // run while no LAT window is in progress.  The startup remap (MaybeAutoRemap) sets
+  // this: no window exists yet.  A mid-run caller instead pauses LAT first
+  // (Mesh::hydro_lat_suspended, set at a synchronized point), which has the same effect.
+  // With neither, a remap under time/lat = true is fatal.
+  bool lat_idle = false;
 };
 
 //----------------------------------------------------------------------------------------

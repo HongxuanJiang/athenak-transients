@@ -201,9 +201,11 @@ and file names.  Each step starts from the last restart file of the previous ste
 | 4 | `tde_04_bh_frame.athinput` | 40 to 70 | `512 x 512 x 256` | 8 | BH rest frame | conversion to the BH rest frame |
 | 5 | `tde_05_fallback_lat.athinput` | 70 to 440 | `1024 x 1280 x 256` | 8 | BH rest frame | fallback with LAT |
 
-Step 5 has two parts.  A remap cannot run with LAT on, so the deck first remaps with
-LAT off and stops at `t = 71`, and the run is then restarted with `time/lat=true`,
-`problem/bh_reciprocal_force=true`, and `time/tlim=440.2`.
+Step 5 has two parts.  The deck ships with `time/lat = false`: it remaps, runs to
+`t = 71` and stops, and the run is then restarted with `time/lat=true`,
+`problem/bh_reciprocal_force=true`, and `time/tlim=440.2`.  A remap can also share a run
+with LAT: with `time/lat=true` on the command line of the first run, the settle steps run
+without LAT and LAT starts after the last remap pass.
 
 ```bash
 REPO=/path/to/athenak
@@ -439,7 +441,7 @@ same grid.  The LAT schedule depends on `time/hydro_lat_min_bin_count`, whose de
 |---|---|
 | `Failed to read lte_table` or the table is not found | The path in `hydro/table` is resolved from the working directory. Run from the step directory with the table in its parent, set `$ATHENAK_DATA`, or pass `hydro/table=/absolute/path`. |
 | The EOS-balanced star fails to build | The star is outside the rho-T range of the table. Use a table that covers the stellar regime. Do not rely on clamping. |
-| `Remap cannot be combined with time/lat = true` | A remap and LAT do not run together. Remap with LAT off, stop, and restart with `time/lat=true`. |
+| `A remap cannot run inside a LAT window` | A remap was called in the middle of a run while LAT windows were active. `tde_external` pauses LAT for its settle steps, so this message points at another problem generator. |
 | `time/lat with gravity/self_gravity=true requires gravity/solve_dt > 0` | LAT needs the self-gravity cadence to bound the window. Set `gravity/solve_dt`. |
 | `problem/remap = true is a retired key` | Migrate the deck to the `<remap>` block, see [`parameters.md`](parameters.md). |
 | `use_translating_frame = false is only supported for restart/remap-based TDE conversion` | A fresh start needs the translating frame. Use `false` only in a step with a `<remap>` block or a restart. |

@@ -23,7 +23,7 @@ remap::MaybeAutoRemap                       (does nothing without an enabled <re
 
 1. **Fresh start only.** The fresh-start constructor of `ProblemGenerator` runs the pgen function and then calls `remap::MaybeAutoRemap`. The restart constructor never calls it. A remap target is therefore always launched with `athena -i`, never `-r`.
 2. **The pgen function still runs.** In `keep` mode the remap blends against the state it built. In `floor` mode the remap overwrites it, so a pgen can skip its own initialization when `remap::IsAutoRemapEnabled` is true.
-3. **Options.** `OptionsFromInput` reads the `<remap>` keys. `LoadAndApplyRemap` refuses `time/lat = true` and an empty `source`.
+3. **Options.** `OptionsFromInput` reads the `<remap>` keys. `LoadAndApplyRemap` refuses an empty `source`, and a call made while LAT windows are active (see [Interactions](#interactions)).
 4. **Load.** `LoadRemapSourceData` reads the ASCII parameter dump at the head of the source file. It checks the source against the target (physics, relativity class, EOS, scalars, dimensionality) and then reads the binary blocks. The gas of a block is read only if the block overlaps the local pack's bounding box plus 2 root cells.
 5. **Band mode.** `auto` becomes `keep` or `floor` from the relativity class. In GR, `CheckRemapGRConsistency` compares the two parameter sets. It only reads the target input and never adds keys to it.
 6. **Newtonian preparation.** The source's outer ghost zones are set to the floor state, and one extra column of thermal energy is built for every source cell.
@@ -84,7 +84,7 @@ In `keep` mode the pass starts from the pgen's own B and owns a face only if its
 
 ## Interactions
 
-- **LAT.** Refused by `LoadAndApplyRemap` and by an early check in `main.cpp`. The supported order is remap with LAT off, then a restart with LAT on.
+- **LAT.** The startup remap runs before the first window, so it is always allowed. A mid-run call is allowed only while the problem generator has paused LAT (`Mesh::hydro_lat_suspended`), which makes every step a plain step of the global time step. After the state is replaced, the remap clears the LAT bins and pulls the cycle counters that the LAT gates compare with `ncycle` (last AMR call, last topology change, last rebalance) back to the source's cycle, because it rewinds `ncycle`. The `tde_external` settle steps are the one user: LAT is paused from the startup remap until the last settle pass has run.
 - **AMR and SMR.** Fully supported on the target side. A multi-level MHD source needs `b_coarsen_ok`, because B is restricted to the source root grid.
 - **MPI and GPU.** The module runs on the host with mirror views and one `deep_copy` back to the device. Gas data is loaded per rank. B data is loaded for all source blocks on every rank, because the covering potential is global. Diagnostics are reduced over MPI or printed by rank 0.
 - **Refused source modules.** A source with `<z4c>`, `<turbulence>`, `<turb_driving>` or `<sink_particles>` carries internal state with no length markers in the restart, so the loader cannot skip past it. Sources with `<cce>` or `<shearing_box>` are refused as well.
@@ -108,7 +108,7 @@ In `keep` mode the pass starts from the pgen's own B and owns a face only if its
 
 ## Testing
 
-No test in `tst/` runs a remap. Two things exercise it:
+One test in `tst/` runs a remap, and it checks only the LAT coupling (`tst/test_suite/nr/test_nr_remap_lat_cpu.py`: a hydro remap onto a periodic SMR mesh, with LAT on and off, same final mass and density to truncation error). Nothing in `tst/` checks the remapped state itself. Two things exercise that:
 
 - The built-in pgen `remap_test` (3D, hydro or MHD). Without a `<remap>` block it initializes a smooth analytic state, with B from an analytic vector potential, and prints the errors against it, so that its output can serve as a source restart. With an enabled `<remap>` block it runs the remap and prints the same line from `user_remap_post_func`: `remap_test_errors: divb_max= b_l1= b_max= rho_l1= eint_l1= b_far_max=`. Here `b_far_max` is the field far outside the source box and should be near zero after a widening remap.
 - The TDE chain in `inputs/TDE_examples/`, which remaps a Newtonian hydro run four times (steps 2 to 5).

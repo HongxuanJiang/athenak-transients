@@ -122,7 +122,7 @@ A refused module makes the run stop with an error message.
 | z4c (evolved metric) and dynamical relativistic spacetimes | refused |
 | ion-neutral two-fluid | refused |
 | particles | refused |
-| `<remap>` ([Remapping](Remapping)) | refused. Remap with LAT off, then restart the remapped run with LAT on. |
+| `<remap>` ([Remap usage](Remap-Usage#remap-with-lat)) | supported. The remap at the start of the run happens before the first window. The `tde_external` settle steps run without LAT, and LAT starts after the last remap pass. |
 | user problem-generator hooks | sources and time-step limits are refused unless the generator flags them `*_lat_safe`. User boundary conditions are always refused with `<hydro>`. |
 
 Only the `rk1` integrator and the rk2-equivalent tableaux (`rk2`, `imex2`) are allowed. All other integrators, including `rk3`, `rk4`, `imex2+` and `imex3`, are refused.

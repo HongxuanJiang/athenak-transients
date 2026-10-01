@@ -16,6 +16,7 @@
 #include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
+#include "mesh/mesh_refinement.hpp"
 #include "mesh/meshblock_pack.hpp"
 #include "coordinates/adm.hpp"
 #include "eos/eos.hpp"
@@ -62,16 +63,17 @@ RemapSummary LoadAndApplyRemap(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *ds
                                const std::function<void(ParameterInput *)> &on_loaded) {
   RemapSummary summary;
   if (pm == nullptr || pmbp == nullptr) return summary;
-  // Remap and LAT (<time>/lat) cannot run together: the remap replaces the state on every
-  // block at once, while LAT carries per-block time levels and bin metadata built against
-  // the state that was there before, and nothing rebuilds them for the new one.  The
-  // supported flow is to remap with LAT off and restart the remapped run with LAT on.
-  // This check used to live in tde_external.cpp alone, so every other pgen -- BBH
-  // included -- walked past it in silence into undefined behavior; it belongs to the
-  // module, on the one path every caller (auto <remap> block, direct call) takes.
-  if (dst_pin != nullptr && dst_pin->IsLATEnabled()) {
-    FatalRemap("Remap cannot be combined with time/lat = true.  Remap first with LAT "
-               "off, then restart the remapped run with time/lat = true.");
+  // Remap and LAT (<time>/lat) can share a run, but not a LAT window.  The remap replaces
+  // the state on every block at once, while a window carries per-block time levels, stage
+  // snapshots and reflux accumulators built against the state that was there before.  The
+  // startup remap qualifies (no window exists yet), and so does a mid-run remap made
+  // while the pgen has paused LAT (Mesh::hydro_lat_suspended).  Anything else is refused
+  // here, on the one path every caller (auto <remap> block, direct call) takes.
+  const bool lat_on = dst_pin != nullptr && dst_pin->IsLATEnabled();
+  if (lat_on && !opts.lat_idle && !pm->hydro_lat_suspended) {
+    FatalRemap("A remap cannot run inside a LAT window (time/lat = true).  Remap at "
+               "startup, or pause LAT first by setting Mesh::hydro_lat_suspended at a "
+               "synchronized point, as the tde_external settle steps do.");
   }
   if (opts.source_path.empty()) {
     std::cout << "### FATAL ERROR in remap::LoadAndApplyRemap" << std::endl
@@ -145,6 +147,23 @@ RemapSummary LoadAndApplyRemap(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *ds
   pm->dt = src.dt;
   pm->dtold = src.dt;
   pm->ncycle = src.ncycle;
+
+  // Under LAT, the AMR and rebalance gates compare ncycle with the cycle of the last AMR
+  // call, topology change and rebalance attempt.  A mid-run remap rewinds ncycle to the
+  // source's, so a later anchor would hold those gates shut until ncycle caught up.  The
+  // per-block factors were derived from the old state; the driver rebuilds them from the
+  // new one at the next time step.
+  if (lat_on) {
+    if (pm->pmr != nullptr) {
+      pm->pmr->last_amr_call_cycle =
+          std::min(pm->pmr->last_amr_call_cycle, pm->ncycle);
+    }
+    pm->topology_last_change_cycle =
+        std::min(pm->topology_last_change_cycle, pm->ncycle);
+    pm->hydro_lat_lb_last_attempt_cycle =
+        std::min(pm->hydro_lat_lb_last_attempt_cycle, pm->ncycle);
+    pm->InvalidateHydroLATMetadata();
+  }
 
   // Refresh the analytic ADM metric (and, for BBH, the excision + M1 radiation masks) at
   // the SOURCE time now that pm->time carries it.  Dyn-GR pgens whose metric callback is
@@ -248,6 +267,7 @@ void MaybeAutoRemap(ProblemGenerator *pgen, ParameterInput *pin, Mesh *pm) {
   if (!IsAutoRemapEnabled(pin)) return;
   RemapOptions opts = OptionsFromInput(pin);
   opts.skip_cell = pgen->user_remap_skip_func;
+  opts.lat_idle = true;  // startup: no LAT window exists yet
   const bool copy_out = pin->GetOrAddBoolean("remap", "copy_output_state", true);
   const RemapSummary summary =
       LoadAndApplyRemap(pm, pm->pmb_pack, pin, copy_out, "--- Remap (<remap> block) ---",

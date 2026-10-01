@@ -1330,7 +1330,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       int lat_sync_factor = hydro_subcycle_factor;
       if (hydro_lat) {
         int max_factor = std::max(1, hydro_subcycle_factor);
-        if (pmesh->hydro_lat_metadata_valid) {
+        // A pgen that paused LAT (Mesh::hydro_lat_suspended) gets plain steps of the
+        // global time step, the same path as a window of one tick, until it resumes.
+        if (pmesh->hydro_lat_metadata_valid && !pmesh->hydro_lat_suspended) {
           max_factor = std::min(max_factor,
                                 std::max(1, pmesh->hydro_lat_sync_factor_current));
         } else {
@@ -2021,7 +2023,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
                 pmesh->hydro_lat_lb_last_attempt_cycle < 0 ||
                 pmesh->topology_last_change_cycle >
                 pmesh->hydro_lat_lb_last_attempt_cycle;
-            if (hydro_lat_post_amr_rebalance &&
+            if (hydro_lat_post_amr_rebalance && !pmesh->hydro_lat_suspended &&
                 pmesh->multilevel && pmesh->pmr != nullptr &&
                 pmesh->hydro_lat_metadata_valid &&
                 !pmesh->HydroLATLoadBalanceCurrent() &&

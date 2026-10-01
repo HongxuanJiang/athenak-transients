@@ -377,7 +377,7 @@ Details: [`../remap_usage.md`](../remap_usage.md), [`../wiki/Remapping.md`](../w
 | `remap/copy_output_state` | bool | `true` | Continues the output file numbers of the source run. | not set | `src/remap/remap.cpp` |
 
 A remap happens only on a fresh start (`athena -i`), never on a restart (`athena -r`).
-The remap module stops with an error if it is combined with `time/lat = true`.
+A remap can share a run with `time/lat = true`: the settle steps run without LAT, and LAT starts after the last remap pass.
 
 ### `<time>`: integrator and localized adaptive time stepping
 

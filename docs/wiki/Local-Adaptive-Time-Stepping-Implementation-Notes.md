@@ -91,7 +91,7 @@ No MPI collective may run inside a bin. A rank with no due block would never rea
 | sink particles | The operator runs once per window, not per bin, because it uses MPI collectives. Blocks near a sink are at factor 1. The reflux refunds the sink potential's work. |
 | external black hole | The source acts only on active blocks. For a translating frame or a live black hole, the TDE generator advances the frame once per window, at the common start time. |
 | integrators | Only `rk1` and the rk2-equivalent tableaux (`rk2`, `imex2`) are allowed, because the delayed-reflux weights are derived for them. |
-| `<remap>` | Refused, in two places. See [Remapping](Remapping). |
+| `<remap>` | The startup remap runs before the first window. A problem generator can pause LAT (`Mesh::hydro_lat_suspended`): the driver then takes plain steps of the global time step, a window of one tick, until the flag is cleared. A remap in the middle of a run is accepted only while LAT is paused. The `tde_external` settle steps use this. See [Remapping](Remapping). |
 | other modules | Refused ones are listed on the [main page](Local-Adaptive-Time-Stepping#what-is-supported-and-refused). |
 
 ## Known limitations
@@ -112,6 +112,7 @@ Run from the `tst` directory, for example `python run_test_suite.py --cpu --test
 | `test_nr_hydro_lat_fofc_edges_cpu.py` | FOFC at the edges of SMR levels keeps the total mass to round-off | `tst/inputs/hydro_lat_fofc_edges.athinput` |
 | `test_nr_hydro_lat_grav_reflux_gate_cpu.py` | The gravitational-work refund closes the energy budget and matches a non-LAT run | `tst/inputs/hydro_lat_grav_reflux_gate.athinput` |
 | `test_nr_amr_restart_bitwise_lat_mpicpu.py` | A LAT run on an adaptive mesh, restarted from a checkpoint, equals the uninterrupted run | `tst/inputs/linear_wave_amr_restart_lat.athinput` |
+| `test_nr_remap_lat_cpu.py` | A remap target run with LAT on matches the same run with LAT off: same mass, density to truncation error | `tst/inputs/remap_lat.athinput`, `tst/inputs/remap_lat_source.athinput` |
 
 The example deck is `inputs/TDE_examples/tde_05_fallback_lat.athinput`. The design note is `docs/lat_implementation_note.tex`.
 

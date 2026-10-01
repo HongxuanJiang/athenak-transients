@@ -125,7 +125,7 @@ Making the transfer conservative is a different algorithm, not a weighting fix. 
 
 - A multi-level MHD source loses its fine-level B structure, because B is restricted to the source root grid. The gas keeps full detail.
 - If the source B does not vanish at the old boundary, a widening remap creates taper currents outside the old box. The module warns when the boundary-shell field exceeds 1e-2 of the maximum.
-- The remap is 3D only on both ends. It needs the same physics modules (no evolved spacetime) and cannot be combined with LAT in the same run. [What is refused](Remap-Usage#what-is-refused) gives the full list.
+- The remap is 3D only on both ends. It needs the same physics modules (no evolved spacetime). It can share a run with LAT, see [Remap with LAT](Remap-Usage#remap-with-lat). [What is refused](Remap-Usage#what-is-refused) gives the full list.
 - B is read for every source block on every rank, because the vector potential is built on a global grid. Gas data is read per rank, only for the blocks near the local pack. This is a one-time input cost.
 
 ## Further reading

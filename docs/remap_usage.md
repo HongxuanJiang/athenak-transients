@@ -36,7 +36,7 @@ After the problem generator has built its own state on the new mesh, the module 
 Before the first run:
 
 - `time/nlim` and `time/tlim` in the new deck are **absolute**: the run continues from the source's `ncycle` and time. To run 500 more cycles after a source that stopped at cycle 1200, set `nlim = 1700`.
-- A remap cannot be combined with LAT. Remap with `time/lat = false`, let the run write a restart, then restart that file with `time/lat = true` (example below).
+- A remap can be combined with LAT: `time/lat = true` may stay in the deck. The remap at the start of the run happens before any LAT window exists. See [Remap with LAT](#remap-with-lat).
 - Re-measure mass, momentum and energy after the remap. They are not carried over exactly.
 - `source` must be a single global restart file. A truncated file, or a restart written as one file per MPI rank, is refused.
 - The physics must match the source: see the [checklist](#checklists).
@@ -73,7 +73,7 @@ settle_steps  = 10
 settle_passes = 1
 ```
 
-Each step runs in its own directory with `athena -i`, so the relative `source` path resolves. The pgen is `tde_external`, a Newtonian run, so `band_mode = auto` resolves to `floor`: the new outer region becomes ambient floor gas, with a transition band at the old boundary. Time, cycle and output numbers continue from the source. Step 5 remaps with `time/lat = false` and is continued with LAT on by a restart. `inputs/TDE_examples/README.md` has the full chain.
+Each step runs in its own directory with `athena -i`, so the relative `source` path resolves. The pgen is `tde_external`, a Newtonian run, so `band_mode = auto` resolves to `floor`: the new outer region becomes ambient floor gas, with a transition band at the old boundary. Time, cycle and output numbers continue from the source. Step 5 ships with `time/lat = false` and is continued with LAT on by a restart. With `time/lat=true` on the command line the whole step can run in one go, see [Remap with LAT](#remap-with-lat). `inputs/TDE_examples/README.md` has the full chain.
 
 ### Change the MeshBlock size or rank count
 
@@ -85,12 +85,21 @@ One exception applies in `floor` mode (the Newtonian default). The transition ba
 
 Add `<mesh_refinement>` (or SMR regions) to the deck of an MHD run whose source is a single-level mesh. B is rebuilt as the curl of one potential, so it is divergence-free on every target block, also across fine/coarse boundaries; check `mhd_divb` after the first cycles. If the source itself is multi-level, set `b_coarsen_ok = true` and accept the loss of fine-level B.
 
-### Remap, then LAT
+### Remap with LAT
+
+Leave `time/lat = true` in the deck:
 
 ```bash
-athena -i new.athinput time/lat=false           # remaps, runs, writes a restart
-athena -r rst/NewRun.00017.rst time/lat=true    # LAT on, from that restart
+athena -i new.athinput time/lat=true            # remaps, then runs with LAT
 ```
+
+The remap at the start of the run happens before the first LAT window, and the driver builds the LAT bins from the remapped state at its first time step. LAT needs hydro without MHD, as always (see [Local Adaptive Time Stepping](Local-Adaptive-Time-Stepping#what-is-supported-and-refused)).
+
+`tde_external` also runs settle steps and a second remap pass, controlled by `settle_steps` and `settle_passes`. Those steps are plain steps of the global time step: LAT is paused while they run, the pass that ends them runs between two plain steps, and LAT starts at the first window after the last pass. Nothing needs to be set for this.
+
+The older route still works: remap with `time/lat = false`, let the run write a restart, then continue it with `athena -r rst/NewRun.00017.rst time/lat=true`.
+
+A problem generator that calls `remap::LoadAndApplyRemap` in the middle of a run has to pause LAT first, see [Writing a pgen that participates](#writing-a-pgen-that-participates).
 
 ### A GR run
 
@@ -123,7 +132,7 @@ The run exits with a message for the following. Floors (`dfloor`, `pfloor`, `tfl
 
 ### Run configuration
 
-- `time/lat = true` in the same run. The check is in the module and in `main.cpp`, so it fires for every pgen.
+- A remap in the middle of a run while LAT windows are active (`time/lat = true`). The startup remap and the `tde_external` settle passes are not affected, because LAT is idle or paused for them. The check is in the module, so it fires for every pgen.
 - A 1D or 2D mesh on either end: both must be 3D, whether or not there is a B field.
 - The retired `<problem>` keys `remap`, `remap_restart_source`, `remap_interpolation`, `remap_settle_steps` and `remap_settle_passes`. On a fresh start `tde_external` refuses `problem/remap = true` and prints the `<remap>` block to write instead. Otherwise, and always on a restart, whose own dump may carry the dead keys, they only warn.
 
@@ -147,7 +156,7 @@ The run exits with a message for the following. Floors (`dfloor`, `pfloor`, `tfl
 ### Before the run
 
 - Same physics modules on both ends: hydro or MHD (not both), the same `eos`, `gamma` (or the same table), `nscalars`, `dual_energy` and `<radiation>` settings, and the same relativity class (for fixed-GR also the same `<coord>` spin `a`).
-- 3D mesh, `time/lat = false`, absolute `nlim` and `tlim`.
+- 3D mesh, absolute `nlim` and `tlim`.
 - `<outputN>` blocks of the new deck use the same names as the source's if the numbering should continue.
 
 ### After the run starts
@@ -161,7 +170,7 @@ The run exits with a message for the following. Floors (`dfloor`, `pfloor`, `tfl
 
 | symptom | cause and fix |
 | --- | --- |
-| Fatal error about LAT | Remap with `time/lat = false`, then restart with LAT on. |
+| Fatal error about LAT windows | A problem generator called the remap in the middle of a run while LAT windows were active. Pause LAT first, as `tde_external` does for its settle steps (see [Writing a pgen that participates](#writing-a-pgen-that-participates)). |
 | Run stops immediately after the remap | `nlim` or `tlim` is absolute. Add the wanted cycles or time to the source's final values. |
 | Output numbering does not continue from the source | `copy_output_state = false`, or the new deck has no `<outputN>` block of the same name. |
 | Fatal error on a multi-level MHD source | Set `b_coarsen_ok = true` and accept the loss of sub-root B structure. |
@@ -184,7 +193,7 @@ user_remap_post_func   = [](const remap::RemapSummary &s) {
 
 `skip` marks cells that keep the ambient state (excision). `loaded` runs after the source parameters are read and before the state is applied. `post` runs last.
 
-In `floor` mode the remap overwrites every cell, so a pgen can skip its own initialization when `remap::IsAutoRemapEnabled(pin)` is true, as `tde_external` and `remap_test` do. In `keep` mode the pgen state is the ambient that the remap blends against, so the pgen must still build it. See `src/pgen/tde_external.cpp` (excision, black-hole and frame metadata, settle passes) and `src/pgen/tests/remap_test.cpp` (error report) for the canonical patterns. The programmatic API `remap::LoadAndApplyRemap(...)` also serves mid-run re-remaps (the TDE settle passes). Mid-run callers must call `Driver::InitBoundaryValuesAndPrimitives` afterwards.
+In `floor` mode the remap overwrites every cell, so a pgen can skip its own initialization when `remap::IsAutoRemapEnabled(pin)` is true, as `tde_external` and `remap_test` do. In `keep` mode the pgen state is the ambient that the remap blends against, so the pgen must still build it. See `src/pgen/tde_external.cpp` (excision, black-hole and frame metadata, settle passes) and `src/pgen/tests/remap_test.cpp` (error report) for the canonical patterns. The programmatic API `remap::LoadAndApplyRemap(...)` also serves mid-run re-remaps (the TDE settle passes). Mid-run callers must call `Driver::InitBoundaryValuesAndPrimitives` afterwards. Under `time/lat = true` a mid-run caller must also pause LAT before the call: set `pm->hydro_lat_suspended = true` at a point where every rank is synchronized, and clear it when LAT may resume. While it is set, every step is a plain step of the global time step, and the remap resets the LAT bins and the cycle counters that the AMR and rebalance gates compare with `ncycle`. The `tde_external` settle steps do exactly this.
 
 ## Further reading
 

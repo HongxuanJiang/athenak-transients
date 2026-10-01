@@ -77,9 +77,11 @@ done
  mpirun -np 10 $ATHENA -r rst/TDEExternalLTEPrad.00017.rst time/lat=true problem/bh_reciprocal_force=true time/tlim=440.2)
 ```
 
-A remap never runs on a restart (`athena -r`), and it cannot run with LAT on.  This is
-why step 5 first remaps with LAT off, stops at t = 71, and is then restarted with LAT
-on, together with the reciprocal force of the gas on the BH.  A step that stops early is continued the usual way, with
+A remap never runs on a restart (`athena -r`).  Step 5 ships with LAT off: it remaps,
+runs to t = 71 and stops, and is then restarted with LAT on, together with the reciprocal
+force of the gas on the BH.  A remap can also share a run with LAT: with `time/lat=true`
+on the command line of the first run, the settle steps run without LAT and LAT starts after
+the last remap pass.  A step that stops early is continued the usual way, with
 `athena -r rst/<last file>.rst` inside its directory.
 
 The restart files used by the next step are

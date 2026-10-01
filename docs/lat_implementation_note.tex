@@ -47,7 +47,7 @@ particles, integrators other than \texttt{rk1} and the rk2-equivalent tableaux
 (\texttt{rk2}, \texttt{imex2}), orbital advection, shearing boxes, viscosity,
 conduction, turbulence driving, the hydro source terms \texttt{const\_accel},
 \texttt{ism\_cooling}, \texttt{rel\_cooling}, \texttt{disk\_cooling} and
-\texttt{rad\_beam}, the remap module, user boundary conditions, and user
+\texttt{rad\_beam}, user boundary conditions, and user
 timestep constraints or source terms that the problem generator has not marked
 LAT-safe.  This restriction is intentional: every operator that changes state
 must be aware of which MeshBlocks are active at the current local time.
@@ -533,10 +533,12 @@ The example deck \path{inputs/TDE_examples/tde_05_fallback_lat.athinput} uses:
   \item \texttt{mesh\_refinement/max\_nmb\_per\_rank=520},
   \item \texttt{gravity/solve\_dt=0.03}.
 \end{itemize}
-The file has \texttt{lat=false}, because the deck first remaps and a remap
-cannot run with LAT.  LAT is switched on with \texttt{time/lat=true} on the
-command line of the restart.  The exact factor distribution is runtime-dependent
-because it follows the local-CFL table and AMR topology.
+The file has \texttt{lat=false}, matching the earlier steps.  The paper runs it as
+a restart with \texttt{time/lat=true} on the command line.  A remap can also share a
+run with LAT: with \texttt{time/lat=true} on the command line of the first run, the
+settle steps run as plain steps of the global time step and LAT starts after the last
+remap pass.  The exact factor distribution is runtime-dependent because it follows
+the local-CFL table and AMR topology.
 
 \section{Limitations and Invariants}
 
