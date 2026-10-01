@@ -31,6 +31,7 @@
 
 #include "athena.hpp"
 
+class Driver;
 class Mesh;
 class MeshBlockPack;
 class ParameterInput;
@@ -142,10 +143,32 @@ RemapSummary LoadAndApplyRemap(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *ds
 //   b_taper_root_cells= 4         A-taper width outside the source box (root cells)
 //   b_report          = true      print FC diagnostics
 //   radiation_i0      = true      remap radiation i0 when both sides carry it
+//   settle_steps      = 0         plain steps to run after the startup remap before the
+//                                 remap is applied again (a "settle pass"); 0 = none.
+//                                 A pgen may seed a different default by reading the key
+//                                 with GetOrAdd before MaybeAutoRemap runs
+//                                 (tde_external seeds 20)
+//   settle_passes     = 1         number of settle passes (each preceded by settle_steps)
+//
+// Settle steps (any pgen).  The first remap lays the source state onto the target mesh as
+// it was built at t = 0; the mesh then adapts to that state, so the state is remapped a
+// second time onto the adapted mesh.  While a settle is pending: AMR checks every cycle
+// (the configured cadence returns after the last pass), outputs are suppressed, and, with
+// time/lat = true, LAT is paused (Mesh::hydro_lat_suspended), so the settle steps and the
+// passes are plain steps of the global time step.  The Driver calls AfterCycleSettle at
+// every synchronized point.  Each pass calls the pgen's user_remap_loaded_func and
+// user_remap_post_func like the startup remap, then call
+// Driver::InitBoundaryValuesAndPrimitives.
 
 bool IsAutoRemapEnabled(ParameterInput *pin);
 RemapOptions OptionsFromInput(ParameterInput *pin);
 void MaybeAutoRemap(ProblemGenerator *pgen, ParameterInput *pin, Mesh *pm);
+
+// True while settle steps are pending: outputs are suppressed (Driver checks this).
+bool SettleActive();
+// Called by the Driver at every synchronized point.  Runs the next settle pass once the
+// settle steps have elapsed.  Returns true if the state was replaced.
+bool AfterCycleSettle(Driver *driver, ParameterInput *pin, Mesh *pm);
 
 }  // namespace remap
 

@@ -91,7 +91,7 @@ No MPI collective may run inside a bin. A rank with no due block would never rea
 | sink particles | The operator runs once per window, not per bin, because it uses MPI collectives. Blocks near a sink are at factor 1. The reflux refunds the sink potential's work. |
 | external black hole | The source acts only on active blocks. For a translating frame or a live black hole, the TDE generator advances the frame once per window, at the common start time. |
 | integrators | Only `rk1` and the rk2-equivalent tableaux (`rk2`, `imex2`) are allowed, because the delayed-reflux weights are derived for them. |
-| `<remap>` | The startup remap runs before the first window. A problem generator can pause LAT (`Mesh::hydro_lat_suspended`): the driver then takes plain steps of the global time step, a window of one tick, until the flag is cleared. A remap in the middle of a run is accepted only while LAT is paused. The `tde_external` settle steps use this. See [Remapping](Remapping). |
+| `<remap>` | The startup remap runs before the first window. A problem generator can pause LAT (`Mesh::hydro_lat_suspended`): the driver then takes plain steps of the global time step, a window of one tick, until the flag is cleared. A remap in the middle of a run is accepted only while LAT is paused. The remap module's settle steps use this. See [Remapping](Remapping). |
 | other modules | Refused ones are listed on the [main page](Local-Adaptive-Time-Stepping#what-is-supported-and-refused). |
 
 ## Known limitations
