@@ -266,7 +266,7 @@ void ParameterInput::CheckBlockNames() {
     "rad_srcterms", "hydro_srcterms", "mhd_srcterms", "particles", "turb_driving",
     "fastflow", "saha_runtime", "gravity",
     "orbital_advection", "planets", "turbulence",
-    "sink_particles", "remap"
+    "sink_particles", "remap", "tde_amr"
     };
 
   for (auto it1 = block.begin(); it1 != block.end(); ++it1) {

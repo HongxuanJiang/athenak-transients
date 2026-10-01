@@ -337,6 +337,22 @@ Refinement combines the standard density criterion with TDE-specific requests.
   happen at most about once per LAT synchronization window.
 * `mesh_refinement/max_nmb_per_rank` caps the MeshBlocks per rank and therefore the device
   memory.
+  When the cap rejects a refinement pass, the derefinements of that pass are kept and only
+  the refinements are cancelled.
+
+#### `<tde_amr>` scheme
+
+A `<tde_amr>` block replaces the BH, unbound-gas and stream-shell requests above with a
+single scheme that refines along the local density spine of the stream.  Regions
+(nozzle, post-nozzle, self-interaction, apocentre and a spine ladder that gets coarser
+with distance) set a level below `max_level`, the stream flanks sit one level below the
+spine, and only blocks that the orbital midplane touches are refined beyond
+`offplane_level`.  The scheme is opt-in, and a deck without the block runs the previous
+logic unchanged.  With the block, `<amr_criterion>` blocks must use `method = user`, and
+the `bh_max_amr`, `unbound_amr` and `stream_shell_*` keys must be removed.  Every key,
+default and region is listed in the
+[`<tde_amr>` table of `parameters.md`](parameters.md#tde_amr-stream-following-refinement).  A usage guide with examples and
+tuning advice is in [`amr.md`](amr.md).
 
 All keys are in [`parameters.md`](parameters.md#5-adaptive-mesh-refinement).
 

@@ -21,6 +21,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -44,11 +45,35 @@
 #include "pgen.hpp"
 #include "pgen/bh_dynamics.hpp"
 #include "pgen/star_bh_orbit.hpp"
+#include "pgen/tde_amr.hpp"
 #include "tde_external.hpp"
 
 namespace tde_external {
 void StoreRuntimeMetadata(ParameterInput *pin);
+
+// <tde_amr> per-block result: max over the cells of the nominal key
+// T_up*kNumRegions + region and of the relaxed T_down, reduced in one team pass.
+struct AMRBlockTargets {
+  int up_key;
+  int down;
+  KOKKOS_INLINE_FUNCTION AMRBlockTargets() : up_key(-1), down(-1) {}
+  KOKKOS_INLINE_FUNCTION
+  AMRBlockTargets &operator+=(const AMRBlockTargets &src) {
+    up_key = (src.up_key > up_key) ? src.up_key : up_key;
+    down = (src.down > down) ? src.down : down;
+    return *this;
+  }
+};
 }  // namespace tde_external
+
+namespace Kokkos {
+template <>
+struct reduction_identity<tde_external::AMRBlockTargets> {
+  KOKKOS_FORCEINLINE_FUNCTION static tde_external::AMRBlockTargets sum() {
+    return tde_external::AMRBlockTargets();
+  }
+};
+}  // namespace Kokkos
 
 namespace {
 
@@ -118,6 +143,23 @@ std::vector<Real> stream_shell_level_drs_global;
 std::vector<Real> stream_shell_level_rho_fracs_global;
 std::vector<Real> stream_shell_level_fill_fracs_global;
 
+// <tde_amr> scheme, active only when the deck has a <tde_amr> block.  It then sets every
+// refinement flag itself; without the block the legacy rules above are untouched.
+bool tde_amr_enable_global = false;
+bool tde_amr_verbose_global = false;
+tde_amr::Params tde_amr_params_global{};
+Real tde_amr_rbin_max_config_global = -1.0;  // <= 0: farthest mesh corner from the BH
+int tde_amr_sink_offset_global = -1;         // -1: no sink rule
+// Spine table and per-block results, allocated once and reused by every check.  Freed
+// by a Kokkos finalize hook, since a namespace-scope View would outlive Kokkos.
+struct TDEAMRWorkspace {
+  DvceArray1D<Real> bins_d;  // nbins_r*nbins_phi spine densities, then nbins_r ring maxes
+  HostArray1D<Real> bins_h;
+  DvceArray1D<int> up_d, down_d;
+  HostArray1D<int> up_h, down_h;
+};
+std::unique_ptr<TDEAMRWorkspace> tde_amr_ws;
+
 int bh_step_cycle_global = -1;
 Real bh_step_time_global = 0.0;
 Real bh_step_dt_global = 0.0;
@@ -179,6 +221,7 @@ struct StellarRadialProfile {
 };
 
 void RefineBHPosition(MeshBlockPack *pmbp);
+void RefineTDEAMR(MeshBlockPack *pmbp);
 void CapHydroLATFactorsNearBH(Mesh *pm, int max_factor, int *lat_factor_eachmb);
 void SyncProblemRuntimeState();
 void InvalidateFrameBHStepState();
@@ -978,6 +1021,503 @@ void RefineBHPosition(MeshBlockPack *pmbp) {
 
   refine_flag.template modify<HostMemSpace>();
   refine_flag.template sync<DevExeSpace>();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void RefineTDEAMR()
+//! \brief The <tde_amr> hook.  It alone sets refine_flag for every local block: +1 below
+//! the nominal target T_up, -1 above the relaxed target T_down, else 0.  One kernel bins
+//! the cells into the (log r, phi) spine table of the orbital plane, one allreduce makes
+//! it global, and one team kernel reduces max(T_up) and max(T_down) per block.
+
+void RefineTDEAMR(MeshBlockPack *pmbp) {
+  Mesh *pmesh = pmbp->pmesh;
+  auto &refine_flag = pmesh->pmr->refine_flag;
+  auto &size = pmbp->pmb->mb_size;
+  const int nmb = pmbp->nmb_thispack;
+  const int mbs = pmesh->gids_eachrank[global_variable::my_rank];
+  auto &indcs = pmesh->mb_indcs;
+  const int is = indcs.is, ie = indcs.ie;
+  const int js = indcs.js, je = indcs.je;
+  const int ks = indcs.ks, ke = indcs.ke;
+  const int nx1 = indcs.nx1, nx2 = indcs.nx2, nx3 = indcs.nx3;
+  const int nji = nx2*nx1;
+  const int nkji = nx3*nji;
+  const bool multi_d = pmesh->multi_d;
+  const bool three_d = pmesh->three_d;
+  const Real bhx = bh_x_global, bhy = bh_y_global, bhz = bh_z_global;
+  const Real bh_vx = bh_vx_global, bh_vy = bh_vy_global, bh_vz = bh_vz_global;
+  const Real bh_soft2 = bh_soft_global*bh_soft_global;
+
+  tde_amr::Params p = tde_amr_params_global;
+  if (tde_amr_rbin_max_config_global > 0.0) {
+    p.rbin_max = tde_amr_rbin_max_config_global;
+  } else {
+    // The farthest mesh corner from the BH bounds every distance to it.
+    const auto &ms = pmesh->mesh_size;
+    const Real ddx = std::max(std::fabs(ms.x1min - bhx), std::fabs(ms.x1max - bhx));
+    const Real ddy = std::max(std::fabs(ms.x2min - bhy), std::fabs(ms.x2max - bhy));
+    const Real ddz = std::max(std::fabs(ms.x3min - bhz), std::fabs(ms.x3max - bhz));
+    p.rbin_max = std::sqrt(ddx*ddx + ddy*ddy + ddz*ddz);
+  }
+  p.rbin_max = std::max(p.rbin_max, static_cast<Real>(2.0)*p.rbin_min);
+  p.log_rbin_min = std::log(p.rbin_min);
+  p.inv_dlog_r = static_cast<Real>(p.nbins_r)/std::log(p.rbin_max/p.rbin_min);
+
+  const int nbin = p.nbins_r*p.nbins_phi;
+  if (tde_amr_ws == nullptr) {
+    tde_amr_ws = std::make_unique<TDEAMRWorkspace>();
+    tde_amr_ws->bins_d = DvceArray1D<Real>("tde_amr_bins", nbin + p.nbins_r);
+    tde_amr_ws->bins_h = Kokkos::create_mirror_view(tde_amr_ws->bins_d);
+    Kokkos::push_finalize_hook([]() { tde_amr_ws.reset(); });
+  }
+  auto &ws = *tde_amr_ws;
+  if (static_cast<int>(ws.up_d.extent(0)) < std::max(1, nmb)) {
+    // Grow-only, with headroom so a slowly growing mesh does not reallocate every check.
+    const int nalloc = std::max(1, nmb + nmb/4);
+    ws.up_d = DvceArray1D<int>("tde_amr_block_up", nalloc);
+    ws.down_d = DvceArray1D<int>("tde_amr_block_down", nalloc);
+    ws.up_h = Kokkos::create_mirror_view(ws.up_d);
+    ws.down_h = Kokkos::create_mirror_view(ws.down_d);
+  }
+
+  // Spine table: max density over every cell above rho_min of each bin, off-plane
+  // cells included.  Reset on the host and copied up, so the check stays at two kernels.
+  auto bins_ = ws.bins_d;
+  for (int n = 0; n < nbin; ++n) ws.bins_h(n) = -1.0;
+  Kokkos::deep_copy(ws.bins_d, ws.bins_h);
+  auto &w0_ = pmbp->phydro->w0;
+  if (nmb > 0) {
+    par_for("tde_amr_spine_bins", DevExeSpace(), 0, nmb - 1, ks, ke, js, je, is, ie,
+    KOKKOS_LAMBDA(int m, int k, int j, int i) {
+      const Real rho = w0_(m, IDN, k, j, i);
+      if (!(rho > p.rho_min)) return;
+      const Real x = CellCenterX(i - is, nx1, size.d_view(m).x1min, size.d_view(m).x1max);
+      const Real y = CellCenterX(j - js, nx2, size.d_view(m).x2min, size.d_view(m).x2max);
+      const Real z = CellCenterX(k - ks, nx3, size.d_view(m).x3min, size.d_view(m).x3max);
+      const int ib = tde_amr::BinIndex(p, x - bhx, y - bhy, z - bhz);
+      if (ib < 0) return;
+      // The plain read only skips an atomic that could not raise the entry.
+      if (rho > bins_(ib)) Kokkos::atomic_max(&bins_(ib), rho);
+    });
+  }
+  Kokkos::deep_copy(ws.bins_h, ws.bins_d);
+#if MPI_PARALLEL_ENABLED
+  MPI_Allreduce(MPI_IN_PLACE, ws.bins_h.data(), nbin, MPI_ATHENA_REAL, MPI_MAX,
+                MPI_COMM_WORLD);
+#endif
+  // Ring maxima over phi for the strand gate.
+  for (int ir = 0; ir < p.nbins_r; ++ir) {
+    Real rmax = -1.0;
+    for (int ip = 0; ip < p.nbins_phi; ++ip) {
+      rmax = std::max(rmax, ws.bins_h(ir*p.nbins_phi + ip));
+    }
+    ws.bins_h(nbin + ir) = rmax;
+  }
+  Kokkos::deep_copy(ws.bins_d, ws.bins_h);
+
+  if (nmb > 0) {
+    auto up_ = ws.up_d;
+    auto down_ = ws.down_d;
+    const int nphi = p.nbins_phi;
+    Kokkos::parallel_for("tde_amr_block_targets",
+    Kokkos::TeamPolicy<>(DevExeSpace(), nmb, Kokkos::AUTO),
+    KOKKOS_LAMBDA(TeamMember_t tmember) {
+      const int m = tmember.league_rank();
+      // Block-level midplane eligibility, for the nominal and the relaxed evaluation.
+      const auto &bs = size.d_view(m);
+      const bool band_up = tde_amr::BlockInBand(p, bs.x1min - bhx, bs.x1max - bhx,
+          bs.x2min - bhy, bs.x2max - bhy, bs.x3min - bhz, bs.x3max - bhz, false);
+      const bool band_down = tde_amr::BlockInBand(p, bs.x1min - bhx, bs.x1max - bhx,
+          bs.x2min - bhy, bs.x2max - bhy, bs.x3min - bhz, bs.x3max - bhz, true);
+      tde_external::AMRBlockTargets bt;
+      Kokkos::parallel_reduce(Kokkos::TeamThreadRange(tmember, nkji),
+      [=](const int idx, tde_external::AMRBlockTargets &acc) {
+        const int kk = idx/nji;
+        const int jj = (idx - kk*nji)/nx1;
+        const int ii = idx - kk*nji - jj*nx1;
+        const int k = kk + ks, j = jj + js, i = ii + is;
+        const Real x = CellCenterX(ii, nx1, size.d_view(m).x1min, size.d_view(m).x1max);
+        const Real y = CellCenterX(jj, nx2, size.d_view(m).x2min, size.d_view(m).x2max);
+        const Real z = CellCenterX(kk, nx3, size.d_view(m).x3min, size.d_view(m).x3max);
+        const Real dx = x - bhx, dy = y - bhy, dz = z - bhz;
+        tde_amr::Cell c;
+        c.rho = w0_(m, IDN, k, j, i);
+        c.rho_ref = -1.0;
+        c.ring_max = 0.0;
+        c.r = Kokkos::sqrt(dx*dx + dy*dy + dz*dz);
+        c.vr = 0.0;
+        c.div_v = 0.0;
+        c.eps = 0.0;
+        c.j2 = 0.0;
+        if (c.rho > p.rho_min) {
+          const int ib = tde_amr::BinIndex(p, dx, dy, dz);
+          if (ib >= 0) {
+            c.rho_ref = bins_(ib);
+            c.ring_max = bins_(nbin + ib/nphi);
+          }
+        }
+        if (c.rho_ref > 0.0) {
+          // Stream cell: orbit relative to the BH (same softened potential as the
+          // unbound rule) and div v by central differences over the ghost-filled w0.
+          const Real dvx = w0_(m, IVX, k, j, i) - bh_vx;
+          const Real dvy = w0_(m, IVY, k, j, i) - bh_vy;
+          const Real dvz = w0_(m, IVZ, k, j, i) - bh_vz;
+          c.vr = (dx*dvx + dy*dvy + dz*dvz)/Kokkos::fmax(c.r, static_cast<Real>(1.0e-30));
+          c.eps = 0.5*(dvx*dvx + dvy*dvy + dvz*dvz) -
+                  p.gm/Kokkos::sqrt(c.r*c.r + bh_soft2);
+          const Real jx = dy*dvz - dz*dvy;
+          const Real jy = dz*dvx - dx*dvz;
+          const Real jz = dx*dvy - dy*dvx;
+          c.j2 = jx*jx + jy*jy + jz*jz;
+          Real div = (w0_(m, IVX, k, j, i+1) - w0_(m, IVX, k, j, i-1))/
+                     (2.0*size.d_view(m).dx1);
+          if (multi_d) {
+            div += (w0_(m, IVY, k, j+1, i) - w0_(m, IVY, k, j-1, i))/
+                   (2.0*size.d_view(m).dx2);
+          }
+          if (three_d) {
+            div += (w0_(m, IVZ, k+1, j, i) - w0_(m, IVZ, k-1, j, i))/
+                   (2.0*size.d_view(m).dx3);
+          }
+          c.div_v = div;
+        }
+        int reg_up = 0, reg_down = 0;
+        tde_external::AMRBlockTargets v;
+        const int t_up = tde_amr::CellTarget(p, c, false, band_up, reg_up);
+        v.up_key = t_up*tde_amr::kNumRegions + reg_up;
+        v.down = tde_amr::CellTarget(p, c, true, band_down, reg_down);
+        acc += v;
+      }, Kokkos::Sum<tde_external::AMRBlockTargets>(bt));
+      Kokkos::single(Kokkos::PerTeam(tmember), [&]() {
+        up_(m) = bt.up_key;
+        down_(m) = bt.down;
+      });
+    });
+    Kokkos::deep_copy(ws.up_h, ws.up_d);
+    Kokkos::deep_copy(ws.down_h, ws.down_d);
+  }
+
+  // Flags, with the block-level sink rule.
+  const bool sink_on = (tde_amr_sink_offset_global >= 0);
+  const int sink_level = std::max(p.background_level,
+                                  pmesh->max_level - tde_amr_sink_offset_global);
+  const Real sink_r = bh_inner_boundary_global ? bh_excise_radius_global : 0.0;
+  auto distance_to_interval = [](const Real xx, const Real xmin, const Real xmax) {
+    if (xx < xmin) return xmin - xx;
+    if (xx > xmax) return xx - xmax;
+    return static_cast<Real>(0.0);
+  };
+  const int nlev = pmesh->max_level - pmesh->root_level + 1;
+  std::vector<int> diag(nlev + tde_amr::kNumRegions + 2, 0);
+  refine_flag.template sync<HostMemSpace>();
+  for (int m = 0; m < nmb; ++m) {
+    const int gid = mbs + m;
+    const int level = pmesh->lloc_eachmb[gid].level;
+    int t_up = ws.up_h(m)/tde_amr::kNumRegions;
+    int region = ws.up_h(m) % tde_amr::kNumRegions;
+    int t_down = ws.down_h(m);
+    if (sink_on) {
+      const auto &bs = size.h_view(m);
+      const Real ex = distance_to_interval(bhx, bs.x1min, bs.x1max);
+      const Real ey = distance_to_interval(bhy, bs.x2min, bs.x2max);
+      const Real ez = distance_to_interval(bhz, bs.x3min, bs.x3max);
+      if (ex*ex + ey*ey + ez*ez <= sink_r*sink_r) {
+        if (sink_level > t_up) {
+          t_up = sink_level;
+          region = tde_amr::kSink;
+        }
+        t_down = std::max(t_down, sink_level);
+      }
+    }
+    const int flag = tde_amr::BlockFlag(level, t_up, t_down);
+    refine_flag.h_view(gid) = flag;
+    ++diag[level - pmesh->root_level];
+    ++diag[nlev + region];
+    if (flag > 0) ++diag[nlev + tde_amr::kNumRegions];
+    if (flag < 0) ++diag[nlev + tde_amr::kNumRegions + 1];
+  }
+  refine_flag.template modify<HostMemSpace>();
+  refine_flag.template sync<DevExeSpace>();
+
+  if (tde_amr_verbose_global) {
+#if MPI_PARALLEL_ENABLED
+    if (global_variable::my_rank == 0) {
+      MPI_Reduce(MPI_IN_PLACE, diag.data(), static_cast<int>(diag.size()), MPI_INT,
+                 MPI_SUM, 0, MPI_COMM_WORLD);
+    } else {
+      MPI_Reduce(diag.data(), nullptr, static_cast<int>(diag.size()), MPI_INT, MPI_SUM, 0,
+                 MPI_COMM_WORLD);
+    }
+#endif
+    if (global_variable::my_rank == 0) {
+      static const char *region_names[tde_amr::kNumRegions] = {
+          "background", "offplane", "spine", "apocentre", "crossing", "post_nozzle",
+          "nozzle", "core_star", "sink"};
+      std::cout << "tde_amr: cycle=" << pmesh->ncycle << " time=" << pmesh->time
+                << " blocks/level";
+      for (int l = 0; l < nlev; ++l) std::cout << " " << l << ":" << diag[l];
+      std::cout << " | regions";
+      for (int g = 0; g < tde_amr::kNumRegions; ++g) {
+        if (diag[nlev + g] > 0) {
+          std::cout << " " << region_names[g] << ":" << diag[nlev + g];
+        }
+      }
+      std::cout << " | flags +1:" << diag[nlev + tde_amr::kNumRegions]
+                << " -1:" << diag[nlev + tde_amr::kNumRegions + 1] << std::endl;
+    }
+  }
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void ConfigureTDEAMR()
+//! \brief Reads and validates the <tde_amr> block, if present, and prints its banner.
+//! r_peri is the pgen's r_t/beta; (sx,sy,sz) and (svx,svy,svz) are the initial star
+//! position and velocity relative to the BH, whose cross product is the orbit normal.
+
+void ConfigureTDEAMR(ParameterInput *pin, Mesh *pm, const Real r_peri,
+                     const Real theta_bh, const Real sx, const Real sy, const Real sz,
+                     const Real svx, const Real svy, const Real svz) {
+  tde_amr_enable_global = pin->DoesBlockExist("tde_amr");
+  if (!tde_amr_enable_global) return;
+  auto fatal = [](const std::string &msg) {
+    std::cout << "### FATAL ERROR in ProblemGenerator::TDEExternal" << std::endl
+              << msg << std::endl;
+    std::exit(EXIT_FAILURE);
+  };
+  if (!pm->adaptive || pm->pmr == nullptr) {
+    fatal("<tde_amr> requires <mesh_refinement>/refinement = adaptive.");
+  }
+  // Single authority: the hook writes every flag, so no generic criterion may run
+  // alongside it, and at least one method = user block must call it.
+  bool has_user = false;
+  for (auto &blk : pin->block) {
+    if (blk.block_name.compare(0, 13, "amr_criterion") != 0) continue;
+    const std::string method = pin->GetString(blk.block_name, "method");
+    if (method == "user") {
+      has_user = true;
+    } else {
+      fatal("<tde_amr> sets every refinement flag itself: remove <" + blk.block_name +
+            "> (method = " + method + "), keeping only method = user criteria.");
+    }
+  }
+  if (!has_user) fatal("<tde_amr> needs an <amr_criterion0> block with method = user.");
+  if (bh_force_refine_global || unbound_refine_global || stream_shell_enable_global) {
+    fatal("<tde_amr> replaces problem/bh_max_amr, problem/unbound_amr and "
+          "problem/stream_shell_*: remove them from the deck.");
+  }
+
+  const std::string b = "tde_amr";
+  const int max_phys = pm->max_level - pm->root_level;
+  tde_amr::Params p{};
+  p.max_level = pm->max_level;
+  tde_amr_verbose_global = pin->GetOrAddBoolean(b, "verbose", false);
+
+  p.nbins_r = pin->GetOrAddInteger(b, "nbins_r", 128);
+  p.nbins_phi = pin->GetOrAddInteger(b, "nbins_phi", 64);
+  if (p.nbins_r < 1 || p.nbins_phi < 1 ||
+      static_cast<long long>(p.nbins_r)*p.nbins_phi > (1LL << 24)) {
+    fatal("tde_amr/nbins_r and nbins_phi must be >= 1 with at most 2^24 bins.");
+  }
+  // The innermost ring holds every r < r_bin_min: log bins much smaller than a cell
+  // would make each diffuse cell the maximum of its own bin.
+  p.rbin_min = pin->GetOrAddReal(b, "r_bin_min", r_peri);
+  tde_amr_rbin_max_config_global = pin->GetOrAddReal(b, "r_bin_max", -1.0);
+  if (!(p.rbin_min > 0.0)) fatal("tde_amr/r_bin_min must be > 0.");
+  if (tde_amr_rbin_max_config_global > 0.0 &&
+      tde_amr_rbin_max_config_global <= p.rbin_min) {
+    fatal("tde_amr/r_bin_max must be > r_bin_min, or <= 0 for the farthest mesh corner.");
+  }
+  p.strand_frac = pin->GetOrAddReal(b, "strand_frac", 1.0e-2);
+  if (!(p.strand_frac >= 0.0 && p.strand_frac <= 1.0)) {
+    fatal("tde_amr/strand_frac must be in [0, 1].");
+  }
+  p.rho_min = pin->GetOrAddReal(
+      b, "rho_min", 100.0*std::max(hydro_dfloor_global, static_cast<Real>(0.0)));
+  if (!(p.rho_min >= 0.0)) fatal("tde_amr/rho_min must be >= 0.");
+  p.hysteresis = pin->GetOrAddReal(b, "hysteresis", 2.0);
+  p.radius_hysteresis = pin->GetOrAddReal(b, "radius_hysteresis", 1.25);
+  if (!(p.hysteresis >= 1.0) || !(p.radius_hysteresis >= 1.0)) {
+    fatal("tde_amr/hysteresis and radius_hysteresis must be >= 1.");
+  }
+  p.spine_frac = pin->GetOrAddReal(b, "spine_frac", 0.5);
+  if (!(p.spine_frac > 0.0 && p.spine_frac <= 1.0)) {
+    fatal("tde_amr/spine_frac must satisfy 0 < value <= 1.");
+  }
+  p.envelope_factor = pin->GetOrAddReal(b, "envelope_factor", 10.0);
+  p.envelope_levels = pin->GetOrAddInteger(b, "envelope_levels", 1);
+  if (!(p.envelope_factor > 1.0) || p.envelope_levels < 0) {
+    fatal("tde_amr/envelope_factor must be > 1 and envelope_levels >= 0.");
+  }
+
+  p.nozzle_radius = pin->GetOrAddReal(b, "nozzle_radius", 2.0*r_peri);
+  p.post_nozzle_radius = pin->GetOrAddReal(b, "post_nozzle_radius", 5.0*r_peri);
+  if (!(p.nozzle_radius > 0.0) || !(p.post_nozzle_radius >= p.nozzle_radius)) {
+    fatal("tde_amr/nozzle_radius must be > 0 and post_nozzle_radius >= nozzle_radius.");
+  }
+  p.nozzle_offset = pin->GetOrAddInteger(b, "nozzle_offset", 0);
+  p.post_nozzle_offset = pin->GetOrAddInteger(b, "post_nozzle_offset", 1);
+  p.crossing_div = pin->GetOrAddReal(b, "crossing_div", 3.0);
+  // The Omega_K scaling makes any compression of the far stream tip look like a crossing,
+  // so the self-interaction region stops at crossing_r_max.
+  p.crossing_r_max = pin->GetOrAddReal(b, "crossing_r_max", 20.0*r_peri);
+  p.crossing_offset = pin->GetOrAddInteger(b, "crossing_offset", 1);
+  p.apocentre_frac = pin->GetOrAddReal(b, "apocentre_frac", 0.8);
+  p.apocentre_boost = pin->GetOrAddInteger(b, "apocentre_boost", 1);
+  p.spine_offset = pin->GetOrAddInteger(b, "spine_offset", 1);
+  p.spine_r_per_level = pin->GetOrAddReal(b, "spine_r_per_level", 2.0);
+  p.spine_offset_max = pin->GetOrAddInteger(b, "spine_offset_max", 1000);
+  if (p.nozzle_offset < 0 || p.post_nozzle_offset < 0 || p.crossing_offset < 0 ||
+      p.apocentre_boost < 0 || p.spine_offset < 0) {
+    fatal("tde_amr/*_offset and apocentre_boost must be >= 0.");
+  }
+  if (!(p.crossing_div > 0.0) || !(p.crossing_r_max > 0.0)) {
+    fatal("tde_amr/crossing_div and crossing_r_max must be > 0.");
+  }
+  if (!(p.apocentre_frac > 0.0)) fatal("tde_amr/apocentre_frac must be > 0.");
+  if (!(p.spine_r_per_level > 1.0) || p.spine_offset_max < p.spine_offset) {
+    fatal("tde_amr/spine_r_per_level must be > 1 and spine_offset_max >= spine_offset.");
+  }
+
+  const int background_phys = pin->GetOrAddInteger(b, "background_level", 0);
+  if (background_phys < 0 || background_phys > max_phys) {
+    fatal("tde_amr/background_level must be between 0 and " + std::to_string(max_phys) +
+          ".");
+  }
+  p.background_level = pm->root_level + background_phys;
+
+  p.core_enable = pin->DoesParameterExist(b, "core_rho");
+  if (p.core_enable) {
+    p.core_rho = pin->GetReal(b, "core_rho");
+    p.core_rho_deref = pin->GetOrAddReal(b, "core_rho_deref", p.core_rho/p.hysteresis);
+    p.core_offset = pin->GetOrAddInteger(b, "core_offset", 0);
+    if (!(p.core_rho > 0.0) || !(p.core_rho_deref > 0.0 && p.core_rho_deref <= p.core_rho)
+        || p.core_offset < 0) {
+      fatal("tde_amr/core_rho must be > 0, 0 < core_rho_deref <= core_rho and "
+            "core_offset >= 0.");
+    }
+  } else if (pin->DoesParameterExist(b, "core_rho_deref") ||
+             pin->DoesParameterExist(b, "core_offset")) {
+    fatal("tde_amr/core_rho_deref and core_offset need tde_amr/core_rho.");
+  }
+  tde_amr_sink_offset_global = pin->GetOrAddInteger(b, "sink_offset", -1);
+  if (tde_amr_sink_offset_global < -1) {
+    fatal("tde_amr/sink_offset must be >= 0, or -1 for no sink rule.");
+  }
+
+  // Only blocks that the orbital plane through the BH passes through refine above
+  // offplane_level by default; midplane_hmin and midplane_angle_deg widen the band.
+  p.midplane_only = pin->GetOrAddBoolean(b, "midplane_only", true);
+  const Real midplane_angle = pin->GetOrAddReal(b, "midplane_angle_deg", 0.0);
+  p.midplane_hmin = pin->GetOrAddReal(b, "midplane_hmin", 0.0);
+  const int offplane_phys = pin->GetOrAddInteger(b, "offplane_level", background_phys);
+  if (!(midplane_angle >= 0.0 && midplane_angle < 90.0) || !(p.midplane_hmin >= 0.0)) {
+    fatal("tde_amr/midplane_angle_deg must be in [0, 90) and midplane_hmin >= 0.");
+  }
+  if (offplane_phys < background_phys || offplane_phys > max_phys) {
+    fatal("tde_amr/offplane_level must be between background_level and " +
+          std::to_string(max_phys) + ".");
+  }
+  p.midplane_tan = std::tan(DegToRad(midplane_angle));
+  p.offplane_level = pm->root_level + offplane_phys;
+  {
+    // One finest cell: the relaxed band never gets thinner, so a plane lying on a block
+    // face keeps the blocks on both sides.
+    Real dmin = pm->mesh_size.dx1;
+    if (pm->multi_d) dmin = std::min(dmin, pm->mesh_size.dx2);
+    if (pm->three_d) dmin = std::min(dmin, pm->mesh_size.dx3);
+    p.band_floor = dmin/static_cast<Real>(1 << max_phys);
+  }
+  p.gm = newton_g_global*bh_mass_global;
+
+  // Orbital plane through the BH.  The normal is the initial orbit's r x v, which is
+  // the rotated z axis (sin theta_bh, 0, cos theta_bh) for the built-in orbits and
+  // follows provide_params otherwise; e1 is the rotated x axis projected into the plane.
+  Real nx = sy*svz - sz*svy, ny = sz*svx - sx*svz, nz = sx*svy - sy*svx;
+  Real nn = std::sqrt(nx*nx + ny*ny + nz*nz);
+  const Real rv = std::sqrt(sx*sx + sy*sy + sz*sz)*std::sqrt(svx*svx + svy*svy + svz*svz);
+  if (!(nn > 1.0e-12*rv) || !(nn > 0.0)) {
+    nx = std::sin(theta_bh);
+    ny = 0.0;
+    nz = std::cos(theta_bh);
+    nn = 1.0;
+  }
+  nx /= nn; ny /= nn; nz /= nn;
+  Real ax = std::cos(theta_bh), ay = 0.0, az = -std::sin(theta_bh);
+  Real an = ax*nx + ay*ny + az*nz;
+  ax -= an*nx; ay -= an*ny; az -= an*nz;
+  Real al = std::sqrt(ax*ax + ay*ay + az*az);
+  if (!(al > 1.0e-6)) {
+    ax = 0.0; ay = 1.0; az = 0.0;
+    an = ny;
+    ax -= an*nx; ay -= an*ny; az -= an*nz;
+    al = std::sqrt(ax*ax + ay*ay + az*az);
+  }
+  p.nx = nx; p.ny = ny; p.nz = nz;
+  p.e1x = ax/al; p.e1y = ay/al; p.e1z = az/al;
+  p.e2x = p.ny*p.e1z - p.nz*p.e1y;
+  p.e2y = p.nz*p.e1x - p.nx*p.e1z;
+  p.e2z = p.nx*p.e1y - p.ny*p.e1x;
+  tde_amr_params_global = p;
+
+  if (global_variable::my_rank == 0) {
+    auto lev = [&](const int offset) {
+      return std::to_string(std::max(p.background_level, p.max_level - offset) -
+                            pm->root_level) + " (max_level - " + std::to_string(offset) +
+             ")";
+    };
+    std::cout << std::endl << "--- TDE AMR <tde_amr> ---" << std::endl
+      << "authority              = tde_amr hook sets every refine flag" << std::endl
+      << "max / background level = " << max_phys << " / " << background_phys << std::endl
+      << "spine table            = " << p.nbins_r << " (log r) x " << p.nbins_phi
+      << " (phi), r in [" << p.rbin_min << ", ";
+    if (tde_amr_rbin_max_config_global > 0.0) {
+      std::cout << tde_amr_rbin_max_config_global;
+    } else {
+      std::cout << "farthest mesh corner";
+    }
+    std::cout << ")" << std::endl
+      << "orbital plane normal   = (" << p.nx << ", " << p.ny << ", " << p.nz << ")"
+      << std::endl
+      << "rho_min                = " << p.rho_min << std::endl
+      << "strand_frac            = " << p.strand_frac << std::endl
+      << "core / envelope        = q >= " << p.spine_frac << " / one level per factor "
+      << p.envelope_factor << " below, " << p.envelope_levels << " level(s)" << std::endl
+      << "nozzle                 = r < " << p.nozzle_radius << ", level "
+      << lev(p.nozzle_offset) << std::endl
+      << "post-nozzle            = r < " << p.post_nozzle_radius << ", v_r > 0, level "
+      << lev(p.post_nozzle_offset) << std::endl
+      << "self-interaction       = -div v >= " << p.crossing_div << " Omega_K, r < "
+      << p.crossing_r_max << ", level "
+      << lev(p.crossing_offset) << std::endl
+      << "apocentre              = r >= " << p.apocentre_frac << " r_apo, ladder level + "
+      << p.apocentre_boost << std::endl
+      << "spine ladder           = offset " << p.spine_offset << " + 1 per factor "
+      << p.spine_r_per_level << " in r/nozzle_radius, max " << p.spine_offset_max
+      << std::endl
+      << "core star              = ";
+    if (p.core_enable) {
+      std::cout << "rho >= " << p.core_rho << " (kept to " << p.core_rho_deref
+                << "), level " << lev(p.core_offset) << std::endl;
+    } else {
+      std::cout << "off" << std::endl;
+    }
+    std::cout << "sink                   = ";
+    if (tde_amr_sink_offset_global >= 0) {
+      std::cout << "level " << lev(tde_amr_sink_offset_global) << std::endl;
+    } else {
+      std::cout << "off" << std::endl;
+    }
+    std::cout << "midplane_only          = " << (p.midplane_only ? "true" : "false")
+      << ", blocks meeting |h| <= max(" << p.midplane_hmin << ", tan(" << midplane_angle
+      << " deg) R) (T_down: x radius_hysteresis, >= " << p.band_floor
+      << "), others <= level " << offplane_phys << std::endl
+      << "hysteresis             = " << p.hysteresis
+      << " (density ratios, strand gate, crossing_div), radius "
+      << p.radius_hysteresis << " (radii, midplane band)" << std::endl
+      << "verbose                = " << (tde_amr_verbose_global ? "true" : "false")
+      << std::endl << std::endl;
+  }
 }
 
 void CapHydroLATFactorsNearBH(Mesh *pm, int max_factor, int *lat_factor_eachmb) {
@@ -3606,6 +4146,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
   auto eos = pmbp->phydro->peos->eos_data;
   hydro_dfloor_global = eos.dfloor;
+  ConfigureTDEAMR(pin, pmy_mesh_, r_peri, DegToRad(theta_bh_deg), star_x, star_y, star_z,
+                  star_vx, star_vy, star_vz);
+  if (tde_amr_enable_global) {
+    user_ref_func = RefineTDEAMR;
+  }
   stream_shell_rho_floor_global = std::max(rho_floor, eos.dfloor);
   if (unbound_refine_rho_min_global < 0.0) {
     unbound_refine_rho_min_global =
@@ -3998,46 +4543,52 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       << "BH grav rho min        = " << bh_grav_rho_min_global << std::endl
       << "BH inner boundary      = " << (bh_inner_boundary_global ? "true" : "false")
       << std::endl
-      << "BH excise radius       = " << bh_excise_radius_global << std::endl
-      << "BH force refine        = " << (bh_force_refine_global ? "true" : "false")
-      << std::endl
-      << "BH refine target level = "
-      << std::max(pmy_mesh_->root_level,
-                  pmy_mesh_->max_level - bh_force_refine_level_offset_global)
-      << " (max_level - " << bh_force_refine_level_offset_global << ")"
-      << std::endl
-      << "Unbound AMR            = " << (unbound_refine_global ? "true" : "false")
-      << std::endl
-      << "Unbound refine level   = "
-      << std::max(pmy_mesh_->root_level,
-                  pmy_mesh_->max_level - unbound_refine_level_offset_global)
-      << " (max_level - " << unbound_refine_level_offset_global << ")"
-      << std::endl
-      << "Unbound rho min        = " << unbound_refine_rho_min_global
-      << std::endl
-      << "Unbound fill frac      = " << unbound_refine_fill_frac_global
-      << std::endl
-      << "Stream shell AMR       = " << (stream_shell_enable_global ? "true" : "false")
-      << std::endl
-      << "Stream shell base lvl  = "
-      << std::max(pmy_mesh_->root_level,
-                  pmy_mesh_->max_level - stream_shell_level_offset_global)
-      << " (max_level - " << stream_shell_level_offset_global << ")"
-      << std::endl
-      << "Stream shell base dr   = " << stream_shell_dr_global << std::endl
-      << "Stream shell r_max     = " << stream_shell_r_max_global << std::endl
-      << "Stream x-split r       = " << stream_shell_xsplit_radius_global
-      << " (inside: separate left/right shell peaks relative to the BH)"
-      << std::endl
-      << "Stream shell rho frac  = " << stream_shell_rho_frac_global
-      << std::endl
-      << "Stream shell fill frac = " << stream_shell_fill_frac_global
-      << " (minimum block coverage away from the shell peak;"
-      << " inner split region refines on direct hits)"
-      << std::endl
-      << "Stream derefine floor  = "
-      << stream_shell_derefine_dfloor_mult_global << " * dfloor"
-      << std::endl
+      << "BH excise radius       = " << bh_excise_radius_global << std::endl;
+    if (tde_amr_enable_global) {
+      std::cout << "AMR scheme             = <tde_amr> (see its banner)" << std::endl;
+    } else {
+      std::cout
+        << "BH force refine        = " << (bh_force_refine_global ? "true" : "false")
+        << std::endl
+        << "BH refine target level = "
+        << std::max(pmy_mesh_->root_level,
+                    pmy_mesh_->max_level - bh_force_refine_level_offset_global)
+        << " (max_level - " << bh_force_refine_level_offset_global << ")"
+        << std::endl
+        << "Unbound AMR            = " << (unbound_refine_global ? "true" : "false")
+        << std::endl
+        << "Unbound refine level   = "
+        << std::max(pmy_mesh_->root_level,
+                    pmy_mesh_->max_level - unbound_refine_level_offset_global)
+        << " (max_level - " << unbound_refine_level_offset_global << ")"
+        << std::endl
+        << "Unbound rho min        = " << unbound_refine_rho_min_global
+        << std::endl
+        << "Unbound fill frac      = " << unbound_refine_fill_frac_global
+        << std::endl
+        << "Stream shell AMR       = " << (stream_shell_enable_global ? "true" : "false")
+        << std::endl
+        << "Stream shell base lvl  = "
+        << std::max(pmy_mesh_->root_level,
+                    pmy_mesh_->max_level - stream_shell_level_offset_global)
+        << " (max_level - " << stream_shell_level_offset_global << ")"
+        << std::endl
+        << "Stream shell base dr   = " << stream_shell_dr_global << std::endl
+        << "Stream shell r_max     = " << stream_shell_r_max_global << std::endl
+        << "Stream x-split r       = " << stream_shell_xsplit_radius_global
+        << " (inside: separate left/right shell peaks relative to the BH)"
+        << std::endl
+        << "Stream shell rho frac  = " << stream_shell_rho_frac_global
+        << std::endl
+        << "Stream shell fill frac = " << stream_shell_fill_frac_global
+        << " (minimum block coverage away from the shell peak;"
+        << " inner split region refines on direct hits)"
+        << std::endl
+        << "Stream derefine floor  = "
+        << stream_shell_derefine_dfloor_mult_global << " * dfloor"
+        << std::endl;
+    }
+    std::cout
       << "BH frame note          = "
       << (use_translating_frame_global
               ? "fixed inertial BH, continuous translating frame"

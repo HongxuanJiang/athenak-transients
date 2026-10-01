@@ -1019,57 +1019,59 @@ void MeshRefinement::AdaptiveMeshRefinement(Driver *pdriver, ParameterInput *pin
   int nnew = 0, ndel = 0;
   UpdateMeshBlockTree(nnew, ndel);
 
+  // A closure over the memory cap cancels the refinements of this pass but keeps its
+  // derefinements.  A refinement can only block a derefinement (MeshBlockTree::Derefine
+  // refuses a parent next to a block two levels finer), never enable one, so the tree is
+  // rebuilt and the derefinements re-derived on it by a second UpdateMeshBlockTree(),
+  // which applies the level-jump check afresh.  Only a mesh already over the cap, where
+  // derefinement alone cannot bring it under, still cancels the whole pass.
   if ((nnew != 0 || ndel != 0) && pmy_mesh->nmb_maxperrank > 0) {
     const int hard_cap = pmy_mesh->nmb_maxperrank * std::max(1, global_variable::nranks);
-    int actual_nmb = 0;
-    pmy_mesh->ptree->CountMeshBlocks(actual_nmb);
-    if (actual_nmb > hard_cap) {
+    auto closure_nmb = [&]() {
+      int actual_nmb = 0;
+      pmy_mesh->ptree->CountMeshBlocks(actual_nmb);
+      return std::max(actual_nmb, pmy_mesh->nmb_total + nnew - ndel);
+    };
+    auto restore_tree = [&]() {
+      pmy_mesh->ptree = std::make_unique<MeshBlockTree>(pmy_mesh);
+      pmy_mesh->ptree->CreateRootGrid();
+      for (int gid=0; gid<pmy_mesh->nmb_total; ++gid) {
+        pmy_mesh->ptree->AddNodeWithoutRefinement(pmy_mesh->lloc_eachmb[gid]);
+      }
+      for (int gid=0; gid<pmy_mesh->nmb_total; ++gid) {
+        pmy_mesh->ptree->SetLeafGID(pmy_mesh->lloc_eachmb[gid], gid);
+      }
+      nnew = 0;
+      ndel = 0;
+    };
+    const int rejected_nmb = closure_nmb();
+    if (rejected_nmb > hard_cap) {
+      restore_tree();
+      for (int gid=0; gid<pmy_mesh->nmb_total; ++gid) {
+        if (refine_flag.h_view(gid) > 0) refine_flag.h_view(gid) = 0;
+      }
+      refine_flag.template modify<HostMemSpace>();
+      refine_flag.template sync<DevExeSpace>();
+      UpdateMeshBlockTree(nnew, ndel);
+      const bool cancel_all = (closure_nmb() > hard_cap);
+      if (cancel_all) {
+        restore_tree();
+        for (int gid=0; gid<pmy_mesh->nmb_total; ++gid) {
+          refine_flag.h_view(gid) = 0;
+        }
+        refine_flag.template modify<HostMemSpace>();
+        refine_flag.template sync<DevExeSpace>();
+      }
       if (global_variable::my_rank == 0) {
         std::cout << "MeshRefinement: AMR memory cap rejected tree closure with "
-                  << actual_nmb << " MeshBlocks > cap " << hard_cap
-                  << "; canceling this refinement pass" << std::endl;
+                  << rejected_nmb << " MeshBlocks > cap " << hard_cap;
+        if (cancel_all) {
+          std::cout << "; canceling this refinement pass" << std::endl;
+        } else {
+          std::cout << "; canceling its refinements, keeping its derefinements ("
+                    << ndel << " MeshBlocks removed)" << std::endl;
+        }
       }
-      pmy_mesh->ptree = std::make_unique<MeshBlockTree>(pmy_mesh);
-      pmy_mesh->ptree->CreateRootGrid();
-      for (int gid=0; gid<pmy_mesh->nmb_total; ++gid) {
-        pmy_mesh->ptree->AddNodeWithoutRefinement(pmy_mesh->lloc_eachmb[gid]);
-      }
-      for (int gid=0; gid<pmy_mesh->nmb_total; ++gid) {
-        pmy_mesh->ptree->SetLeafGID(pmy_mesh->lloc_eachmb[gid], gid);
-      }
-      for (int gid=0; gid<pmy_mesh->nmb_total; ++gid) {
-        refine_flag.h_view(gid) = 0;
-      }
-      refine_flag.template modify<HostMemSpace>();
-      refine_flag.template sync<DevExeSpace>();
-      nnew = 0;
-      ndel = 0;
-    }
-  }
-  if ((nnew != 0 || ndel != 0) && pmy_mesh->nmb_maxperrank > 0) {
-    const int hard_cap = pmy_mesh->nmb_maxperrank * std::max(1, global_variable::nranks);
-    const int projected_nmb = pmy_mesh->nmb_total + nnew - ndel;
-    if (projected_nmb > hard_cap) {
-      if (global_variable::my_rank == 0) {
-        std::cout << "MeshRefinement: AMR memory cap rejected realized closure with "
-                  << projected_nmb << " MeshBlocks > cap " << hard_cap
-                  << "; canceling this refinement pass" << std::endl;
-      }
-      pmy_mesh->ptree = std::make_unique<MeshBlockTree>(pmy_mesh);
-      pmy_mesh->ptree->CreateRootGrid();
-      for (int gid=0; gid<pmy_mesh->nmb_total; ++gid) {
-        pmy_mesh->ptree->AddNodeWithoutRefinement(pmy_mesh->lloc_eachmb[gid]);
-      }
-      for (int gid=0; gid<pmy_mesh->nmb_total; ++gid) {
-        pmy_mesh->ptree->SetLeafGID(pmy_mesh->lloc_eachmb[gid], gid);
-      }
-      for (int gid=0; gid<pmy_mesh->nmb_total; ++gid) {
-        refine_flag.h_view(gid) = 0;
-      }
-      refine_flag.template modify<HostMemSpace>();
-      refine_flag.template sync<DevExeSpace>();
-      nnew = 0;
-      ndel = 0;
     }
   }
 

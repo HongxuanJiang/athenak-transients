@@ -133,6 +133,8 @@ analysis scripts read it from there (see
 The keys below add TDE-specific refinement requests on top of the standard AMR
 criteria.  The generator installs its user refinement function whenever `bh_max_amr`,
 `unbound_amr`, or any `stream_shell_*` key is active (`src/pgen/tde_external.cpp`).
+The separate [`<tde_amr>` scheme](#tde_amr-stream-following-refinement) replaces all of
+them, and [`amr.md`](amr.md) is its usage guide.
 Each of the rules below that applies to a block gives a target level, and the block is
 moved toward the finest of them: refined if it is coarser, derefined if it is finer and
 no standard criterion asks to refine it.  With stream shells on, a block that no rule
@@ -190,6 +192,123 @@ The FID setup of step 3 and 4 uses `stream_shell_dr = 0.5`, `rho_frac = 0.5`,
 offset 2, and `stream_shell_r_max = 300`.  Step 5 uses `xsplit_radius = 40`,
 `rho_frac = 0.9`, tier 1 from `r = 10`, tier 2 from `r = 50`, and
 `stream_shell_r_max = 200`.
+
+### `<tde_amr>`: stream-following refinement
+
+The `<tde_amr>` block replaces the BH, unbound-gas and stream-shell rules above with one
+scheme that follows the local density spine of the stream (`src/pgen/tde_amr.hpp`, read
+in `src/pgen/tde_external.cpp`).  It is opt-in.  A deck without a `<tde_amr>` block runs
+the legacy logic, bitwise unchanged.
+
+With the block present, the problem hook is the only source of refinement flags.  The
+generator stops with an error in the following cases.
+
+* A generic `<amr_criterion>` block has a `method` other than `user`.  Only
+  `method = user` blocks are accepted, and at least one must exist, normally
+  `<amr_criterion0>`.
+* `problem/bh_max_amr`, `problem/unbound_amr` or any `problem/stream_shell_*` key is set.
+* `<mesh_refinement>/refinement` is not `adaptive`.
+
+All levels below are logical levels counted from the root, and an offset is counted down
+from the finest level, `max_level = num_levels - 1`.  Every cell gets a target level.  A
+block is refined if its level is below the largest target of its cells (nominal
+thresholds) and derefined if its level is above the largest target evaluated with the
+relaxed thresholds (see Hysteresis).  A block in between keeps its level.
+
+**Detection.**  The cells are binned by the distance `r` to the BH, in `nbins_r`
+logarithmic bins, and by the azimuth in the orbital plane, in `nbins_phi` bins.  A bin is a
+shell sector of every height.  The orbital plane is the plane through the BH normal to
+the initial `r x v` of the star.  The maximum density of a bin is the local spine density
+`rho_ref`.  A cell with `rho > rho_min` is a stream cell if `rho_ref >= strand_frac *`
+(the largest `rho_ref` at its radius).  This gate removes the bins that the stream has
+left.  A stream cell with `q = rho / rho_ref >= spine_frac` is a core cell.  A stream cell
+below it loses one level per factor `envelope_factor` of `q` below `spine_frac`, up to
+`envelope_levels`, and is the same as a background cell below that.  The flanks of the
+stream are therefore resolved one level below the spine by default.  A core or envelope
+cell takes the finest region of the table below that it matches, and an envelope cell
+sits its drop below that level.
+
+| Region | Condition | Level |
+|---|---|---|
+| Nozzle | `r < nozzle_radius` | `max_level - nozzle_offset` |
+| Post-nozzle | `nozzle_radius <= r < post_nozzle_radius` and radial velocity `> 0` | `max_level - post_nozzle_offset` |
+| Self-interaction | `nozzle_radius <= r < crossing_r_max` and `-div v >= crossing_div * Omega_K(r)` | `max_level - crossing_offset` |
+| Apocentre | `r >= apocentre_frac * r_apo`, with `r_apo` the apocentre of the Kepler orbit of the cell about the BH (bound cells only) | spine ladder level plus `apocentre_boost` |
+| Spine ladder | every stream cell | `max_level - spine_offset - n`, with `n` the number of factors `spine_r_per_level` that `r / nozzle_radius` exceeds, at most `spine_offset_max - spine_offset` |
+| Core star | `rho >= core_rho` (only if `core_rho` is set) | `max_level - core_offset` |
+| Sink | block within the excision radius of the BH (only if `sink_offset >= 0`) | `max_level - sink_offset` |
+| Background | everything else | `background_level` |
+
+At equal level the region listed lower in the table is the one reported by `verbose`.
+The core star and the sink are exempt from the midplane rule below.  No level goes below
+`background_level`.
+
+**Midplane-only blocks.**  With `midplane_only = true` a block may be refined above
+`offplane_level` only if it intersects the band `|h| <= max(midplane_hmin, tan(midplane_angle_deg) * R)`
+around the orbital plane.  Here `h` is the distance to the plane, and `R` is the in-plane
+distance to the BH of the point of the block nearest to the BH.  The rule is applied to the
+whole block, so a block that the band touches keeps its full target level, and every
+other block stays at or below `offplane_level`.  The whole stream, spine included,
+is capped off the band, and these blocks are reported as `offplane`.
+
+**Hysteresis.**  The refinement target uses the nominal thresholds.  The derefinement
+target relaxes them: `spine_frac`, `strand_frac` and `crossing_div` are divided by
+`hysteresis`, `core_rho_deref` replaces `core_rho`, and every radius bound and the
+midplane band are multiplied by `radius_hysteresis` (the band is at least one finest
+cell wide).  Each region can only grow under the relaxed evaluation, so a block never
+derefines below its nominal target.
+
+**Number of blocks.**  Every offset is counted from `max_level`, so adding a level to
+`num_levels` moves every region one level finer.  The blocks of a region then grow by up
+to a factor of 8, and by about 4 for the part restricted to the midplane band.  A larger
+offset coarsens its region by the same rule.  `nozzle_radius` sets the volume of the
+finest region, which grows as its cube, and it also sets the start of the spine ladder, so
+a larger radius moves the whole ladder outwards.  Larger `nozzle_offset`,
+`post_nozzle_offset`, `crossing_offset` and `spine_offset` lower the levels of their
+regions and reduce the blocks quickly, and a smaller `spine_r_per_level` raises the
+number of ladder steps.  `mesh_refinement/max_nmb_per_rank` still caps the blocks.
+
+| Key | Type | Default | Meaning | Source |
+|---|---|---|---|---|
+| `tde_amr/verbose` | bool | `false` | Print one line per AMR check on rank 0, with the blocks per level, the blocks per region that sets their target, and the number of blocks flagged for refinement (`+1`) and derefinement (`-1`). | `src/pgen/tde_external.cpp` |
+| `tde_amr/nbins_r` | int | `128` | Number of logarithmic distance bins of the spine table. Must be `>= 1`, and `nbins_r * nbins_phi <= 2^24`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/nbins_phi` | int | `64` | Number of azimuth bins in the orbital plane. Must be `>= 1`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/r_bin_min` | real | `r_t / beta` (the pericenter) | Inner edge of the distance bins. Every cell closer than this falls in the first bin. Must be `> 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/r_bin_max` | real | `-1.0` | Outer edge of the distance bins. A value `<= 0` uses the farthest mesh corner from the BH. Otherwise it must exceed `r_bin_min`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/strand_frac` | real | `0.01` | A bin counts as stream only if its spine density is at least this fraction of the largest spine density at its radius. Must be in `[0, 1]`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/rho_min` | real | `100 * hydro/dfloor` | Cells at or below this density are never stream cells. Must be `>= 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/spine_frac` | real | `0.5` | Minimum `rho / rho_ref` of a core cell. Must satisfy `0 < value <= 1`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/envelope_factor` | real | `10.0` | Factor of `q` per level lost in the envelope. Must be `> 1`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/envelope_levels` | int | `1` | Maximum number of levels lost in the envelope. `0` removes the envelope. Must be `>= 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/hysteresis` | real | `2.0` | Factor that relaxes the density ratios, the strand gate, `crossing_div` and the default `core_rho_deref` for derefinement. Must be `>= 1`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/radius_hysteresis` | real | `1.25` | Factor that widens every radius bound and the midplane band for derefinement. Must be `>= 1`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/nozzle_radius` | real | `2 * r_peri` | Outer radius of the nozzle region, and the base radius of the spine ladder. Must be `> 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/nozzle_offset` | int | `0` | Level offset below `max_level` in the nozzle. Must be `>= 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/post_nozzle_radius` | real | `5 * r_peri` | Outer radius of the post-nozzle region. Must be `>= nozzle_radius`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/post_nozzle_offset` | int | `1` | Level offset in the post-nozzle region. Must be `>= 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/crossing_div` | real | `3.0` | Compression threshold of the self-interaction region, in units of the local Kepler frequency. Must be `> 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/crossing_r_max` | real | `20 * r_peri` | Outer radius of the self-interaction region. Must be `> 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/crossing_offset` | int | `1` | Level offset in the self-interaction region. Must be `>= 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/apocentre_frac` | real | `0.8` | Fraction of the Kepler apocentre beyond which the apocentre region starts. Must be `> 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/apocentre_boost` | int | `1` | Levels of the apocentre region finer than the spine ladder at the same radius. Must be `>= 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/spine_offset` | int | `1` | Level offset of the spine ladder inside `spine_r_per_level * nozzle_radius`. Must be `>= 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/spine_r_per_level` | real | `2.0` | Factor of the radius per additional ladder offset. Must be `> 1`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/spine_offset_max` | int | `1000` | Largest ladder offset, which in effect leaves the ladder uncapped. Must be `>= spine_offset`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/background_level` | int | `0` | Level of everything that is not stream, counted from the root. Must be in `[0, max_level - root_level]`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/midplane_only` | bool | `true` | Apply the midplane-only block rule. | `src/pgen/tde_external.cpp` |
+| `tde_amr/midplane_hmin` | real | `0.0` | Minimum half-width of the midplane band. Must be `>= 0`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/midplane_angle_deg` | real | `0.0` | Opening angle of the band, whose half-width is `tan(angle) * R`. Must be in `[0, 90)`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/offplane_level` | int | `background_level` | Highest level of a block outside the band. Must be in `[background_level, max_level - root_level]`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/core_rho` | real | not set | Density above which a cell is refined as the core star. Without it the core-star region is off. | `src/pgen/tde_external.cpp` |
+| `tde_amr/core_rho_deref` | real | `core_rho / hysteresis` | Density below which a core-star cell stops being kept. Must satisfy `0 < value <= core_rho`, and it needs `core_rho`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/core_offset` | int | `0` | Level offset of the core star. Must be `>= 0`, and it needs `core_rho`. | `src/pgen/tde_external.cpp` |
+| `tde_amr/sink_offset` | int | `-1` | Level offset of the blocks within the excision radius of the BH. `-1` switches the sink rule off. | `src/pgen/tde_external.cpp` |
+
+`r_peri` is the pericenter distance `r_t / beta` of the star.  The generator prints the
+resolved values in a `--- TDE AMR <tde_amr> ---` banner at start.  With `verbose = true`
+each check prints a line of the form `tde_amr: cycle=... time=... blocks/level 0:n0 1:n1 ...
+| regions spine:n ... | flags +1:n -1:n`, where only the regions that set at least one
+block target are listed.
 
 ## 6. Keys of other blocks used by the TDE decks
 
