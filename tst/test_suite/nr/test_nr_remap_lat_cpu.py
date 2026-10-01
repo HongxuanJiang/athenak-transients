@@ -4,7 +4,9 @@ Remap and LAT can share a run.  The startup remap runs before any LAT window exi
 nothing built for the old state is left behind, and the driver derives the LAT bins from
 the remapped state at its first time step.  The deck remaps a smooth analytic state
 (``remap_test``) from a uniform source mesh onto a periodic SMR target with two levels,
-so the LAT run really uses windows of two ticks.
+so the LAT run really uses windows of two ticks.  The transition band is off: on a
+periodic box it would fade the density to the floor at the old domain boundary and make
+a discontinuity there, which the two schemes treat differently (2.5e-4 instead of 1e-6).
 
 Two things are checked against the same deck run with ``time/lat=false``.  The total mass
 is a conserved quantity of the periodic target, so a LAT window that dropped or doubled a
@@ -29,8 +31,9 @@ SOURCE_INPUT = "inputs/remap_lat_source.athinput"
 TARGET_INPUT = "inputs/remap_lat.athinput"
 # Round-off of a sum of 3.3e4 cell masses.
 MAX_MASS_DRIFT = 1.0e-12
-# Truncation difference of LAT and synchronous stepping over about fifteen cycles.
-MAX_DENSITY_DIFFERENCE = 1.0e-3
+# Truncation difference of LAT and synchronous stepping (9.5e-7 measured; the same deck
+# without a remap gives 1e-6 to 4e-6).
+MAX_DENSITY_DIFFERENCE = 1.0e-5
 
 
 def _run(command, tmp_path):

@@ -58,6 +58,7 @@ gamma = 1.6666666666666667
 enable = true
 source = none.rst
 copy_output_state = false
+transition_band = false
 
 <problem>
 pgen_name = remap_test
