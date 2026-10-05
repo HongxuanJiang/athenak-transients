@@ -370,14 +370,14 @@ Details: [`../remap_usage.md`](../remap_usage.md), [`../wiki/Remapping.md`](../w
 |---|---|---|---|---|---|
 | `remap/enable` | bool | `true` when the block exists | Master switch. Without a `<remap>` block nothing is remapped. | `true` | `src/remap/remap.cpp` |
 | `remap/source` | string | none | Restart file of the previous step. Required when the remap is enabled. Relative paths are resolved from the directory the run starts in. | `../0N_.../rst/<file>.rst` | `src/remap/remap.cpp`, `src/pgen/tde_external.cpp` |
-| `remap/settle_steps` | int | `20` | Number of steps of the refinement-only settling phase before the final projection. Must be `>= 0`. The remap module runs it for every pgen (default `0`); `tde_external` seeds `20`. | `10` | `src/remap/remap.cpp`, `src/pgen/tde_external.cpp` |
-| `remap/settle_passes` | int | `1` | Number of settling passes. Must be `>= 0`. | `1` | `src/remap/remap.cpp` |
+| `remap/settle_steps` | int | `20` | Number of steps of the refinement-only settling phase before the final projection. Must be `>= 0`. | `10` | `src/pgen/tde_external.cpp` |
+| `remap/settle_passes` | int | `1` | Number of settling passes. Must be `>= 0`. | `1` | `src/pgen/tde_external.cpp` |
 | `remap/transition_band` | bool | `true` | Fades the state to the floor across the edge of the source domain. | not set | `src/remap/remap.cpp` |
 | `remap/band_mode` | string | `auto` | `auto`, `floor`, or `keep`. `auto` selects `floor` for Newtonian gas. | not set | `src/remap/remap.cpp` |
 | `remap/copy_output_state` | bool | `true` | Continues the output file numbers of the source run. | not set | `src/remap/remap.cpp` |
 
 A remap happens only on a fresh start (`athena -i`), never on a restart (`athena -r`).
-A remap can share a run with `time/lat = true`: the settle steps run without LAT, and LAT starts after the last remap pass.
+The remap module stops with an error if it is combined with `time/lat = true`.
 
 ### `<time>`: integrator and localized adaptive time stepping
 

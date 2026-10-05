@@ -71,7 +71,6 @@ Mesh::Mesh(ParameterInput *pin) :
   hydro_lat_pin_density(0.0),
   hydro_lat_metadata_nmb(0),
   hydro_lat_sync_factor_current(1),
-  hydro_lat_suspended(false),
   hydro_lat_metadata_version(0),
   hydro_lat_metadata_topology_version(0),
   hydro_lat_lb_topology_version(kInvalidLATVersion),

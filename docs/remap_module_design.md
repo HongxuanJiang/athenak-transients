@@ -402,13 +402,9 @@ the CC pass's own blend weight (`KeepSampleWeight`, factored out of remap_cc.cpp
 so the two passes cannot drift apart), forced to 0 in `skip_cell` cells.  In floor-fade
 mode `w == 1` and `emag_pgen == 0` in every cell, so the add-back reduces to `0.5|B_new|^2`.
 
-**10.5 The LAT rule lives in the module** (remap.cpp `LoadAndApplyRemap`).  A remap may not
-run while LAT windows are active.  The startup remap (`MaybeAutoRemap` sets
-`RemapOptions::lat_idle`) and a mid-run remap made while the pgen has paused LAT
-(`Mesh::hydro_lat_suspended`) are allowed; any other call under `time/lat = true` is fatal,
-on the one path that both the `<remap>` auto mode and every programmatic caller take.  After
-the state is replaced, the module invalidates the LAT metadata and pulls the cycle anchors
-that the LAT gates compare with `ncycle` back to the rewound `ncycle`.
+**10.5 The LAT refusal lives in the module** (remap.cpp `LoadAndApplyRemap`).  The
+`<remap>` + `time/lat = true` combination is refused on the one path that both the
+`<remap>` auto mode and every programmatic caller take.
 
 **10.6 The inverse-curl residual is gated** (remap_fc.cpp).  The residual is printed under
 `b_report`, but it is also checked when `b_report = false`.  Relative to `max |B|`: `> 1e-8` is a warning

@@ -16,14 +16,12 @@
 #include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
-#include "mesh/mesh_refinement.hpp"
 #include "mesh/meshblock_pack.hpp"
 #include "coordinates/adm.hpp"
 #include "eos/eos.hpp"
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
-#include "driver/driver.hpp"
 #include "pgen/pgen.hpp"
 #include "remap/remap.hpp"
 #include "remap/remap_impl.hpp"
@@ -56,58 +54,6 @@ void CopyRemapOutputState(ParameterInput *dst, ParameterInput *src) {
   }
 }
 
-// Settle steps: see remap.hpp.  One remap per process, so the state is file-scope.
-struct SettleState {
-  bool active = false;
-  int steps = 0;
-  int passes_remaining = 0;
-  int target_cycle = -1;
-  bool copy_output_state = true;
-  int saved_ncycle_check = 1;
-  int saved_refinement_interval = 1;
-  RemapOptions opts;
-  std::function<void(ParameterInput *)> on_loaded;
-  std::function<void(const RemapSummary &)> post;
-};
-SettleState settle;
-
-void BeginSettle(ProblemGenerator *pgen, ParameterInput *pin, Mesh *pm,
-                 const RemapOptions &opts, const bool copy_out, const int steps,
-                 const int passes) {
-  if (steps <= 0 || passes <= 0) return;
-  settle.active = true;
-  settle.steps = steps;
-  settle.passes_remaining = passes;
-  settle.target_cycle = pm->ncycle + steps;
-  settle.copy_output_state = copy_out;
-  settle.opts = opts;
-  // A pass runs in the middle of the run: it is allowed under LAT only because LAT is
-  // paused for it, so it must not inherit the startup remap's lat_idle.
-  settle.opts.lat_idle = false;
-  settle.on_loaded = pgen->user_remap_loaded_func;
-  settle.post = pgen->user_remap_post_func;
-  if (pm->pmr != nullptr) {
-    settle.saved_ncycle_check = pm->pmr->ncyc_check_amr;
-    settle.saved_refinement_interval = pm->pmr->refinement_interval;
-    pm->pmr->ncyc_check_amr = 1;
-    pm->pmr->refinement_interval = 1;
-  }
-  pm->hydro_lat_suspended = pin->IsLATEnabled();
-  if (global_variable::my_rank == 0) {
-    std::cout << "remap settle steps     = " << steps << std::endl
-              << "remap settle passes    = " << passes << std::endl
-              << "first settle pass      = cycle " << settle.target_cycle << std::endl
-              << "AMR cadence            = every cycle until the settle ends "
-              << "(then ncycle_check=" << settle.saved_ncycle_check
-              << ", refinement_interval=" << settle.saved_refinement_interval << ")"
-              << std::endl
-              << "outputs suppressed     = true until the settle ends" << std::endl
-              << "LAT                    = "
-              << (pm->hydro_lat_suspended ? "paused until the settle ends" : "off")
-              << std::endl << std::endl;
-  }
-}
-
 }  // namespace
 
 RemapSummary LoadAndApplyRemap(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *dst_pin,
@@ -116,17 +62,16 @@ RemapSummary LoadAndApplyRemap(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *ds
                                const std::function<void(ParameterInput *)> &on_loaded) {
   RemapSummary summary;
   if (pm == nullptr || pmbp == nullptr) return summary;
-  // Remap and LAT (<time>/lat) can share a run, but not a LAT window.  The remap replaces
-  // the state on every block at once, while a window carries per-block time levels, stage
-  // snapshots and reflux accumulators built against the state that was there before.  The
-  // startup remap qualifies (no window exists yet), and so does a mid-run remap made
-  // while the pgen has paused LAT (Mesh::hydro_lat_suspended).  Anything else is refused
-  // here, on the one path every caller (auto <remap> block, direct call) takes.
-  const bool lat_on = dst_pin != nullptr && dst_pin->IsLATEnabled();
-  if (lat_on && !opts.lat_idle && !pm->hydro_lat_suspended) {
-    FatalRemap("A remap cannot run inside a LAT window (time/lat = true).  Remap at "
-               "startup, or pause LAT first by setting Mesh::hydro_lat_suspended at a "
-               "synchronized point, as the remap settle steps do.");
+  // Remap and LAT (<time>/lat) cannot run together: the remap replaces the state on every
+  // block at once, while LAT carries per-block time levels and bin metadata built against
+  // the state that was there before, and nothing rebuilds them for the new one.  The
+  // supported flow is to remap with LAT off and restart the remapped run with LAT on.
+  // This check used to live in tde_external.cpp alone, so every other pgen -- BBH
+  // included -- walked past it in silence into undefined behavior; it belongs to the
+  // module, on the one path every caller (auto <remap> block, direct call) takes.
+  if (dst_pin != nullptr && dst_pin->IsLATEnabled()) {
+    FatalRemap("Remap cannot be combined with time/lat = true.  Remap first with LAT "
+               "off, then restart the remapped run with time/lat = true.");
   }
   if (opts.source_path.empty()) {
     std::cout << "### FATAL ERROR in remap::LoadAndApplyRemap" << std::endl
@@ -200,23 +145,6 @@ RemapSummary LoadAndApplyRemap(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *ds
   pm->dt = src.dt;
   pm->dtold = src.dt;
   pm->ncycle = src.ncycle;
-
-  // Under LAT, the AMR and rebalance gates compare ncycle with the cycle of the last AMR
-  // call, topology change and rebalance attempt.  A mid-run remap rewinds ncycle to the
-  // source's, so a later anchor would hold those gates shut until ncycle caught up.  The
-  // per-block factors were derived from the old state; the driver rebuilds them from the
-  // new one at the next time step.
-  if (lat_on) {
-    if (pm->pmr != nullptr) {
-      pm->pmr->last_amr_call_cycle =
-          std::min(pm->pmr->last_amr_call_cycle, pm->ncycle);
-    }
-    pm->topology_last_change_cycle =
-        std::min(pm->topology_last_change_cycle, pm->ncycle);
-    pm->hydro_lat_lb_last_attempt_cycle =
-        std::min(pm->hydro_lat_lb_last_attempt_cycle, pm->ncycle);
-    pm->InvalidateHydroLATMetadata();
-  }
 
   // Refresh the analytic ADM metric (and, for BBH, the excision + M1 radiation masks) at
   // the SOURCE time now that pm->time carries it.  Dyn-GR pgens whose metric callback is
@@ -318,14 +246,8 @@ RemapOptions OptionsFromInput(ParameterInput *pin) {
 
 void MaybeAutoRemap(ProblemGenerator *pgen, ParameterInput *pin, Mesh *pm) {
   if (!IsAutoRemapEnabled(pin)) return;
-  const int settle_steps = pin->GetOrAddInteger("remap", "settle_steps", 0);
-  const int settle_passes = pin->GetOrAddInteger("remap", "settle_passes", 1);
-  if (settle_steps < 0 || settle_passes < 0) {
-    FatalRemap("<remap>/settle_steps and <remap>/settle_passes must be >= 0.");
-  }
   RemapOptions opts = OptionsFromInput(pin);
   opts.skip_cell = pgen->user_remap_skip_func;
-  opts.lat_idle = true;  // startup: no LAT window exists yet
   const bool copy_out = pin->GetOrAddBoolean("remap", "copy_output_state", true);
   const RemapSummary summary =
       LoadAndApplyRemap(pm, pm->pmb_pack, pin, copy_out, "--- Remap (<remap> block) ---",
@@ -333,58 +255,6 @@ void MaybeAutoRemap(ProblemGenerator *pgen, ParameterInput *pin, Mesh *pm) {
   if (pgen->user_remap_post_func) {
     pgen->user_remap_post_func(summary);
   }
-  BeginSettle(pgen, pin, pm, opts, copy_out, settle_steps, settle_passes);
-}
-
-bool SettleActive() { return settle.active; }
-
-bool AfterCycleSettle(Driver *driver, ParameterInput *pin, Mesh *pm) {
-  if (!settle.active || pm->ncycle < settle.target_cycle) return false;
-  if (driver == nullptr || pin == nullptr || pm->pmb_pack == nullptr) return false;
-
-  if (global_variable::my_rank == 0) {
-    std::cout << std::endl
-              << "--- Remap settle pass ---" << std::endl
-              << "current cycle           = " << pm->ncycle << std::endl
-              << "current time            = " << pm->time << std::endl
-              << "target cycle            = " << settle.target_cycle << std::endl
-              << "remaining passes before = " << settle.passes_remaining << std::endl
-              << std::endl;
-  }
-  // LAT is still paused here (Mesh::hydro_lat_suspended), which is what lets the remap
-  // replace the state.
-  const RemapSummary summary =
-      LoadAndApplyRemap(pm, pm->pmb_pack, pin, settle.copy_output_state,
-                        "--- Remap settle pass (<remap> block) ---", settle.opts,
-                        settle.on_loaded);
-  if (settle.post) settle.post(summary);
-  --settle.passes_remaining;
-  if (settle.passes_remaining > 0) {
-    settle.target_cycle = pm->ncycle + settle.steps;
-  } else {
-    settle.active = false;
-    settle.target_cycle = -1;
-    if (pm->pmr != nullptr) {
-      pm->pmr->ncyc_check_amr = settle.saved_ncycle_check;
-      pm->pmr->refinement_interval = settle.saved_refinement_interval;
-    }
-    pm->hydro_lat_suspended = false;
-  }
-  driver->InitBoundaryValuesAndPrimitives(pm);
-  if (global_variable::my_rank == 0) {
-    std::cout << "remap settle passes remaining = " << settle.passes_remaining
-              << std::endl;
-    if (settle.active) {
-      std::cout << "next settle pass              = cycle " << settle.target_cycle
-                << std::endl;
-    } else {
-      std::cout << "settle passes complete; AMR cadence restored (ncycle_check="
-                << settle.saved_ncycle_check << ", refinement_interval="
-                << settle.saved_refinement_interval << ")" << std::endl;
-    }
-    std::cout << std::endl;
-  }
-  return true;
 }
 
 }  // namespace remap
