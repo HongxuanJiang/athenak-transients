@@ -144,6 +144,15 @@ class Mesh {
   Real hydro_lat_pin_density;
   int hydro_lat_metadata_nmb;
   int hydro_lat_sync_factor_current;
+  // True while a problem generator has paused the LAT windows.  Driver::Execute then
+  // takes every cycle as one plain step of the global time step, which is what it already
+  // does whenever no block can use a factor above 1, so the LAT configuration, the
+  // pgen's LAT hooks and the rest of the machinery stay in force and LAT resumes at the
+  // next window as soon as the flag is cleared.  A pgen sets and clears it at a
+  // synchronized point, identically on every rank (the settle steps of the remap module
+  // are the user); remap::LoadAndApplyRemap accepts a mid-run call under LAT only while
+  // it is set.
+  bool hydro_lat_suspended;
   static constexpr std::uint64_t kInvalidLATVersion = ~std::uint64_t{0};
   // Smallest predicted relative window-time gain for which a LAT block->rank migration
   // is worth its cost (seconds of whole-block transfer against a ~20 s window).  Used

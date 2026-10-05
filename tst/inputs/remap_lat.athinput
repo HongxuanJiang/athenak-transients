@@ -1,0 +1,70 @@
+<job>
+basename = remap_lat
+
+<mesh>
+nghost = 2
+nx1 = 32
+x1min = -1.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 32
+x2min = -1.0
+x2max = 1.0
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 32
+x3min = -1.0
+x3max = 1.0
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement = static
+
+<refined_region0>
+level = 1
+x1min = -0.5
+x1max = 0.5
+x2min = -0.5
+x2max = 0.5
+x3min = -0.5
+x3max = 0.5
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = -1
+tlim = 0.1
+ndiag = 100000
+lat = true
+lat_levels = 2
+hydro_lat_min_bin_count = 1
+lat_diagnostics = true
+
+<hydro>
+eos = ideal
+reconstruct = plm
+rsolver = hllc
+gamma = 1.6666666666666667
+
+<remap>
+enable = true
+source = none.rst
+copy_output_state = false
+transition_band = false
+
+<problem>
+pgen_name = remap_test
+
+<output1>
+file_type = bin
+variable = hydro_u
+variable_precision = float64
+dt = 1.0e6

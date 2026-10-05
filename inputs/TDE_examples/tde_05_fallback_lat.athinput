@@ -66,10 +66,10 @@ evolution  = dynamic
 integrator = rk2
 cfl_number = 0.5
 nlim       = -1
-tlim       = 71.0
+tlim       = 440.2
 ndiag      = 1
 
-lat                      = false
+lat                      = true
 lat_levels               = 7
 lat_same_level           = true
 lat_same_level_max_ratio = 2
@@ -134,7 +134,7 @@ vz_star                = 0.0
 
 external_bh_gravity_source = true
 bh_live               = true
-bh_reciprocal_force   = false
+bh_reciprocal_force   = true
 bh_pair_force         = finite_difference
 use_translating_frame = false
 frame_rho_min         = 1.0e-9

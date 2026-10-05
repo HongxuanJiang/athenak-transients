@@ -92,15 +92,6 @@ Real bh_excise_density_global;
 Real bh_excise_eint_global;
 Real newton_g_global;
 bool bh_inner_boundary_global = true;
-bool remap_enable_global = false;
-std::string remap_restart_source_global;
-int remap_settle_steps_global = 0;
-int remap_settle_config_passes_global = 0;
-int remap_settle_remaining_passes_global = 0;
-int remap_settle_target_cycle_global = -1;
-bool remap_settle_active_global = false;
-int remap_amr_ncycle_check_config_global = 1;
-int remap_amr_refinement_interval_config_global = 1;
 
 // Translating, non-rotating debris-frame state. When the translating frame is
 // disabled, these are reset to zero and the BH is frozen in the current mesh
@@ -226,17 +217,10 @@ void CapHydroLATFactorsNearBH(Mesh *pm, int max_factor, int *lat_factor_eachmb);
 void SyncProblemRuntimeState();
 void InvalidateFrameBHStepState();
 void RestoreOptionalFrameBHStepState(ParameterInput *pin);
-void ScheduleNextAutoRemapPass(Mesh *pm);
-void DisableAutoRemapPasses(Mesh *pm = nullptr);
-void UpdateAutoRemapAMRControls(Mesh *pm);
-bool OutputsAllowedOnCurrentCycle(Mesh *pm);
 void TDEExternalHydroStateFixup(MeshBlockPack *pmbp, const Real time);
 void SwitchToFrozenBHInertialFrame(Mesh *pm, MeshBlockPack *pmbp);
 bool RestoreFrameBHStateFromMetadata(ParameterInput *pin);
 void RestoreLiveBHMetadata(ParameterInput *pin);
-void LoadAndApplyRemapSource(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *dst_pin,
-                             bool copy_output_state, const char *banner_label);
-bool AutoRemapAfterCycle(Driver *driver, ParameterInput *pin, Mesh *pm);
 
 inline Real ClampUnitInterval(const Real x);
 KOKKOS_INLINE_FUNCTION
@@ -265,95 +249,6 @@ inline void EvaluateBHAccelerationAtPoint(const Real x, const Real y, const Real
   ax = -gm * dx * invr3;
   ay = -gm * dy * invr3;
   az = -gm * dz * invr3;
-}
-
-void UpdateAutoRemapAMRControls(Mesh *pm) {
-  if (pm == nullptr || pm->pmr == nullptr) return;
-  if (remap_settle_active_global) {
-    pm->pmr->ncyc_check_amr = 1;
-    pm->pmr->refinement_interval = 1;
-  } else {
-    pm->pmr->ncyc_check_amr =
-        std::max(remap_amr_ncycle_check_config_global, 1);
-    pm->pmr->refinement_interval =
-        std::max(remap_amr_refinement_interval_config_global,
-                 pm->pmr->ncyc_check_amr);
-  }
-}
-
-void DisableAutoRemapPasses(Mesh *pm) {
-  remap_settle_remaining_passes_global = 0;
-  remap_settle_target_cycle_global = -1;
-  remap_settle_active_global = false;
-  UpdateAutoRemapAMRControls(pm);
-}
-
-void ScheduleNextAutoRemapPass(Mesh *pm) {
-  if (pm == nullptr || !remap_enable_global || remap_settle_steps_global <= 0 ||
-      remap_settle_remaining_passes_global <= 0) {
-    DisableAutoRemapPasses(pm);
-    return;
-  }
-  remap_settle_target_cycle_global = pm->ncycle + remap_settle_steps_global;
-  remap_settle_active_global = true;
-  UpdateAutoRemapAMRControls(pm);
-}
-
-bool OutputsAllowedOnCurrentCycle(Mesh *pm) {
-  (void)pm;
-  return !remap_settle_active_global;
-}
-
-void LoadAndApplyRemapSource(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *dst_pin,
-                             bool copy_output_state, const char *banner_label) {
-  if (pm == nullptr || pmbp == nullptr || pmbp->phydro == nullptr) return;
-  if (!remap_enable_global || remap_restart_source_global.empty()) {
-    std::cout << "### FATAL ERROR in ProblemGenerator::UserProblem" << std::endl
-              << "Automatic remap requested without a valid remap source path."
-              << std::endl;
-    std::exit(EXIT_FAILURE);
-  }
-
-  remap::RemapOptions opts;
-  if (dst_pin != nullptr && dst_pin->DoesBlockExist("remap")) {
-    opts = remap::OptionsFromInput(dst_pin);
-  }
-  opts.source_path = remap_restart_source_global;
-  opts.skip_cell = [](Real x, Real y, Real z) {
-    const Real excise_r2 = bh_inner_boundary_global ?
-        bh_excise_radius_global * bh_excise_radius_global : -1.0;
-    return tde_external::InsideExcisionZone(x, y, z, bh_x_global, bh_y_global,
-                                            bh_z_global, excise_r2);
-  };
-  remap::LoadAndApplyRemap(pm, pmbp, dst_pin, copy_output_state, banner_label, opts,
-      [](ParameterInput *src_pin) {
-        // The BH/frame record must be restored BEFORE the state is applied: the
-        // excision skip hook above reads the restored BH position during the apply.
-        if (!RestoreFrameBHStateFromMetadata(src_pin)) {
-          std::cout << "### FATAL ERROR in ProblemGenerator::UserProblem" << std::endl
-                    << "remap source restart is missing the BH/frame metadata."
-                    << std::endl;
-          std::exit(EXIT_FAILURE);
-        }
-        // A live BH also keeps its inertial velocity and gas acceleration across the
-        // remap.  Without them the leapfrog restarts from rest after every remap and
-        // SwitchToFrozenBHInertialFrame places the BH at rest in the new frame.
-        RestoreLiveBHMetadata(src_pin);
-      });
-
-  if (use_translating_frame_global) {
-    frame_state_time_global = pm->time;
-    InvalidateFrameBHStepState();
-    SyncProblemRuntimeState();
-  } else {
-    SwitchToFrozenBHInertialFrame(pm, pmbp);
-  }
-
-  if (global_variable::my_rank == 0) {
-    std::cout << "use translating frame  = "
-              << (use_translating_frame_global ? "true" : "false") << std::endl
-              << std::endl;
-  }
 }
 
 // Apply a uniform Galilean boost to the loaded hydro state.
@@ -2410,52 +2305,6 @@ bool RestoreFrameBHStateFromMetadata(ParameterInput *pin) {
   return true;
 }
 
-bool AutoRemapAfterCycle(Driver *driver, ParameterInput *pin, Mesh *pm) {
-  if (driver == nullptr || pin == nullptr || pm == nullptr) return false;
-  if (!remap_settle_active_global) return false;
-  if (pm->ncycle < remap_settle_target_cycle_global) return false;
-
-  MeshBlockPack *pmbp = pm->pmb_pack;
-  if (pmbp == nullptr || pmbp->phydro == nullptr) return false;
-
-  if (global_variable::my_rank == 0) {
-    std::cout << std::endl
-              << "--- TDE Auto Remap Trigger ---" << std::endl
-              << "current cycle           = " << pm->ncycle << std::endl
-              << "current time            = " << pm->time << std::endl
-              << "target cycle            = " << remap_settle_target_cycle_global
-              << std::endl
-              << "remaining passes before = " << remap_settle_remaining_passes_global
-              << std::endl
-              << std::endl;
-  }
-
-  LoadAndApplyRemapSource(pm, pmbp, pin, true, "--- TDE Auto Remap ---");
-  if (remap_settle_remaining_passes_global > 0) {
-    remap_settle_remaining_passes_global--;
-  }
-  ScheduleNextAutoRemapPass(pm);
-  driver->InitBoundaryValuesAndPrimitives(pm);
-  tde_external::StoreRuntimeMetadata(pin);
-
-  if (global_variable::my_rank == 0) {
-    std::cout << "auto-remap remaining passes = "
-              << remap_settle_remaining_passes_global << std::endl;
-    if (remap_settle_active_global) {
-      std::cout << "next auto-remap cycle       = "
-                << remap_settle_target_cycle_global << std::endl;
-    } else {
-      std::cout << "auto-remap passes complete" << std::endl
-                << "restored AMR cadence        = ncycle_check="
-                << remap_amr_ncycle_check_config_global
-                << ", refinement_interval="
-                << remap_amr_refinement_interval_config_global << std::endl;
-    }
-    std::cout << std::endl;
-  }
-  return true;
-}
-
 inline void RK4Step(const Real xi, const Real h, const Real theta, const Real dtheta,
                     const Real n, Real &theta_out, Real &dtheta_out) {
   Real k1_t, k1_dt;
@@ -3611,17 +3460,12 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
   bool remap_enable = remap::IsAutoRemapEnabled(pin);
   std::string remap_restart_source;
-  int remap_settle_steps = 20;
-  int remap_settle_passes = 1;
   if (pin->DoesBlockExist("remap")) {
     remap_restart_source = pin->GetOrAddString("remap", "source", "");
-    remap_settle_steps = pin->GetOrAddInteger("remap", "settle_steps", 20);
-    remap_settle_passes = pin->GetOrAddInteger("remap", "settle_passes", 1);
+    // The settle steps are run by the remap module (remap.hpp).  tde_external only seeds
+    // its own default of 20 steps, which the module then reads from the <remap> block.
+    (void) pin->GetOrAddInteger("remap", "settle_steps", 20);
   }
-  int configured_amr_ncycle_check =
-      pin->GetOrAddInteger("mesh_refinement", "ncycle_check", 1);
-  int configured_amr_refinement_interval =
-      pin->GetOrAddInteger("mesh_refinement", "refinement_interval", 5);
   use_translating_frame_global =
       pin->GetOrAddBoolean("problem", "use_translating_frame", false);
   hydro_lat_enabled_global = pin->IsLATEnabled();
@@ -3692,20 +3536,6 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
   bool has_loaded_restart_state = restart || pmy_mesh_->ncycle > 0
       || pmy_mesh_->time != 0.0;
-  remap_enable_global = remap_enable;
-  if (remap_enable) {
-    after_cycle_func = AutoRemapAfterCycle;
-    user_output_gate_func = OutputsAllowedOnCurrentCycle;
-  }
-  remap_restart_source_global = remap_restart_source;
-  remap_settle_steps_global = remap_settle_steps;
-  remap_settle_config_passes_global = remap_settle_passes;
-  remap_amr_ncycle_check_config_global =
-      std::max(configured_amr_ncycle_check, 1);
-  remap_amr_refinement_interval_config_global =
-      std::max(configured_amr_refinement_interval,
-               remap_amr_ncycle_check_config_global);
-  DisableAutoRemapPasses(pmy_mesh_);
 
   if (poly_n <= 0.0 || poly_n >= 5.0) {
     std::cout << "### FATAL ERROR in ProblemGenerator::UserProblem" << std::endl
@@ -3755,16 +3585,6 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       std::cout << "### FATAL ERROR in ProblemGenerator::UserProblem" << std::endl
                 << "remap/source must be set when the <remap> block is enabled."
                 << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    if (remap_settle_steps < 0) {
-      std::cout << "### FATAL ERROR in ProblemGenerator::UserProblem" << std::endl
-                << "remap/settle_steps must be >= 0." << std::endl;
-      std::exit(EXIT_FAILURE);
-    }
-    if (remap_settle_passes < 0) {
-      std::cout << "### FATAL ERROR in ProblemGenerator::UserProblem" << std::endl
-                << "remap/settle_passes must be >= 0." << std::endl;
       std::exit(EXIT_FAILURE);
     }
   }
@@ -4228,30 +4048,12 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       } else {
         SwitchToFrozenBHInertialFrame(pm_cap, pmbp_cap);
       }
-      remap_settle_remaining_passes_global = remap_settle_config_passes_global;
-      ScheduleNextAutoRemapPass(pm_cap);
       tde_external::StoreRuntimeMetadata(pin_cap);
 
       if (global_variable::my_rank == 0) {
         std::cout << "use translating frame  = "
-                  << (use_translating_frame_global ? "true" : "false") << std::endl;
-        if (remap_settle_active_global) {
-          std::cout << "auto-remap settle steps = " << remap_settle_steps_global
-                    << std::endl
-                    << "auto-remap passes       = " << remap_settle_remaining_passes_global
-                    << std::endl
-                    << "first auto-remap cycle  = " << remap_settle_target_cycle_global
-                    << std::endl
-                    << "forced AMR cadence      = ncycle_check=1, refinement_interval=1"
-                    << std::endl
-                    << "restored AMR cadence    = ncycle_check="
-                    << remap_amr_ncycle_check_config_global
-                    << ", refinement_interval="
-                    << remap_amr_refinement_interval_config_global << std::endl
-                    << "outputs suppressed      = true until settle/remap completes"
-                    << std::endl;
-        }
-        std::cout << std::endl;
+                  << (use_translating_frame_global ? "true" : "false") << std::endl
+                  << std::endl;
       }
     };
     return;

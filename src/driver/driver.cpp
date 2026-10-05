@@ -31,6 +31,7 @@
 #include "driver.hpp"
 #include "gravity/gravity.hpp"
 #include "pgen/pgen.hpp"
+#include "remap/remap.hpp"
 #include "srcterms/srcterms.hpp"
 
 #if MPI_PARALLEL_ENABLED
@@ -1237,6 +1238,7 @@ void Driver::Initialize(Mesh *pmesh, ParameterInput *pin, Outputs *pout, bool re
   if (pmesh->pgen != nullptr && pmesh->pgen->user_output_gate_func != nullptr) {
     allow_outputs = pmesh->pgen->user_output_gate_func(pmesh);
   }
+  if (remap::SettleActive()) allow_outputs = false;  // see remap.hpp, settle steps
   if (!res_flag && allow_outputs) { // only write outputs at the beginning of the run
     for (auto &out : pout->pout_list) {
       out->LoadOutputData(pmesh);
@@ -1330,7 +1332,9 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
       int lat_sync_factor = hydro_subcycle_factor;
       if (hydro_lat) {
         int max_factor = std::max(1, hydro_subcycle_factor);
-        if (pmesh->hydro_lat_metadata_valid) {
+        // A pgen that paused LAT (Mesh::hydro_lat_suspended) gets plain steps of the
+        // global time step, the same path as a window of one tick, until it resumes.
+        if (pmesh->hydro_lat_metadata_valid && !pmesh->hydro_lat_suspended) {
           max_factor = std::min(max_factor,
                                 std::max(1, pmesh->hydro_lat_sync_factor_current));
         } else {
@@ -1914,6 +1918,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
           if (pmesh->pgen != nullptr && pmesh->pgen->user_output_gate_func != nullptr) {
             allow_outputs = pmesh->pgen->user_output_gate_func(pmesh);
           }
+          if (remap::SettleActive()) allow_outputs = false;  // settle steps pending
           if (allow_outputs) {
             for (auto &out : pout->pout_list) {
               // compare at floating point (32-bit) precision to reduce effect of round
@@ -1944,10 +1949,15 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
           ClearHydroLAT(pmesh);
           hydro_lat_cleared = true;
         }
-        if (lat_synchronized_state &&
-            pmesh->pgen != nullptr && pmesh->pgen->after_cycle_func != nullptr) {
-          const bool post_step_state_changed =
-              (pmesh->pgen->after_cycle_func)(this, pin, pmesh);
+        if (lat_synchronized_state) {
+          // The remap module's settle pass (a no-op unless <remap>/settle_steps is
+          // pending) and then the pgen's own hook; either may replace the state.
+          bool post_step_state_changed = remap::AfterCycleSettle(this, pin, pmesh);
+          if (pmesh->pgen != nullptr && pmesh->pgen->after_cycle_func != nullptr) {
+            post_step_state_changed =
+                (pmesh->pgen->after_cycle_func)(this, pin, pmesh) ||
+                post_step_state_changed;
+          }
           if (post_step_state_changed) {
             if (pmesh->pmb_pack != nullptr && pmesh->pmb_pack->pgrav != nullptr) {
               pmesh->pmb_pack->pgrav->MarkPhiInvalid();
@@ -2021,7 +2031,7 @@ void Driver::Execute(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
                 pmesh->hydro_lat_lb_last_attempt_cycle < 0 ||
                 pmesh->topology_last_change_cycle >
                 pmesh->hydro_lat_lb_last_attempt_cycle;
-            if (hydro_lat_post_amr_rebalance &&
+            if (hydro_lat_post_amr_rebalance && !pmesh->hydro_lat_suspended &&
                 pmesh->multilevel && pmesh->pmr != nullptr &&
                 pmesh->hydro_lat_metadata_valid &&
                 !pmesh->HydroLATLoadBalanceCurrent() &&
@@ -2063,6 +2073,7 @@ void Driver::Finalize(Mesh *pmesh, ParameterInput *pin, Outputs *pout) {
   if (pmesh->pgen != nullptr && pmesh->pgen->user_output_gate_func != nullptr) {
     allow_outputs = pmesh->pgen->user_output_gate_func(pmesh);
   }
+  if (remap::SettleActive()) allow_outputs = false;  // see remap.hpp, settle steps
   if (allow_outputs) {
     for (auto &out : pout->pout_list) {
       out->LoadOutputData(pmesh);
