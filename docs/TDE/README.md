@@ -5,7 +5,7 @@ workflow of this repository.  The workflow is the one described in
 
 > Jiang, H.-X., Yang, M., Velasco-Romero, D. A., Yu, F., Xia, J.-Z., Li, X., and Mizuno, Y.,
 > *An End-to-End Numerical Framework for Tidal Disruption Events with AthenaK*,
-> The Astrophysical Journal Supplement Series (in revision).
+> The Astrophysical Journal Supplement Series (accepted).
 
 **Scope.**  This repository is a fork of AthenaK (Stone et al. 2024).  We maintain and
 support only the TDE workflow of the paper: the `tde_external` problem generator and the
@@ -467,7 +467,7 @@ use the radiative post-processing `athenak_rt`, please also cite Yang et al. (20
   title   = {An End-to-End Numerical Framework for Tidal Disruption Events with {AthenaK}},
   journal = {The Astrophysical Journal Supplement Series},
   year    = {2026},
-  note    = {in revision},
+  note    = {accepted},
   archivePrefix = {arXiv},
   eprint  = {2609.37859}
 }

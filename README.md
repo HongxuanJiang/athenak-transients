@@ -24,7 +24,7 @@ and mergers, common-envelope evolution, and other transients.
 
 > Jiang, H.-X., Yang, M., Velasco-Romero, D. A., Yu, F., Xia, J.-Z., Li, X., and Mizuno, Y.,
 > *An End-to-End Numerical Framework for Tidal Disruption Events with AthenaK*,
-> The Astrophysical Journal Supplement Series (in revision), [arXiv:2609.37859](https://arxiv.org/abs/2609.37859).
+> The Astrophysical Journal Supplement Series (accepted), [arXiv:2609.37859](https://arxiv.org/abs/2609.37859).
 
 ## Highlights
 
