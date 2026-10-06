@@ -82,6 +82,135 @@ void BuildRemapMetricSampler(MeshBlockPack *pmbp, RemapSourceData &src) {
   src.metric.bbh_view = pmbp->padm->GetMetricView(src.time);
 }
 
+// Source blocks that a remap can read for THIS rank's target blocks.
+//
+// RULE.  A source block is selected iff it overlaps (closed boxes) at least one target
+// block of this rank, grown by a stencil margin.  Per target block T, let C be T clamped
+// to the source mesh and dq the largest source cell width (per axis) among the leaves that
+// overlap C.  The margin is
+//     2 dq                        if T lies deeper than (g + 1) root cells inside the source
+//                                 mesh on every axis, g = max(ngh + 1, 3);
+//     (g + 3) root cells          otherwise (T within the transition band of a mesh face,
+//                                 or outside the mesh), when the transition band is on.
+//
+// PROOF SKETCH (every claim refers to remap_cc.cpp).
+//  1. Every sub-sample point p of a target cell of T maps to p_src = clamp(p) in C, and the
+//     leaf B that FindContainingSourceBlock returns for it overlaps C, so its cell width
+//     dq_B <= dq.  The target-cell center test (TargetCellMatchesSourceGrid) is also in C.
+//  2. The trilinear stencil (SampleSourceCellCenteredArr) uses the cells whose centers
+//     bracket p_src, so its node centers lie within one cell width dq_B of p_src.  A node
+//     outside B's active cells is not read from B's ghost zones: it is re-sampled
+//     (SampleSourceActiveCellContainingArr) from the leaf that contains the node center,
+//     which is the finest loaded leaf there whatever its level, and it overlaps the box
+//     C + dq_B.  So at coarse/fine interfaces the neighbour (finer or coarser) is reached
+//     iff it overlaps C grown by dq <= 2 dq.  Ghost zones are never read at all.
+//  3. Keep mode, the plain sampler and the band-off paths sample only at p_src: the taper
+//     decays the WEIGHT, not the sample position, so step 2 is the whole reach.
+//  4. Floor-fade with the transition band can move the sample: the reference point is
+//     clamped to at most g cells (of dq_B <= root cell) inside p_src, the deeper point one
+//     cell further, the ambient inward shift one more, and the stencil one more, so every
+//     read lies within (g + 3) root cells of C.  That path needs a weight < 1 or a point
+//     outside the mesh, which requires T within g root cells of a face (dq_B <= root cell).
+//  5. The face-centered B never uses this set: the covering grid is streamed from every
+//     block, and the per-block magnetic-energy swap uses the block's own faces.
+// The caller also keeps the old per-rank bounding-box test (a superset of this one), so
+// the loaded set is a subset of the old set, and the result is bitwise identical: each
+// block the samplers can reach is present in both, every other block is never read.
+//
+// Cost: source blocks are binned on a uniform lattice (about one block per bin), each
+// target block is two bin queries, so O(Ntarget * blocks per queried bin), not
+// O(Ntarget * Nsource).
+std::vector<char> SelectSourceBlocksByTarget(const RemapSourceData &src,
+                                             const std::vector<RegionSize> &bsize,
+                                             Mesh *pm, const bool use_band,
+                                             const Real root_dx[3]) {
+  const int nb = std::clamp(
+      static_cast<int>(std::ceil(std::cbrt(static_cast<double>(src.nmb_total)))), 1, 64);
+  const Real lo[3] = {src.mesh_size.x1min, src.mesh_size.x2min, src.mesh_size.x3min};
+  const Real hi[3] = {src.mesh_size.x1max, src.mesh_size.x2max, src.mesh_size.x3max};
+  auto bin_of = [&](const int a, const Real q) {
+    const Real f = std::floor((q - lo[a]) / (hi[a] - lo[a]) * static_cast<Real>(nb));
+    return std::clamp(static_cast<int>(std::max(f, static_cast<Real>(-1.0))), 0, nb - 1);
+  };
+  auto bmin = [](const RegionSize &r, const int a) {
+    return (a == 0) ? r.x1min : ((a == 1) ? r.x2min : r.x3min);
+  };
+  auto bmax = [](const RegionSize &r, const int a) {
+    return (a == 0) ? r.x1max : ((a == 1) ? r.x2max : r.x3max);
+  };
+  auto bdx = [](const RegionSize &r, const int a) {
+    return (a == 0) ? r.dx1 : ((a == 1) ? r.dx2 : r.dx3);
+  };
+
+  std::vector<std::vector<int>> bins(static_cast<std::size_t>(nb) * nb * nb);
+  for (int n = 0; n < src.nmb_total; ++n) {
+    int b0[3], b1[3];
+    for (int a = 0; a < 3; ++a) {
+      b0[a] = bin_of(a, bmin(bsize[n], a));
+      b1[a] = bin_of(a, bmax(bsize[n], a));
+    }
+    for (int k = b0[2]; k <= b1[2]; ++k) {
+      for (int j = b0[1]; j <= b1[1]; ++j) {
+        for (int i = b0[0]; i <= b1[0]; ++i) {
+          bins[(static_cast<std::size_t>(k) * nb + j) * nb + i].push_back(n);
+        }
+      }
+    }
+  }
+
+  // visit every source block whose closed box meets [qlo, qhi]
+  auto query = [&](const Real qlo[3], const Real qhi[3], auto &&visit) {
+    int b0[3], b1[3];
+    for (int a = 0; a < 3; ++a) {
+      b0[a] = bin_of(a, qlo[a]);
+      b1[a] = bin_of(a, qhi[a]);
+    }
+    for (int k = b0[2]; k <= b1[2]; ++k) {
+      for (int j = b0[1]; j <= b1[1]; ++j) {
+        for (int i = b0[0]; i <= b1[0]; ++i) {
+          for (const int n : bins[(static_cast<std::size_t>(k) * nb + j) * nb + i]) {
+            const RegionSize &r = bsize[n];
+            if (bmin(r, 0) <= qhi[0] && bmax(r, 0) >= qlo[0] &&
+                bmin(r, 1) <= qhi[1] && bmax(r, 1) >= qlo[1] &&
+                bmin(r, 2) <= qhi[2] && bmax(r, 2) >= qlo[2]) visit(n);
+          }
+        }
+      }
+    }
+  };
+
+  const Real g = static_cast<Real>(std::max(src.ngh + 1, 3));
+  std::vector<char> needed(src.nmb_total, 0);
+  auto &mb_size = pm->pmb_pack->pmb->mb_size;
+  for (int m = 0; m < pm->pmb_pack->nmb_thispack; ++m) {
+    Real tlo[3] = {mb_size.h_view(m).x1min, mb_size.h_view(m).x2min,
+                   mb_size.h_view(m).x3min};
+    Real thi[3] = {mb_size.h_view(m).x1max, mb_size.h_view(m).x2max,
+                   mb_size.h_view(m).x3max};
+    Real clo[3], chi[3], dq[3] = {0.0, 0.0, 0.0};
+    bool near_face = false;
+    for (int a = 0; a < 3; ++a) {
+      clo[a] = std::clamp(tlo[a], lo[a], hi[a]);
+      chi[a] = std::clamp(thi[a], lo[a], hi[a]);
+      if (tlo[a] < lo[a] + (g + 1.0) * root_dx[a] ||
+          thi[a] > hi[a] - (g + 1.0) * root_dx[a]) near_face = true;
+    }
+    query(clo, chi, [&](const int n) {
+      for (int a = 0; a < 3; ++a) dq[a] = std::max(dq[a], bdx(bsize[n], a));
+    });
+    Real qlo[3], qhi[3];
+    for (int a = 0; a < 3; ++a) {
+      if (!(dq[a] > 0.0)) dq[a] = root_dx[a];   // no leaf found: be conservative
+      const Real margin = (use_band && near_face) ? (g + 3.0) * root_dx[a]
+                                                  : 2.0 * dq[a];
+      qlo[a] = clo[a] - margin;
+      qhi[a] = chi[a] + margin;
+    }
+    query(qlo, qhi, [&](const int n) { needed[n] = 1; });
+  }
+  return needed;
+}
+
 }  // namespace
 
 //----------------------------------------------------------------------------------------
@@ -575,6 +704,17 @@ bool LoadRemapSourceData(const std::string &path, Mesh *pm, MeshBlockPack *pmbp,
                        static_cast<Real>(2.0) * root_dx1,
                        static_cast<Real>(2.0) * root_dx2,
                        static_cast<Real>(2.0) * root_dx3);
+  // Per-target-block selection (see SelectSourceBlocksByTarget).  A rank's bounding box
+  // can span the whole domain when its blocks are scattered, so the box alone would load
+  // nearly the whole source on every rank; it is kept only as a cheap superset test.
+  std::vector<RegionSize> bsize(src.nmb_total);
+  for (int n = 0; n < src.nmb_total; ++n) {
+    bsize[n] = LogicalLocationToRegionSize(src.mesh_size, src.mesh_indcs, src.mb_indcs,
+                                           src.root_level, lloc[n]);
+  }
+  const Real root_dx3v[3] = {root_dx1, root_dx2, root_dx3};
+  const std::vector<char> needed = SelectSourceBlocksByTarget(
+      src, bsize, pm, opts.use_transition_band, root_dx3v);
   src.blocks.clear();
   src.block_map.clear();
 
@@ -592,10 +732,8 @@ bool LoadRemapSourceData(const std::string &path, Mesh *pm, MeshBlockPack *pmbp,
   }
 
   for (int n = 0; n < src.nmb_total; ++n) {
-    RegionSize block_size =
-        LogicalLocationToRegionSize(src.mesh_size, src.mesh_indcs, src.mb_indcs,
-                                    src.root_level, lloc[n]);
-    const bool overlaps = RegionOverlaps(block_size, local_bounds);
+    const RegionSize &block_size = bsize[n];
+    const bool overlaps = needed[n] && RegionOverlaps(block_size, local_bounds);
     const IOWrapperSizeT block_base = src.data_offset +
                                       static_cast<IOWrapperSizeT>(n) * src.data_size;
     int kept_idx = -1;
