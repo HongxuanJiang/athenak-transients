@@ -209,8 +209,8 @@ pin, pm)` immediately after the pgen function returns (src/pgen/pgen.cpp); it is
 unless the input carries a `<remap>` block with `enable = true` (default true when the
 block exists; production inputs keep an explicit `enable` key so it can be flipped from
 the command line).  Keys: `enable, source, copy_output_state, transition_band,
-b_coarsen_ok, b_taper_root_cells, b_report` (see remap.hpp), plus
-consumer-private keys that live in the same block (TDE: `settle_steps, settle_passes`).
+b_coarsen_ok, b_taper_root_cells, b_report, settle_steps, settle_passes` (see remap.hpp), plus
+consumer-private keys that live in the same block.
 `remap` is on the ParameterInput block whitelist.
 
 Pgens participate through three optional `ProblemGenerator` members enrolled inside the

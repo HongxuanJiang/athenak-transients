@@ -95,7 +95,7 @@ A numerically evolved spacetime (`<z4c>`, `<cce>`) is refused. An interpolation 
 
 ### Time, time step and outputs
 
-The module sets the mesh time, the time step, the previous time step and `ncycle` to the source's values, and sets `<time>` `start_time` to the source time. Unless `copy_output_state = false`, each `<outputN>` block of the new deck that also exists in the source takes the source's `file_number` and `last_time`, so the file numbering continues.
+The module sets the mesh time, the time step, the previous time step and `ncycle` to the source's values, and sets `<time>` `start_time` to the source time. Unless `copy_output_state = false`, each `<outputN>` block of the new deck that also exists in the source takes the source's `file_number` and `last_time`, so the file numbering continues. With `settle_steps` above 0 the state is remapped once more onto the adapted mesh after that many plain steps, see [Settle steps](Remap-Usage#settle-steps).
 
 ### Dual energy and the tabulated EOS
 
@@ -126,11 +126,12 @@ Making the transfer conservative is a different algorithm, not a weighting fix. 
 - A multi-level MHD source loses its fine-level B structure, because B is restricted to the source root grid. The gas keeps full detail.
 - If the source B does not vanish at the old boundary, a widening remap creates taper currents outside the old box. The module warns when the boundary-shell field exceeds 1e-2 of the maximum.
 - The remap is 3D only on both ends. It needs the same physics modules (no evolved spacetime). It can share a run with LAT, see [Remap with LAT](Remap-Usage#remap-with-lat). [What is refused](Remap-Usage#what-is-refused) gives the full list.
+- The module does no boundary exchange, physical boundary conditions or primitive recovery. The normal start-up after the pgen does them. A source whose restart carries a section the module cannot size, other than the stored `<adm>` metric, is refused instead of misread.
+- No test in `tst/` checks the remapped state itself. The only one that runs a remap checks the LAT coupling. The built-in `remap_test` pgen prints errors against an analytic state, see [A convergence test](Remap-Usage#a-convergence-test).
 - B is read for every source block on every rank, because the vector potential is built on a global grid. Gas data is read per rank, only for the blocks near the local pack. This is a one-time input cost.
 
 ## Further reading
 
 - [Remap usage](Remap-Usage): the parameter table, worked examples, refusals and troubleshooting.
-- [Implementation notes](Remapping-Implementation-Notes): the order of the stages, known issues and how to test.
 - [Dual Energy](Dual-Energy) and [Tabulated EOS](Tabulated-EOS): the closures the remap must match.
 - `docs/remap_module_design.md`: the design document.

@@ -8,7 +8,7 @@ The remap module resamples the state of an existing restart file onto a **new me
 
 **Use it** to widen or shrink a domain, change the MeshBlock size for a different rank count, or add and move refinement. For a plain continuation on the same mesh, use an ordinary restart (`athena -r`).
 
-**Do not use it** when you need exact conservation of mass, momentum and energy: the transfer is second-order accurate and [not conservative](Remapping#guarantees-and-limits). It also cannot be used for a 2D run, with an evolved spacetime (`<z4c>`), or in the same run as [LAT](Local-Adaptive-Time-Stepping) (local adaptive time stepping). [What is refused](#what-is-refused) lists every case.
+**Do not use it** when you need exact conservation of mass, momentum and energy: the transfer is second-order accurate and [not conservative](Remapping#guarantees-and-limits). It also cannot be used for a 2D run or with an evolved spacetime (`<z4c>`). It can share a run with [LAT](Local-Adaptive-Time-Stepping) (local adaptive time stepping), see [Remap with LAT](#remap-with-lat). [What is refused](#what-is-refused) lists every case.
 
 The design background is in `docs/remap_module_design.md`.
 
@@ -206,6 +206,5 @@ In `floor` mode the remap overwrites every cell, so a pgen can skip its own init
 ## Further reading
 
 - [Remapping](Remapping): how the remap works, what is exact and what is not.
-- [Implementation notes](Remapping-Implementation-Notes): the stages, known issues and how to test.
 - [Dual Energy](Dual-Energy) and [Tabulated EOS](Tabulated-EOS): the closures the remap must match.
 - `docs/remap_module_design.md`: the design document.

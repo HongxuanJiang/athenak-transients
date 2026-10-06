@@ -111,7 +111,10 @@ and stops with a message naming it if the file differs.
 
 - Maintained, because the generator can build tables for them: `saha_table`, `lte_table_t13`,
   `lte_table_scvh_t13_cp_helm_union` and `lte_table_chabrier2021_t13_helm_union`, each `lte_`
-  name with or without `_prad`. The generator's job list does not cover every variant; see
+  name with or without `_prad`. The generator has jobs for four of the `eos` names
+  (`lte_table_t13_prad`, `lte_table_scvh_t13_cp_helm_union_prad` and
+  `lte_table_chabrier2021_t13_helm_union` with and without `_prad`), and the Chabrier name with
+  `_prad` has seven jobs in all, including the composition variants such as `X620Y380`. See
   [EOS Tables](EOS-Tables#the-table-jobs).
 - Unmaintained (see [Limitations](#limitations)): `lte_table_hhe`, `lte_table_hybrid_hhe_t13`,
   `lte_table_scvh1995_hhe`, `lte_table_scvh_t13_union`, `lte_table_scvh_t13_helm_union` and
@@ -195,8 +198,8 @@ The code temperature unit belongs to the active EOS, not to `<units>`. For a tab
 is v_code^2 m_H / k_B, with the hydrogen mass hard-coded, because the table is the authority
 on the mean molecular weight. It does not use the `<units>/mu` key. The `hydro_temperature`
 output is in this unit. A temperature scale computed by hand from `<units>` is wrong by
-mu m_u / m_H under a tabulated EOS. For code that needs the scale, see the
-[implementation notes](Tabulated-EOS-Implementation-Notes#where-other-modules-meet-the-eos).
+mu m_u / m_H under a tabulated EOS. Code that needs the scale should call
+`MeshBlockPack::TemperatureUnitCGS()` and not read the unit from `<units>`.
 
 ### Memory cost
 
@@ -225,8 +228,9 @@ scripts, or download the default table from the release assets of the repository
 
 - The five TDE decks in `inputs/TDE_examples/` use `chabrier2021_t13_helm_union_prad_640.table`
   with `eos = lte_table_chabrier2021_t13_helm_union_prad`. `get_eos_table.sh` builds it.
-- The tests under `tst/` read the same table from `eos_tables/`, and
-  `chabrier2021_t13_helm_union_640.table` (no radiation pressure) for the PLM unit test.
+- Eight decks in `tst/inputs/` use a tabulated EOS, all with the Chabrier table. Seven read
+  `chabrier2021_t13_helm_union_prad_640.table` from `eos_tables/`, and `hydro_plm_unit` reads
+  `chabrier2021_t13_helm_union_640.table` (no radiation pressure).
 - The chemistry plots of `scripts/TDE/bin/plot_slice.py` read `lte_t13_prad_eos.table`
   (job `lte_t13_prad`).
 - No deck or test in the repository uses `saha_table`, the SCvH table or the composition
@@ -318,15 +322,17 @@ and remaps with the Chabrier table, but are not part of the test suite.
 - The loader accepts 18 `lte_` table types, but the generator can build only 6 of them
   (`t13`, `scvh_t13_cp_helm_union` and `chabrier2021_t13_helm_union`, each with and without
   radiation). The loader recognizes 12 masked-union types, and eight of them have no generator
-  model; the other four are the `cp_helm_union` and `chabrier2021` types. The simple
+  model. The other four are the `cp_helm_union` and `chabrier2021` types, and three of those
+  have a generator job (`scvh_t13_cp_helm_union_prad` and both Chabrier types). The simple
   `lte_hhe` and the hybrid `lte_hybrid_hhe_t13` types have none either. Treat the matching
   `eos` names as unmaintained unless a table for them comes from elsewhere.
+- Every rank reads and checks its own copy of the table file. The diagnostic columns that the
+  `t13` and union tables carry for offline plotting are read into host memory with the rest and
+  discarded after loading.
 - No test covers the table generators or `saha_table` (see [Tests](#tests)).
 
 ## Further reading
 
-- [Implementation notes](Tabulated-EOS-Implementation-Notes): how the loader, the inverse
-  table and the conversion kernels fit together, restart provenance and known issues.
 - [EOS Tables](EOS-Tables): generator jobs, building tables and where decks look for them.
 - Tomida et al. (2013), Appendix 1: the `t13` chemistry.
 - Saumon, Chabrier & Van Horn (1995): the SCvH dense-fluid H/He EOS.

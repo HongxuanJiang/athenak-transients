@@ -17,16 +17,13 @@ checked against the code in this repository.
 
 ## All pages
 
-Each topic has a main page for users and an implementation-notes page for people who want to
-change the code.
-
-| topic | main page | implementation notes |
-| --- | --- | --- |
-| Local adaptive time stepping (LAT) | [Local Adaptive Time Stepping](Local-Adaptive-Time-Stepping) | [notes](Local-Adaptive-Time-Stepping-Implementation-Notes) |
-| Restart remap | [Remap usage](Remap-Usage) (how to use it), [Remapping](Remapping) (how it works) | [notes](Remapping-Implementation-Notes) |
-| Tabulated EOS (LTE / Saha) | [Tabulated EOS](Tabulated-EOS), [EOS tables](EOS-Tables) (building the tables) | [notes](Tabulated-EOS-Implementation-Notes) |
-| Multigrid self-gravity | [Multigrid Self-Gravity](Multigrid-Self-Gravity) | [notes](Multigrid-Self-Gravity-Implementation-Notes) |
-| Dual energy | [Dual Energy](Dual-Energy) | [notes](Dual-Energy-Implementation-Notes) |
+| topic | page |
+| --- | --- |
+| Local adaptive time stepping (LAT) | [Local Adaptive Time Stepping](Local-Adaptive-Time-Stepping) |
+| Restart remap | [Remap usage](Remap-Usage) (how to run it), [Remapping](Remapping) (how it works) |
+| Tabulated EOS (LTE / Saha) | [Tabulated EOS](Tabulated-EOS), [EOS tables](EOS-Tables) (building the tables) |
+| Multigrid self-gravity | [Multigrid Self-Gravity](Multigrid-Self-Gravity) |
+| Dual energy | [Dual Energy](Dual-Energy) |
 
 ## How a main page is laid out
 

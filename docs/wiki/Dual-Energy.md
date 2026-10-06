@@ -40,8 +40,10 @@ itself. For MHD, put the same three keys in `<mhd>`.
 - `dual_energy_eta2` decides where the auxiliary is reset from the total energy.
 
 Both thresholds are explained under [How it works](#how-it-works). The flavour is not a key.
-It follows the coordinate system: Newtonian runs get the internal-energy auxiliary and
-general-relativistic runs get the adiabat auxiliary.
+It follows the coordinate system. Internally each of `Hydro` and `MHD` sets a flag
+`dual_energy_pdv`, which is not a deck key. It is true when the run is not relativistic
+(Newtonian flavour, internal-energy auxiliary with a compression step) and false for general
+relativity (GR flavour, adiabat auxiliary).
 
 ## Full parameter table
 
@@ -101,6 +103,9 @@ use the energy channel   if  thermal energy > eta1 * total energy
 otherwise                use the auxiliary channel
 ```
 
+The total energy in this test, and the neighbour maximum in the eta2 test, are floored at
+1e-18 in code units to avoid a zero denominator.
+
 In Newtonian MHD the energy channel must also pass a second test, because at low plasma beta
 the truncation error of the magnetic energy exceeds the thermal energy. It is used only if the
 thermal energy is larger than 10% of the magnetic energy. In GR the test compares the thermal
@@ -129,8 +134,8 @@ fluxes -> RK update -> dual-energy step -> source terms -> exchange and prolonga
 ```
 
 This is the Newtonian order. In GR the resync moves into the dual-energy step, ahead of the
-exchange. The [implementation notes](Dual-Energy-Implementation-Notes#how-a-step-runs) give
-both orders.
+exchange, so the exchange carries the resynced adiabat into every ghost cell. The Newtonian
+resync needs the neighbours' new total energies and therefore runs after the exchange.
 
 The Newtonian flavour reconstructs the auxiliary with the same schemes as every other
 variable. With a tabulated EOS, how the face energies are formed is described under Face states
@@ -164,6 +169,9 @@ problem is shown to need it.
 A GR cell that takes its pressure from the adiabat keeps its conserved energy. The energy
 equation is ignored for the pressure in that cell, not overwritten.
 
+The Newtonian MHD energy channel is not trusted at low plasma beta, where the truncation error
+of the magnetic energy exceeds the thermal energy.
+
 ### Choosing eta1 and eta2
 
 - Start from the TDE values, eta1 = 1e-3 and eta2 = 1e-4. Remember that the default of eta2 is
@@ -179,7 +187,8 @@ equation is ignored for the pressure in that cell, not overwritten.
 ### Interactions
 
 - **Cooling.** ISM cooling, relativistic cooling and disk cooling take their energy loss out of
-  the auxiliary as well as out of the gas. Gravitational work is deliberately not charged.
+  the auxiliary as well as out of the gas. Gravitational work is deliberately not charged. In GR
+  the debit is multiplicative, because the adiabat scales with the internal energy.
 - **LAT.** Supported for hydro (see [Local Adaptive Time Stepping](Local-Adaptive-Time-Stepping)). After
   a LAT tick's flux correction, the receiving blocks go through the normal conversion step, which
   runs the resync. For the Newtonian flavour the shortcut paths that skip the final boundary
@@ -239,8 +248,6 @@ These are the tests and decks that exist. Run a test from `tst/` with, for examp
 
 ## Further reading
 
-- [Implementation notes](Dual-Energy-Implementation-Notes): how the two flavours are built,
-  the order of a step, known limits and tests.
 - Example decks: `inputs/TDE_examples/*.athinput` (Newtonian, tabulated EOS, `<hydro>`). GR test
   decks: `tst/inputs/mub1_gr_dual.athinput`, `tst/inputs/dual_*.athinput`. Newtonian MHD test
   deck: `tst/inputs/mhd_bw_lowbeta_dual.athinput`.

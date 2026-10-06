@@ -170,8 +170,7 @@ The table is a `640 x 640` grid in `ln(rho)` and `ln(T)`, for `X_H = 0.7` and
 `Y_He = 0.3` without metals, and it covers `-20 <= log10(rho / g cm^-3) <= 3` in density.  The
 generator job covers `0 <= log10(T / K) <= 10`.  The file format, the generator, and
 the checks are described in [`../eos_tables.md`](../eos_tables.md) and
-[`../wiki/Tabulated-EOS.md`](../wiki/Tabulated-EOS.md).  The design of the EOS
-is documented in [`../eos_implementation_note.pdf`](../eos_implementation_note.pdf).
+[`../wiki/Tabulated-EOS.md`](../wiki/Tabulated-EOS.md).
 
 Place the table where the decks find it.  The example decks use
 `table = ../chabrier2021_t13_helm_union_prad_640.table`, which is resolved relative to the
@@ -240,7 +239,7 @@ table.  This avoids the closure mismatch of a polytropic star mapped onto a tabu
 EOS.  A short velocity damping (`relax_damp`, `relax_tau`, `relax_t_end`, `relax_radius`)
 removes the residual motion of the discretized star in the first `0.2 t0`.  The mode
 `legacy_polytrope` builds a Lane-Emden star instead.  See
-[`../eos_implementation_note.pdf`](../eos_implementation_note.pdf) and the section
+[`../wiki/Tabulated-EOS.md`](../wiki/Tabulated-EOS.md) and the section
 "EOS-balanced stellar initialization" of the paper.
 
 ### Translating frame and BH potential
@@ -380,8 +379,7 @@ whole box.  Neighboring blocks differ by at most a factor of two, and conservati
 mixed-step interfaces is enforced with time-integrated flux corrections, including the
 gravitational work.  In the production benchmark of the paper LAT reduces the number of
 MeshBlock updates by 85% and increases the throughput by a factor of 3.1.  Details:
-[`../wiki/Local-Adaptive-Time-Stepping.md`](../wiki/Local-Adaptive-Time-Stepping.md) and
-[`../lat_implementation_note.pdf`](../lat_implementation_note.pdf).
+[`../wiki/Local-Adaptive-Time-Stepping.md`](../wiki/Local-Adaptive-Time-Stepping.md).
 
 **LAT for MHD and GRMHD.** In this release, LAT is available for hydrodynamics, including self-gravity. The development version of the code also supports LAT for MHD and GRMHD, including GRMHD on dynamical spacetimes. These paths are not included in this public release; they are available on request from Hong-Xuan Jiang (masterjoe2000@outlook.com).
 
@@ -516,7 +514,7 @@ package uses MESA opacity tables, see [`docs/athenak_rt.md`](../athenak_rt.md).
 | Outputs and analysis scripts | [`outputs_and_analysis.md`](outputs_and_analysis.md), [`bin/README_ANALYSIS.md`](bin/README_ANALYSIS.md) |
 | Radiative post-processing | [`docs/athenak_rt.md`](../athenak_rt.md), [`athenak_rt/README.md`](../../athenak_rt/README.md) |
 | Remap | [`../remap_usage.md`](../remap_usage.md), [`../wiki/Remapping.md`](../wiki/Remapping.md) |
-| LAT | [`../wiki/Local-Adaptive-Time-Stepping.md`](../wiki/Local-Adaptive-Time-Stepping.md), [`../lat_implementation_note.pdf`](../lat_implementation_note.pdf) |
+| LAT | [`../wiki/Local-Adaptive-Time-Stepping.md`](../wiki/Local-Adaptive-Time-Stepping.md) |
 | Multigrid self-gravity | [`../wiki/Multigrid-Self-Gravity.md`](../wiki/Multigrid-Self-Gravity.md) |
-| Tabulated EOS | [`../wiki/Tabulated-EOS.md`](../wiki/Tabulated-EOS.md), [`../eos_tables.md`](../eos_tables.md), [`../eos_implementation_note.pdf`](../eos_implementation_note.pdf) |
+| Tabulated EOS | [`../wiki/Tabulated-EOS.md`](../wiki/Tabulated-EOS.md), [`../eos_tables.md`](../eos_tables.md) |
 | Dual energy | [`../wiki/Dual-Energy.md`](../wiki/Dual-Energy.md) |

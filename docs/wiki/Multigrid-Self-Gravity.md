@@ -93,7 +93,7 @@ source.
 | `coarsest_min_sweeps` | int | 64 (at least 1) | Minimum number of relaxations on the coarsest root grid. |
 | `mg_prolongation` | string | `tricubic` with SMR or AMR, else `trilinear` | Interpolation used to prolong the correction. Any value other than `tricubic` means trilinear. |
 | `mg_nghost` | int | 1 | Ghost cells on the multigrid levels. A value above 1 is fatal on a refined mesh. Its only use is a multi-rank optimisation on uniform meshes. |
-| `mg_fc_symmetric` | bool | `false` | Make the coarse/fine operator symmetric (see [the notes](Multigrid-Self-Gravity-Implementation-Notes#energy-ledger-and-coarsefine-symmetry)). |
+| `mg_fc_symmetric` | bool | `false` | Make the coarse/fine operator symmetric by dropping the tangential terms of the fine ghost value. Without it the composite operator is slightly non-symmetric, and the LAT ledger records the effect as `E_asym`. On the octet levels this changes only the convergence rate, not the solution. |
 | `subtract_average` | bool | `true` on a fully periodic mesh, else `false` | Remove the mean of the source and the solution. Forced to `true` (with a warning) when no face is `zerofixed` or `multipole`, and forced to `false` when a face is `multipole`. |
 | `root_on_host` | bool | `true` if the root grid has at most 4096 blocks | Keep the root-grid arrays in host memory. |
 
@@ -131,7 +131,7 @@ exchanges on several ranks.
 | `show_defect` | string or int | `"0"` | 0 or `false` is off, 1 or `true` prints the final defect of each solve, 2 or more prints every iteration. Any other value is fatal. |
 | `show_timing` | bool | `false` | Print one timing line per solve with the time of each phase. |
 | `mg_verbose` | int | 0 (at least 0) | Gates exactly one warning: a multipole source whose total mass cancels. It is not a general verbosity switch. |
-| `lat_time_centered_work` | bool | `false` | LAT only. Adds a time-centering energy correction at each window end for an energy ledger that closes (see [the notes](Multigrid-Self-Gravity-Implementation-Notes#energy-ledger-and-coarsefine-symmetry)). Its requirements are in [Requirements and refusals](#requirements-and-refusals). |
+| `lat_time_centered_work` | bool | `false` | LAT only. Solves again at each window end and adds $-\tfrac{1}{2}\,\Delta\rho\,\Delta\phi$ to the energy of each cell, so that the gas energy plus $\tfrac{1}{2}\sum\rho\phi\,dV$ changes only through floors, AMR remaps, boundary transport and the operator asymmetry. These terms are tallied in double precision and carried through restarts as `<gravity>` metadata. The `tde_external` problem generator writes them as history columns (`W_cent`, `E_remap`, `E_floor`, `E_asym`, and with `lat_boundary_flux_diagnostics` also `B_mass`, `B_E`, `B_Wself`, `B_Wbh`). Its requirements are in [Requirements and refusals](#requirements-and-refusals). |
 | `lat_boundary_flux_diagnostics`, `lat_ledger_debug` | bool | `false` | Extra ledger columns, and a per-window printout on rank 0. The first requires `lat_time_centered_work`. |
 | `reciprocity_test` | bool | `false` | Run a diagnostic of the coarse/fine operator's symmetry at startup, then stop before any evolution. Its tuning keys (`reciprocity_*`) are for developers. |
 
@@ -241,7 +241,7 @@ The potential is not written to restart files, so the first solve after a restar
 FMG solve. A restarted run therefore agrees with the uninterrupted run only to the solver
 tolerance, not bit for bit. With a `solve_every` or `solve_dt` cadence and no LAT, the first
 stage after a restart also uses a freshly solved potential, where the uninterrupted run would
-still use an older one. Under LAT the potential is solved at the first window start.
+still use an older one. Under LAT the potential is solved at the first window start. LAT for MHD is not in this release, and the LAT gravity logic reads the hydro source terms only.
 
 ### Requirements and refusals
 
@@ -295,8 +295,11 @@ Separately, `auto_max_extra_cycles` and `warm_final_niter` are silently ignored 
   the analytic black-hole potential if enabled). Before the first solve the solved part is zero.
   It is also added automatically to the `hydro_u`, `hydro_w`, `mhd_u` and `mhd_w` output
   bundles.
-- The regression tests are in `tst/test_suite/multigrid/`. See
-  [the notes](Multigrid-Self-Gravity-Implementation-Notes#tests) for how to run them.
+- The regression tests are in `tst/test_suite/multigrid/`. From `tst/`, run
+  `python run_test_suite.py --cpu --test test_suite/multigrid`, or use `--mpicpu` or `--gpu`.
+  They cover a two-sphere Poisson problem, Jeans waves and 64^3 hydro and MHD solves, with
+  checks on convergence rate and on independence from MeshBlock size and rank count. Further
+  gravity tests are in `tst/test_suite/nr/`.
 
 ### Other notes
 
@@ -308,8 +311,6 @@ Separately, `auto_max_extra_cycles` and `warm_final_niter` are silently ignored 
 
 ## Further reading
 
-- [Implementation notes](Multigrid-Self-Gravity-Implementation-Notes): the solver, how a solve
-  runs, LAT scheduling, the energy ledger, known issues and tests.
 - Mullen, Hanawa and Gammie (2020): the flux-consistent gravitational-work source form.
-- `docs/lat_implementation_note.tex`, sections "Self-Gravity" and "Limitations and
-  Invariants": the reference for how LAT and gravity stay synchronized.
+- [Local Adaptive Time Stepping](Local-Adaptive-Time-Stepping): how a window works and how LAT
+  and gravity stay synchronized.

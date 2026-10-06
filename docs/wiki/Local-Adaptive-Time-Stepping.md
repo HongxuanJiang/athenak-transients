@@ -44,9 +44,7 @@ All `time/` keys are read only when LAT is on. Legacy spellings are listed below
 | `time/lat_same_level_max_ratio` | int | 1 | Largest factor ratio between same-level neighbours; it acts only with `lat_same_level = true`. Must be 1, 2, 4 or 8, otherwise fatal. |
 | `time/lat_neighbor_limiter` | string | `all` | Which same-level neighbours the factor limiter looks at: `all` (faces, edges and corners), `face` (faces only) or `hybrid` (faces held to 2:1, edges and corners to the configured ratio). It acts only with `lat_same_level = true`. With self-gravity or an external black hole, `face` together with `lat_same_level = true` is fatal. Any other value is fatal. |
 | `time/hydro_lat_min_bin_count` | int | -1 | Smallest number of blocks a bin above factor 1 may hold. A smaller bin is merged into the next bin down (half the factor). `-1` means `4*nranks`, `0` switches the merge off, and values below -1 are fatal. With the default, bin membership depends on the rank count, and rank 0 warns when more than one rank is used. |
-| `time/lat_pin_density_contrast` | Real | 0 | If above 1, a block whose largest density is at least this multiple of its smallest density is forced to factor 1, together with all its neighbours. Meant for sharp density jumps. Must be finite. |
-| `time/lat_pin_density` | Real | 0 | If above 0, a block that has a cell with density at or above this value (code units) is forced to factor 1, together with all its neighbours. Must be finite. |
-| `time/lat_diagnostics` | bool | `false` | Print the bin table at several stages of the factor selection (raw, after the problem cap, the pins and the neighbour limiter, and final), and the same-level and refinement-interface status lines. In release builds it also switches on an internal consistency check of the fused predictor step. |
+| `time/lat_diagnostics` | bool | `false` | Print the bin table at several stages of the factor selection (raw, after the problem cap and the neighbour limiter, and final), and the same-level and refinement-interface status lines. In release builds it also switches on an internal consistency check of the fused predictor step. |
 | `time/lat_union_stage1` | string | `auto` | `auto`, `true` or `false` (`1` and `0` also work). Whether all due bins share one fused predictor kernel in each tick. `auto` and `true` both use the value derived from the run's capabilities, and neither overrides the integrator and user-hook conditions. Any other value is fatal. |
 | `time/hydro_lat_gid_reorder` | bool | `true` | Order blocks so that each rank owns a slice of every bin (see [Parallel layout](#parallel-layout)). |
 | `time/hydro_lat_post_amr_rebalance` | bool | value of `hydro_lat_gid_reorder` | Allow the LAT rebalance of the rank layout at a window end, once the mesh has stayed unchanged for four window lengths. `true` together with `hydro_lat_gid_reorder = false` is fatal. |
@@ -67,13 +65,12 @@ All `time/` keys are read only when LAT is on. Legacy spellings are listed below
 Each block works out the largest step it can take on its own. The ratio of that step to the global step, rounded down to a power of two and capped at `2^lat_levels`, is the block's factor. Rules then lower factors where a large one would be unsafe, in this order:
 
 1. A cap from the problem generator, if it installs one. The TDE generator forces factor 1 around the excised black hole.
-2. The density pin, if you enabled it with `lat_pin_density_contrast` or `lat_pin_density`.
-3. Sink pinning: blocks around a sink are forced to factor 1.
-4. The refinement-level collapse, unless `lat_same_level = true`.
-5. The minimum bin population, `hydro_lat_min_bin_count`.
-6. A neighbour limiter that keeps the factors of neighbouring blocks close.
+2. Sink pinning: blocks around a sink are forced to factor 1.
+3. The refinement-level collapse, unless `lat_same_level = true`.
+4. The minimum bin population, `hydro_lat_min_bin_count`. A bin above factor 1 with too few blocks is merged into the next bin down.
+5. A neighbour limiter that keeps the factors of neighbouring blocks close. Across a refinement interface a finer block never has a larger factor than the coarser one. Between same-level neighbours the ratio is at most `lat_same_level_max_ratio`.
 
-The [implementation notes](Local-Adaptive-Time-Stepping-Implementation-Notes#how-the-factors-are-chosen) explain each rule.
+The factors are recomputed at startup, at every window end and after every regrid.
 
 ### Windows and ticks
 
@@ -171,13 +168,12 @@ The remaining cost is mainly communication and task-list launch overhead for the
 
 ### Limitations
 
+- The default bin floor makes the trajectory depend on the rank count (see Reproducibility across rank counts).
 - Same-level mixed bins (`lat_same_level = true`) are a physics-validation risk at large factor ratios, because the interpolation is a dense Runge-Kutta polynomial between the start and end conserved states.
 - A window cannot be cut short. The driver shortens windows beforehand so that no limit (`tlim`, `nlim`, wall clock) falls inside one, and turns any attempt to leave a window early into a fatal error rather than a silent loss of conservation.
 
 ## Further reading
 
-- [Implementation notes](Local-Adaptive-Time-Stepping-Implementation-Notes): how the factors are chosen, the tick loop, rank layout, restart, module interactions, limitations and tests.
 - Example deck: `inputs/TDE_examples/tde_05_fallback_lat.athinput`. It runs the remap, the settle steps and the fallback in one run: the settle steps run without LAT and LAT starts after the last remap pass.
-- Design note `docs/lat_implementation_note.tex`, with its `.pdf` built from it: scope, user controls, factor metadata, masks, boundary exchange, delayed flux correction, self-gravity, block ordering, load balance, AMR, restart, performance and invariants.
 - Berger and Colella (1989), *J. Comput. Phys.* **82**, 64: the refluxing generalised here to bin boundaries.
 - Gottlieb (2009): the SSPRK(2,2) tableau whose dense output is used for mixed-cadence ghosts.
